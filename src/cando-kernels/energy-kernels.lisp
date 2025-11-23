@@ -1,5 +1,5 @@
 
-(in-package :energy-kernels)
+(in-package :cando-kernels)
 
 ;;; -------------------------------
 ;;; Small string / name utilities

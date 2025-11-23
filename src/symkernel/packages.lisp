@@ -166,11 +166,3 @@
   (:use :cl :opt-exp :expr-ir :stmt-ir)
   )
 
-
-(defpackage :energy-kernels
-  (:use :cl :expr-ir :stmt-ir)
-  (:export
-   #:make-stretch-energy-kernel
-   #:make-stretch-energy-kernel-with-macros
-   #:generate-stretch-code))
-
