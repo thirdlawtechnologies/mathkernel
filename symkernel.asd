@@ -9,12 +9,9 @@
   :components ((:module "src"
                 :components ((:module "symkernel"
                               :components ((:file "packages")
-                                           (:file "optimize-expressions")
-                                           (:file "derivatives")
                                            (:file "math")
                                            (:file "expression-ir")
                                            (:file "expression-parse")
-                                           (:file "expression-print")
                                            (:file "expression-tests")
                                            (:file "statement-ir")
                                            (:file "expression-diff")

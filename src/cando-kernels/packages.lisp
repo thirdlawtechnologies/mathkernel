@@ -1,6 +1,7 @@
 
-(defpackage :cando-kernels
-  (:use :cl :expr-ir :stmt-ir)
+(defpackage :energy-kernels
+  (:use :cl :opt-exp :expr-ir :stmt-ir)
   (:export
-   #:generate-stretch-code))
+   #:generate-kernel-code
+   ))
 

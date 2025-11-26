@@ -48,6 +48,38 @@ never appears as an assignment target in STATEMENTS."
           d
           nil))))
 
+
+(defun make-local-partial-derivative-assignments-for-block
+    (statements &key base-vars)
+  "Given a list of STATEMENTS (assignment-statement objects),
+return a list of assignment-statement objects for the local partial
+derivatives d(target)/d(dep) of each assignment.
+
+For each assignment
+    target = RHS(...)
+we look at the free variables of RHS. For every such DEP:
+
+  D<TARGET>_D<DEP> = ∂(RHS)/∂DEP
+
+If BASE-VARS is non-NIL, it must be a list of symbols; only
+dependencies that are members of BASE-VARS are differentiated."
+  (let ((result '()))
+    (dolist (st statements (nreverse result))
+      (when (typep st 'assignment-statement)
+        (let* ((target (stmt-target-name st))
+               (rhs    (stmt-expression st))
+               (deps   (expr-ir:expr-free-vars rhs)))
+          (dolist (dep deps)
+            (when (or (null base-vars)
+                      (member dep base-vars :test #'eq))
+              ;; Local partial: differentiate RHS treating DEP as independent
+              (let* ((dexpr (expr-ir:differentiate-expr rhs dep))
+                     (dname (make-derivative-name target dep))
+                     (dst   (make-assignment-stmt dname dexpr)))
+                (push dst result)))))))))
+
+
+  
 ;;; ----------------------------------------------------------------------
 ;;; Generate derivative assignment statements for a block
 ;;; ----------------------------------------------------------------------

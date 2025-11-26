@@ -44,6 +44,30 @@
 ;;; Canonicalizing constructors
 ;;; ----------------------------------------------------------------------
 
+(defun ev (sym)
+  "Ensure that the symbol is in expr-user"
+  (cond
+    ((null sym)
+     (error "We cannot have a NIL variable name"))
+    ((stringp sym)
+     (intern sym :expr-var))
+    ((symbolp sym)
+  (if (eq (symbol-package sym) (find-package :expr-var))
+      sym
+      (intern (symbol-name sym) :expr-var)))
+    (t (error "Handle ~s" sym))))
+
+(defun ensure-keyword (sym)
+  (cond
+    ((stringp sym)
+     (intern sym :keyword))
+    ((symbolp sym)
+  (if (eq (symbol-package sym) (find-package :keyword))
+      sym
+      (intern (symbol-name sym) :keyword)))
+    (t (error "Handle ~s" sym))))
+
+
 (defun make-expr-const (value)
   "Construct a constant-expression. You can add rational normalization here."
   (make-instance 'constant-expression :value value))
@@ -51,7 +75,7 @@
 (defun make-expr-var (name)
   "Construct a variable-expression."
   (check-type name symbol)
-  (make-instance 'variable-expression :name name))
+  (make-variable (ev name)))
 
 (defun %numeric-constant-p (expr)
   (typep expr 'constant-expression))
@@ -263,6 +287,8 @@ Simplifications:
 (defun make-expr-funcall (name args)
   "Constructor for function-call-expression. No canonicalization beyond argument IR."
   (check-type name symbol)
+  (unless (keywordp name)
+    (error "All function names must be keywords - you have ~s in ~s" name (symbol-package name)))
   (make-instance 'function-call-expression
                  :function-name name
                  :argument-list args))
@@ -288,6 +314,7 @@ Supported forms (initial version):
 
 ENV is reserved for future use (e.g. to distinguish some function names)."
   (declare (ignore env))
+  (declare (optimize (debug 3)))
   (cond
     ;; Already an expression node
     ((typep form 'expression)
@@ -297,7 +324,7 @@ ENV is reserved for future use (e.g. to distinguish some function names)."
      (make-expr-const form))
     ;; Symbol -> variable
     ((symbolp form)
-     (make-expr-var form))
+     (make-expr-var (ev form)))
     ;; List / compound form
     ((consp form)
      (let* ((op   (car form))
@@ -380,7 +407,7 @@ ENV is reserved for future use (e.g. to distinguish some function names)."
                            :argument-expression (rec (first args))))
            ;; default: function call
            (t
-            (make-expr-funcall op (mapcar #'rec args)))))))
+            (make-expr-funcall (ensure-keyword op) (mapcar #'rec args)))))))
     (t
      (error "Cannot convert ~S to expression IR." form))))
 
@@ -559,7 +586,7 @@ ENV is reserved for future use (e.g. to distinguish some function names)."
       ;; identifier: variable or function call
       ((eq (token-type tok) :ident)
        (ps-advance ps)
-       (let* ((name-sym (intern (symbol-name (token-value tok)) :cl-user)))
+       (let* ((name-sym (ev (token-value tok))))
          (if (eq (token-type (ps-current ps)) :lparen)
              ;; function call
              (progn
@@ -572,7 +599,7 @@ ENV is reserved for future use (e.g. to distinguish some function names)."
                          (progn (ps-advance ps) (continue))
                          (return))))
                  (ps-expect ps :rparen "Expected ')' after function arguments.")
-                 (make-expr-funcall name-sym (nreverse args))))
+                 (make-expr-funcall (ensure-keyword name-sym) (nreverse args))))
              ;; simple variable
              (make-expr-var name-sym))))
       ;; '(' expr ')'

@@ -1,3 +1,4 @@
+;;; packages.lisp
 
 (defpackage :opt-exp
   (:use :cl)
@@ -28,7 +29,12 @@
    #:append-rule
    #:append-accumulate
    #:append-gradient-force-and-hessian
-   #:outputs))
+   #:outputs
+   #:sv-cross
+   #:svector
+   #:sv-len))
+
+
 
 
 ;;;; Expression IR for symbolic math / AD / C generation
@@ -87,7 +93,6 @@
    #:parse-expr
 
    #:expr->sexpr
-   #:expr->sexpr-string
    #:expr->infix-string
 
    #:differentiate-expr
@@ -95,7 +100,15 @@
 
    #:simplify-expr
    #:expr->c-expr-string
-   #:expr-var-symbol))
+   #:expr-var-symbol
+   #:expr-free-vars
+   #:set-var-derivative
+   #:lookup-var-derivative
+   #:add-expressions
+   #:ev
+
+   #:factor-sum-of-products
+   #:normalize-signs-expr))
 
 
 
@@ -146,6 +159,7 @@
    #:build-derivative-env-for-block
    #:differentiate-target-in-block
    #:make-derivative-assignments-for-block
+   #:make-local-partial-derivative-assignments-for-block
 
    #:simplify-statement
    #:simplify-block
@@ -154,15 +168,30 @@
    #:make-energy-grad-hess-block
 
    #:c-function->c-source-string
+   #:cse-block-multi-optimization
    #:cse-block-multi
    #:collect-scalar-targets-in-block
-   #:copy-propagate-block))
+   #:copy-propagate-optimization
+   #:*debug*
+   #:check-cse-temp-order
+
+   #:factor-sums-optimization
+   #:factor-temp-param-products-optimization
+   #:normalize-signs-optimization
+   #:make-optimization-pipeline
+   #:make-optimization
+   #:run-optimization-pipeline
+   #:make-pass-id-counter))
 
 (defpackage :stmt-ir.tests
   (:use :cl :expr-ir :stmt-ir)
   (:export #:run-statement-tests))
 
-(defpackage :opt-exp-user
-  (:use :cl :opt-exp :expr-ir :stmt-ir)
-  )
+(defpackage :expr-var)
+
+;;;; Symbols go in this package
+(defpackage :expr-user
+  (:use :cl :expr-ir :opt-exp)
+  (:export
+   ))
 

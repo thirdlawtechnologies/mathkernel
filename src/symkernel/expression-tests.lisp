@@ -148,7 +148,7 @@ canonically sorted. Used to ignore operand order in comparisons."
     (assert-true (typep v 'variable-expression)
                  'test-constants-and-variables
                  "v is not variable-expression")
-    (assert-true (eq (variable-name v) 'x)
+    (assert-true (eq (variable-name v) (expr-ir:ev 'x))
                  'test-constants-and-variables
                  "variable name mismatch: ~S" (variable-name v))))
 
@@ -157,48 +157,50 @@ canonically sorted. Used to ignore operand order in comparisons."
 ;;; ----------------------------------------------------------------------
 
 (deftest test-add-canonicalization
-  ;; (+ 1 2 3) -> constant 6
-  (let* ((a1 (make-expr-add (list (make-expr-const 1)
-                                  (make-expr-const 2)
-                                  (make-expr-const 3)))))
-    (assert-true (typep a1 'constant-expression)
-                 'test-add-canonicalization
-                 "expected folded constant for sum")
-    (assert-true (= (expression-value a1) 6)
-                 'test-add-canonicalization
-                 "sum constant value mismatch: ~S" (expression-value a1)))
-  ;; (+ x y 0) -> (+ x y) (no explicit 0 term)
-  (let* ((x (make-expr-var 'x))
-         (y (make-expr-var 'y))
-         (sum (make-expr-add (list x y (make-expr-const 0)))))
-    (assert-true (typep sum 'add-expression)
-                 'test-add-canonicalization
-                 "expected add-expression")
-    (let ((args (expression-arguments sum)))
-      (assert-true (= (length args) 2)
+  (progn
+    ;; (+ 1 2 3) -> constant 6
+    (let* ((a1 (make-expr-add (list (make-expr-const 1)
+                                    (make-expr-const 2)
+                                    (make-expr-const 3)))))
+      (assert-true (typep a1 'constant-expression)
                    'test-add-canonicalization
-                   "expected 2 arguments in simplified sum, got ~D"
-                   (length args))
-      (assert-true (null (set-exclusive-or (mapcar #'expr->sexpr args)
-                                     (list 'x 'y)
-                                     :test #'equal))
+                   "expected folded constant for sum")
+      (assert-true (= (expression-value a1) 6)
                    'test-add-canonicalization
-                   "sum arguments not {x,y}: ~S vs ~s"
-                   (mapcar #'expr->sexpr args)
-                   (list 'x 'y))))
-  ;; (+ x (+ 1 y)) -> (+ 1 x y), flattened and sorted
-  (let* ((x (make-expr-var 'x))
-         (y (make-expr-var 'y))
-         (inner (make-expr-add (list (make-expr-const 1) y)))
-         (outer (make-expr-add (list x inner))))
-    (assert-true (typep outer 'add-expression)
-                 'test-add-canonicalization
-                 "expected outer add-expression")
-    (assert-true (equal (expr->sexpr outer)
-                        '(+ 1 X Y))
-                 'test-add-canonicalization
-                 "unexpected canonical S-expression for add: ~S"
-                 (expr->sexpr outer))))
+                   "sum constant value mismatch: ~S" (expression-value a1)))
+    ;; (+ x y 0) -> (+ x y) (no explicit 0 term)
+    (let* ((x (make-expr-var 'x))
+           (y (make-expr-var 'y))
+           (sum (make-expr-add (list x y (make-expr-const 0)))))
+      (assert-true (typep sum 'add-expression)
+                   'test-add-canonicalization
+                   "expected add-expression")
+      (let ((args (expression-arguments sum)))
+        (assert-true (= (length args) 2)
+                     'test-add-canonicalization
+                     "expected 2 arguments in simplified sum, got ~D"
+                     (length args))
+        (assert-true (null (set-exclusive-or (mapcar #'expr->sexpr args)
+                                             (list (expr-ir:ev 'x) (expr-ir:ev 'y))
+                                             :test #'equal))
+                     'test-add-canonicalization
+                     "sum arguments not {x,y}: ~S vs ~s"
+                     (mapcar #'expr->sexpr args)
+                     (list 'x 'y))))
+    ;; (+ x (+ 1 y)) -> (+ 1 x y), flattened and sorted
+    (let* ((x (make-expr-var 'x))
+           (y (make-expr-var 'y))
+           (inner (make-expr-add (list (make-expr-const 1) y)))
+           (outer (make-expr-add (list x inner))))
+      (declare (optimize (debug 3)))
+      (assert-true (typep outer 'add-expression)
+                   'test-add-canonicalization
+                   "expected outer add-expression")
+      (assert-true (equal (expr->sexpr outer)
+                          '(+ 1 expr-var::X expr-var::Y))
+                   'test-add-canonicalization
+                   "unexpected canonical S-expression for add: ~S"
+                   (expr->sexpr outer)))))
 
 (deftest test-mul-canonicalization
   ;; (* 2 3 4) -> constant 24
@@ -224,7 +226,7 @@ canonically sorted. Used to ignore operand order in comparisons."
                    "expected 2 arguments in simplified product, got ~D"
                    (length args))
       (assert-true (null (set-exclusive-or (mapcar #'expr->sexpr args)
-                                     (list 'x 'y)
+                                     (list 'expr-var::x 'expr-var::y)
                                      :test #'equal))
                    'test-mul-canonicalization
                    "product arguments not {x,y}: ~S"
@@ -283,15 +285,15 @@ canonically sorted. Used to ignore operand order in comparisons."
 
 (deftest test-funcall-basic
   (let* ((x (make-expr-var 'x))
-         (call (make-expr-funcall 'sin (list x))))
+         (call (make-expr-funcall :sin (list x))))
     (assert-true (typep call 'function-call-expression)
                  'test-funcall-basic
                  "sin(x) not function-call-expression")
-    (assert-true (eq (function-call-name call) 'sin)
+    (assert-true (eq (function-call-name call) :sin)
                  'test-funcall-basic
                  "function name mismatch: ~S" (function-call-name call))
     (assert-true (equal (mapcar #'expr->sexpr (function-call-arguments call))
-                        '(x))
+                        '(expr-var::x))
                  'test-funcall-basic
                  "function arguments mismatch: ~S"
                  (mapcar #'expr->sexpr (function-call-arguments call)))))
@@ -309,29 +311,29 @@ canonically sorted. Used to ignore operand order in comparisons."
                  "top-level should be add-expression")
     ;; canonical S-expression form
     (assert-true (equal (expr->sexpr expr)
-                        '(+ 1 X (* 2 Y)))
+                        '(+ 1 expr-var::X (* 2 expr-var::Y)))
                  'test-sexpr-arithmetic
                  "unexpected canonical sexpr: ~S" (expr->sexpr expr)))
   ;; (- x y) -> (+ x (- y))
-  (let* ((form '(- x y))
+  (let* ((form '(- expr-var::x expr-var::y))
          (expr (sexpr->expr-ir form)))
     (assert-true (typep expr 'add-expression)
                  'test-sexpr-arithmetic
                  "(- x y) did not become add-expression")
     (assert-true (equal (expr->sexpr expr)
-                        '(+ X (- Y)))
+                        '(+ expr-var::X (- expr-var::Y)))
                  'test-sexpr-arithmetic
                  "(- x y) canonical sexpr mismatch: ~S" (expr->sexpr expr)))
   ;; (/ x y) -> x * y^-1
-  (let* ((form '(/ x y))
+  (let* ((form '(/ expr-var::x expr-var::y))
          (expr (sexpr->expr-ir form))
          (sexpr (expr->sexpr expr)))
     (assert-true (typep expr 'multiply-expression)
                  'test-sexpr-arithmetic
                  "(/ x y) did not become multiply-expression")
     ;; don't over-specify order, just check general shape
-    (assert-true (or (equal sexpr '(* X (EXPT Y -1)))
-                     (equal sexpr '(* (EXPT Y -1) X)))
+    (assert-true (or (equal sexpr '(* expr-var::X (EXPT expr-var::Y -1)))
+                     (equal sexpr '(* (EXPT expr-var::Y -1) expr-var::X)))
                  'test-sexpr-arithmetic
                  "(/ x y) unexpected representation: ~S" sexpr)))
 
@@ -342,27 +344,27 @@ canonically sorted. Used to ignore operand order in comparisons."
     (assert-true (typep expr 'comparison-expression)
                  'test-sexpr-comparison-and-logic
                  "(< x y) not comparison-expression")
-    (assert-true (equal (expr->sexpr expr) '(< X Y))
+    (assert-true (equal (expr->sexpr expr) '(< expr-var::X expr-var::Y))
                  'test-sexpr-comparison-and-logic
                  "comparison sexpr mismatch: ~S" (expr->sexpr expr)))
   ;; (and (< x y) (> y 0))
-  (let* ((form '(and (< x y) (> y 0)))
+  (let* ((form '(and (< expr-var::x expr-var::y) (> expr-var::y 0)))
          (expr (sexpr->expr-ir form)))
     (assert-true (typep expr 'logical-nary-expression)
                  'test-sexpr-comparison-and-logic
                  "and form not logical-nary-expression")
     (assert-true (equal (expr->sexpr expr)
-                        '(AND (< X Y) (> Y 0)))
+                        '(AND (< expr-var::X expr-var::Y) (> expr-var::Y 0)))
                  'test-sexpr-comparison-and-logic
                  "and canonical sexpr mismatch: ~S" (expr->sexpr expr)))
   ;; (not (= x 0))
-  (let* ((form '(not (= x 0)))
+  (let* ((form '(not (= expr-var::x 0)))
          (expr (sexpr->expr-ir form)))
     (assert-true (typep expr 'logical-not-expression)
                  'test-sexpr-comparison-and-logic
                  "not form not logical-not-expression")
     (assert-true (equal (expr->sexpr expr)
-                        '(NOT (= X 0)))
+                        '(NOT (= expr-var::X 0)))
                  'test-sexpr-comparison-and-logic
                  "not canonical sexpr mismatch: ~S" (expr->sexpr expr))))
 
@@ -491,7 +493,7 @@ canonically sorted. Used to ignore operand order in comparisons."
   ;; Parse a nontrivial expression, then simplify twice and check that
   ;; the result is the same up to commutativity of + and *.
   (let* ((expr0 (parse-expr
-                 "kb*Power(-r0 + Sqrt(Power(-x1 + x2,2) + Power(-y1 + y2,2) + Power(-z1 + z2,2)),2)"))
+                 "kb*(-r0 + Sqrt((-x1 + x2)^2 + (-y1 + y2)^2 + (-z1 + z2)^2))^2"))
          (expr1 (simplify-expr expr0))
          (expr2 (simplify-expr expr1)))
     (assert-true (expr-equal? expr1 expr2)
@@ -558,7 +560,7 @@ canonically sorted. Used to ignore operand order in comparisons."
 (deftest test-stretch-energy-variable-consistency
   (let* ((energy-expr
            (expr-ir:parse-expr
-            "kb*Power(Sqrt((x2-x1)^2 + (y2-y1)^2 + (z2-z1)^2) - r0, 2)"))
+            "kb*(Sqrt((x2-x1)^2 + (y2-y1)^2 + (z2-z1)^2) - r0)^2"))
          (vars (collect-vars energy-expr))
          (x1   (expr-var-symbol "x1"))
          (y1   (expr-var-symbol "y1"))
@@ -579,7 +581,7 @@ canonically sorted. Used to ignore operand order in comparisons."
 (deftest test-stretch-diff-x1
   (let* ((energy-expr
            (expr-ir:parse-expr
-            "kb*Power(Sqrt((x2-x1)^2 + (y2-y1)^2 + (z2-z1)^2) - r0, 2)"))
+            "kb*(Sqrt((x2-x1)^2 + (y2-y1)^2 + (z2-z1)^2) - r0)^2"))
          (x1 (expr-var-symbol "x1"))
          (dE-dx1 (expr-ir:differentiate-expr energy-expr x1)))
     (format t "~&[DEBUG] dE/dx1 sexpr: ~S~%"
@@ -595,7 +597,7 @@ canonically sorted. Used to ignore operand order in comparisons."
 (deftest test-stretch-diff-kb
   (let* ((energy-expr
            (expr-ir:parse-expr
-            "kb*Power(Sqrt((x2-x1)^2 + (y2-y1)^2 + (z2-z1)^2) - r0, 2)"))
+            "kb*(Sqrt((x2-x1)^2 + (y2-y1)^2 + (z2-z1)^2) - r0)^2"))
          (kb (expr-var-symbol "kb"))
          (dE-dkb (expr-ir:differentiate-expr energy-expr kb)))
     (format t "~&[DEBUG] dE/dkb sexpr: ~S~%"
@@ -610,6 +612,7 @@ canonically sorted. Used to ignore operand order in comparisons."
 ;; Helper: evaluate an expr at a given environment using expr->sexpr and EVAL.
 (defun eval-expr-at (expr env)
   "ENV is an alist (var-symbol . value)."
+  (declare (optimize (debug 3)))
   (let ((form (expr-ir:expr->sexpr expr)))
     (eval `(let ,(mapcar (lambda (pair)
                            (list (car pair) (cdr pair)))
@@ -643,19 +646,19 @@ canonically sorted. Used to ignore operand order in comparisons."
            (expr-ir:parse-expr
             "kb*(Sqrt((x2-x1)^2 + (y2-y1)^2 + (z2-z1)^2) - r0)^2"))
          ;; Pick a random but fixed configuration and parameters
-         (env `((cl-user::kb . 10.0d0)
-                (cl-user::r0 . 1.5d0)
-                (cl-user::x1 . 0.1d0)
-                (cl-user::y1 . -0.2d0)
-                (cl-user::z1 . 0.3d0)
-                (cl-user::x2 . 1.1d0)
-                (cl-user::y2 . 0.8d0)
-                (cl-user::z2 . -0.4d0)))
+         (env `((expr-var::kb . 10.0d0)
+                (expr-var::r0 . 1.5d0)
+                (expr-var::x1 . 0.1d0)
+                (expr-var::y1 . -0.2d0)
+                (expr-var::z1 . 0.3d0)
+                (expr-var::x2 . 1.1d0)
+                (expr-var::y2 . 0.8d0)
+                (expr-var::z2 . -0.4d0)))
          ;; Analytic dE/dx1
-         (dE-dx1-expr (expr-ir:differentiate-expr energy-expr 'cl-user::x1))
+         (dE-dx1-expr (expr-ir:differentiate-expr energy-expr 'expr-var::x1))
          (dE-dx1-val  (eval-expr-at dE-dx1-expr env))
          ;; Numeric dE/dx1 by finite difference
-         (dE-dx1-num  (finite-diff energy-expr 'cl-user::x1 env))
+         (dE-dx1-num  (finite-diff energy-expr 'expr-var::x1 env))
          (tol 1.0d-6))
     (assert-true (< (abs (- dE-dx1-val dE-dx1-num)) tol)
                  'test-stretch-energy-grad-numeric

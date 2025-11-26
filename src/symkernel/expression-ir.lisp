@@ -1,4 +1,13 @@
+;;;; ----------------------------------------------------------------------
+;;;; expression-ir.lisp
+;;;; ----------------------------------------------------------------------
+
+
 (in-package :expr-ir)
+
+
+(defparameter *function-names* '(:cos :sin :exp :log :sqrt :acos))
+
 
 ;;; ----------------------------------------------------------------------
 ;;; Base classes
@@ -71,6 +80,7 @@ expressions."
       (t
        (error "expr-var-symbol: ~S did not parse to a VARIABLE-EXPRESSION: ~S"
               name-string expr)))))
+
 ;;; ----------------------------------------------------------------------
 ;;; N-ary arithmetic operators (associative, possibly commutative)
 ;;; ----------------------------------------------------------------------
@@ -185,7 +195,7 @@ Within each class, order by a printable name where possible."
     :accessor function-call-name
     :type symbol
     :documentation
-    "Symbol naming the function (e.g. 'sin, 'cos, 'exp, 'log, 'sqrt, 'fabs).")
+    "Symbol naming the function (e.g. :sin, :cos, :exp, :log, :sqrt, :fabs).")
    (argument-list
     :initarg :argument-list
     :accessor function-call-arguments
@@ -299,7 +309,7 @@ This is a pure pass that:
                 (let* ((fname (function-call-name e))
                        (args  (function-call-arguments e))
                        (sargs (mapcar #'simp args)))
-                  (make-expr-funcall fname sargs)))
+                  (make-expr-funcall (ensure-keyword fname) sargs)))
 
                ;; comparisons
                (comparison-expression
@@ -327,6 +337,37 @@ This is a pure pass that:
 
 
 
+
+
+;;; ----------------------------------------------------------------------
+;;; Assist with debugging of statment ordering
+;;; ----------------------------------------------------------------------
+
+(defun expr-free-vars (expr)
+  "Return a list of variable symbols appearing in EXPR.
+We do this via the sexpr representation: the first element of a list
+is treated as an operator/function name, not a variable; only symbols
+in argument positions are counted."
+  (let ((vars '()))
+    (labels ((rec (sexpr)
+               (cond
+                 ;; variable position
+                 ((symbolp sexpr)
+                  (pushnew sexpr vars :test #'eq))
+                 ;; list: (f arg1 arg2 ...)
+                 ((consp sexpr)
+                  (let ((head (car sexpr)))
+                    ;; do not treat HEAD as a variable; it's an operator
+                    (declare (ignore head))
+                    (dolist (arg (cdr sexpr))
+                      (rec arg))))
+                 (t
+                  ;; numbers, etc.
+                  nil))))
+      (rec (expr->sexpr expr))
+      vars)))
+
+
 ;;; ----------------------------------------------------------------------
 ;;; Optional: simple constructor helpers (you can extend / replace these)
 ;;; ----------------------------------------------------------------------
@@ -337,6 +378,8 @@ This is a pure pass that:
 
 (defun make-variable (symbol-name)
   "Convenience constructor for a variable-expression."
+  (unless symbol-name
+    (error "make-variable with nil"))
   (make-instance 'variable-expression :name symbol-name))
 
 
@@ -417,12 +460,14 @@ Variable and function names are lower-cased."
                    ;; map some common names to standard C math names
                    (c-fname   (case (intern fname-str :keyword)
                                 (:sqrt "sqrt")
+                                ((:acos :arccos) "acos")
                                 (:sin  "sin")
                                 (:cos  "cos")
                                 (:tan  "tan")
                                 (:exp  "exp")
                                 (:log  "log")
                                 (:fabs "fabs")
+                                (:acos "acos")
                                 (t fname-str))))
               (format nil "~A(~{~A~^, ~})" c-fname args)))
 
@@ -461,3 +506,306 @@ Variable and function names are lower-cased."
                    (type-of e) e)))))
     (emit expr)))
 
+(defun add-expressions (a b)
+  "Return an expression representing A + B, doing minimal local
+simplification:
+
+  - if A is the constant 0, return B
+  - if B is the constant 0, return A
+  - otherwise build a canonical ADD-EXPRESSION via MAKE-EXPR-ADD."
+
+  ;; Treat NIL as 0 for convenience (in case callers pass it).
+  (when (null a)
+    (setf a (make-constant 0)))
+  (when (null b)
+    (setf b (make-constant 0)))
+
+  (flet ((zero-const-p (e)
+           (and (typep e 'constant-expression)
+                (zerop (expression-value e)))))
+    (cond
+      ((zero-const-p a) b)
+      ((zero-const-p b) a)
+      (t
+       ;; Let MAKE-EXPR-ADD handle flattening, constant folding, ordering, etc.
+       (make-expr-add (list a b))))))
+
+
+
+;;; ----------------------------------------------------------------------
+;;; Normalization pass
+;;; ----------------------------------------------------------------------
+
+(in-package :expr-ir)
+
+(defun unary-minus-sexpr-p (sx)
+  "True if SX is a unary minus of the form (- x)."
+  (and (consp sx)
+       (eq (car sx) '-)
+       (= (length sx) 2)))
+
+(defun normalize-signs-sexpr (sx &optional (sign 1))
+  "Return a new sexpr equivalent to SIGN * SX, with:
+  - unary minus absorbed into numeric factors in products,
+  - unary minus at term level in sums (no -(* ...) inside sums),
+  - nested + and * flattened where possible.
+
+We only do algebraic rewrites for +, * and unary -. Other heads
+(f, sin, cos, ...) are treated as opaque; SIGN is applied as a
+unary minus or numeric negation."
+
+  (cond
+    ;; Unary minus: flip SIGN and recurse on the inside.
+    ((unary-minus-sexpr-p sx)
+     (normalize-signs-sexpr (second sx) (- sign)))
+
+    ;; Addition: SIGN * (t1 + t2 + ...) = sum_i (SIGN * ti).
+    ((and (consp sx) (eq (car sx) '+))
+     (let ((terms '()))
+       (dolist (term (cdr sx))
+         (let ((norm (normalize-signs-sexpr term sign)))
+           ;; flatten nested (+ ...)
+           (if (and (consp norm) (eq (car norm) '+))
+               (setf terms (nconc terms (cdr norm)))
+               (push norm terms))))
+       (setf terms (nreverse terms))
+       (cond
+         ((null terms) 0)
+         ((null (cdr terms)) (car terms))
+         (t (cons '+ terms)))))
+
+    ;; Multiplication: SIGN * (f1 * f2 * ...) => numeric SCALE * product(Fi).
+    ((and (consp sx) (eq (car sx) '*))
+     (let ((scale (if (= sign 1) 1 -1))
+           (factors '()))
+       (dolist (factor (cdr sx))
+         (let ((nf (normalize-signs-sexpr factor 1)))
+           (cond
+             ;; numeric factor: fold into SCALE
+             ((numberp nf)
+              (setf scale (* scale nf)))
+             ;; nested product: flatten
+             ((and (consp nf) (eq (car nf) '*))
+              (setf factors (nconc factors (cdr nf))))
+             ;; ordinary factor
+             (t
+              (push nf factors)))))
+       (setf factors (nreverse factors))
+       ;; build product from SCALE and FACTORS
+       (cond
+         ;; all zero
+         ((zerop scale) 0)
+         ;; scale = 1
+         ((= scale 1)
+          (cond
+            ((null factors) 1)
+            ((null (cdr factors)) (car factors))
+            (t (cons '* factors))))
+         ;; scale = -1
+         ((= scale -1)
+          (cond
+            ((null factors) -1)
+            ;; fold into first numeric factor if present
+            ((numberp (car factors))
+             (let ((first (car factors))
+                   (rest  (cdr factors)))
+               (cond
+                 ((null rest) (- first))
+                 (t (cons '* (cons (- first) rest))))))
+            ;; otherwise explicit -1 factor
+            (t
+             (cons '* (cons -1 factors)))))
+         ;; general nontrivial scale
+         (t
+          (cond
+            ((null factors) scale)
+            (t (cons '* (cons scale factors))))))))
+
+    ;; Generic function call or other operator: recurse into args,
+    ;; then apply SIGN as a unary minus or numeric negation.
+    ((consp sx)
+     (let* ((head (car sx))
+            (args (mapcar (lambda (arg)
+                            (normalize-signs-sexpr arg 1))
+                          (cdr sx)))
+            (inner (cons head args)))
+       (if (= sign 1)
+           inner
+           (if (numberp inner)
+               (- inner)
+               (list '- inner)))))
+
+    ;; Atom: apply SIGN directly.
+    (t
+     (if (= sign 1)
+         sx
+         (if (numberp sx)
+             (- sx)
+             (list '- sx))))))
+
+
+(defun normalize-signs-expr (expr)
+  "Normalize signs in EXPR-IR expression EXPR by lifting unary minus
+out of products/sums and flattening where possible."
+  (sexpr->expr-ir
+   (normalize-signs-sexpr (expr->sexpr expr) 1)))
+
+
+
+;;; ----------------------------------------------------------------------
+;;; Expression -> prefix Lisp S-expressions
+;;; ----------------------------------------------------------------------
+
+(defun expr->sexpr (expr)
+  "Convert an expression IR node to a standard Lisp S-expression in prefix form.
+This is a structural mapping; / is represented via * and expt, not reconstructed."
+  (labels ((rec (e)
+             (typecase e
+               (constant-expression
+                (expression-value e))
+               (variable-expression
+                (variable-name e))
+               (add-expression
+                (cons '+ (mapcar #'rec (expression-arguments e))))
+               (multiply-expression
+                (cons '* (mapcar #'rec (expression-arguments e))))
+               (power-expression
+                (list 'expt
+                      (rec (power-base-expression e))
+                      (rec (power-exponent-expression e))))
+               (negate-expression
+                (list '- (rec (negate-argument-expression e))))
+               (function-call-expression
+                (let* ((fn (function-call-name e))
+                       (ffn (if (keywordp fn)
+                                (intern (symbol-name fn) :cl)
+                                fn)))
+                  (cons ffn
+                        (mapcar #'rec (function-call-arguments e)))))
+               (comparison-expression
+                (let* ((op (comparison-operator e))
+                       (sym (ecase op
+                              (:<  '<)
+                              (:>  '>)
+                              (:<= '<=)
+                              (:>= '>=)
+                              (:=  '=)
+                              (:/= '/=))))
+                  (list sym
+                        (rec (comparison-left-expression e))
+                        (rec (comparison-right-expression e)))))
+               (logical-nary-expression
+                (let* ((op (logical-operator e))
+                       (sym (ecase op
+                              (:and 'and)
+                              (:or  'or))))
+                  (cons sym (mapcar #'rec (logical-arguments e)))))
+               (logical-not-expression
+                (list 'not (rec (logical-not-argument-expression e))))
+               (t
+                (error "Don't know how to convert ~S to S-expression." e)))))
+    (rec expr)))
+
+
+;;; ----------------------------------------------------------------------
+;;; Expression -> infix string
+;;; ----------------------------------------------------------------------
+;;; We use a simple precedence-based printer with parentheses when needed.
+
+(defun expression-precedence (expr)
+  "Return a numeric precedence for EXPR. Larger means binds tighter."
+  (typecase expr
+    (logical-nary-expression
+     (if (eq (logical-operator expr) :or) 1 2)) ; or < and
+    (comparison-expression          3)
+    (add-expression                 4)
+    (multiply-expression            5)
+    ((or negate-expression
+         logical-not-expression)    6) ; unary operators
+    (power-expression               7)
+    ((or function-call-expression
+         constant-expression
+         variable-expression)       8)
+    (t                              0)))
+
+(defun %maybe-paren (string child-prec parent-prec)
+  (if (and parent-prec
+           (< child-prec parent-prec))
+      (format nil "(~a)" string)
+      string))
+
+(defun expr->infix-string (expr &optional parent-precedence)
+  "Convert an expression IR node to an infix string suitable for C-like output."
+  (labels
+      ((rec (e &optional (parent-precedence parent-precedence))
+         (let* ((prec (expression-precedence e)))
+           (flet ((wrap (s child-prec)
+                    (%maybe-paren s child-prec parent-precedence)))
+             (typecase e
+               (constant-expression
+                (wrap (princ-to-string (expression-value e)) prec))
+               (variable-expression
+                (wrap (symbol-name (variable-name e)) prec))
+               (add-expression
+                (let* ((args (expression-arguments e))
+                       (parts (mapcar (lambda (x)
+                                        (rec x prec))
+                                      args))
+                       (joined (format nil "~{~a~^ + ~}" parts)))
+                  (wrap joined prec)))
+               (multiply-expression
+                (let* ((args (expression-arguments e))
+                       (parts (mapcar (lambda (x)
+                                        (rec x prec))
+                                      args))
+                       (joined (format nil "~{~a~^ * ~}" parts)))
+                  (wrap joined prec)))
+               (power-expression
+                (let* ((b (rec (power-base-expression e) prec))
+                       (p (rec (power-exponent-expression e) prec))
+                       (s (format nil "~a ^ ~a" b p)))
+                  (wrap s prec)))
+               (negate-expression
+                (let* ((arg (negate-argument-expression e))
+                       (s (format nil "-~a"
+                                  (rec arg prec))))
+                  (wrap s prec)))
+               (function-call-expression
+                (let* ((name (symbol-name (function-call-name e)))
+                       (args (function-call-arguments e))
+                       (parts (mapcar (lambda (x) (rec x 0)) args))
+                       (s (format nil "~a(~{~a~^, ~})"
+                                  name parts)))
+                  (wrap s prec)))
+               (comparison-expression
+                (let* ((op (comparison-operator e))
+                       (op-str (ecase op
+                                 (:<  "<")
+                                 (:>  ">")
+                                 (:<= "<=")
+                                 (:>= ">=")
+                                 (:=  "==")
+                                 (:/= "!=")))
+                       (lhs (rec (comparison-left-expression e) prec))
+                       (rhs (rec (comparison-right-expression e) prec))
+                       (s   (format nil "~a ~a ~a" lhs op-str rhs)))
+                  (wrap s prec)))
+               (logical-nary-expression
+                (let* ((op (logical-operator e))
+                       (op-str (ecase op
+                                 (:and "&&")
+                                 (:or  "||")))
+                       (args (logical-arguments e))
+                       (parts (mapcar (lambda (x)
+                                        (rec x prec))
+                                      args))
+                       (s (format nil "~{~a~^ ~a ~}"
+                                  parts op-str)))
+                  (wrap s prec)))
+               (logical-not-expression
+                (let* ((arg (logical-not-argument-expression e))
+                       (s (format nil "!~a" (rec arg prec))))
+                  (wrap s prec)))
+               (t
+                (error "Don't know how to print ~S as infix." e)))))))
+    (rec expr nil)))

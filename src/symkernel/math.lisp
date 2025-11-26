@@ -1,3 +1,6 @@
+;;; math.lisp
+
+
 (in-package :opt-exp)
 
 
@@ -16,6 +19,8 @@
   (format stream "{ ~{~a~^ ~}}" (svector-components v))
   )
 
+(defmacro svector (xx yy zz)
+  `(make-svector ',xx ',yy ',zz))
 
 (defun read-svector (stream char)
   (declare (ignore char))
@@ -72,6 +77,25 @@
          (c2 (svector-components sv2))
          (products (mapcar (lambda (a b) `(* ,a ,b)) c1 c2)))
     (expr-sum products)))
+
+(defun sv-len (sv)
+  "Symbolic dot product of two svectors."
+    `(sqrt ,(sv-dot sv sv)))
+
+(defun sv-cross (sv1 sv2)
+  "Symbolic dot product of two svectors."
+  (let* ((c1 (svector-components sv1))
+         (c2 (svector-components sv2))
+         (x1 (elt c1 0))
+         (y1 (elt c1 1))
+         (z1 (elt c1 2))
+         (x2 (elt c2 0))
+         (y2 (elt c2 1))
+         (z2 (elt c2 2))
+         (cross (make-svector `(- (* ,y1 ,z2) (* ,y2 ,z1))
+                              `(- (* ,x2 ,z1) (* ,x1 ,z2))
+                              `(- (* ,x1 ,y2) (* ,x2 ,y1)))))
+    cross))
 
 (defun sv-square-components (sv)
   "Return list of component^2 expressions for an svector."
@@ -200,7 +224,7 @@ TOP-LEVEL = T means: don't wrap the whole thing in parens."
 
 (defun start () 
   (enable-opt-exp-syntax)
-  (in-package :opt-exp-user))
+  (in-package :expr-user))
 
 
 ;;;; Example usage
