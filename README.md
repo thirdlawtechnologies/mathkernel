@@ -3,6 +3,20 @@
 
 Generate math kernels for non-linear optimization and dynamics.
 
+
+## Usage
+
+```
+sbcl
+(ql:quickload :cando-kernels)
+(energy-kernels:write-all "/tmp/code/")
+```
+This builds molecular modeling kernels for evaluating stretch, angle, dihedral, nonbond and nonbond+distance-dependent-dielectric+cutoff terms
+and writes optimized C code into /tmp/code/.
+
+Ask ChatGPT what that means if you want to learn more.  It's math for building molecules.
+
+
 ## Documentation
 
 [Documentation for defkernel](docs/mathkernel.md)
