@@ -66,6 +66,32 @@ Order of precedence:
 ;;; Helper: derivative of unary function-call
 ;;; ----------------------------------------------------------------------
 
+(defun %differentiate-binary-funcall (f arg1 d-arg1 arg2 d-arg2)
+  "Return derivative for f(arg1,arg2) with respect to base variable,
+given d-arg1 = d(arg1)/d(base) and d-arg2 = d(arg2)/d(base)."
+  (ecase f
+    (:atan2
+     ;; We treat f(y,x) = atan2(y,x), like C's atan2.
+     (let* ((y   arg1)
+            (dy  d-arg1)
+            (x   arg2)
+            (dx  d-arg2)
+            (two (make-expr-const 2))
+            ;; x^2 + y^2
+            (x2  (make-expr-pow x two))
+            (y2  (make-expr-pow y two))
+            (den (make-expr-add (list x2 y2)))
+            ;; 1 / (x^2 + y^2)
+            (den-inv (make-expr-pow den (make-expr-const -1)))
+            ;; partials: ∂z/∂y = x/(x^2+y^2), ∂z/∂x = -y/(x^2+y^2)
+            (df-dy (make-expr-mul (list x den-inv)))
+            (df-dx (make-expr-mul (list (make-expr-neg y) den-inv)))
+            ;; dz/dv = df/dy*dy/dv + df/dx*dx/dv
+            (term1 (make-expr-mul (list df-dy dy)))
+            (term2 (make-expr-mul (list df-dx dx))))
+       (make-expr-add (list term1 term2))))))
+
+
 (defun %differentiate-unary-funcall (f arg d-arg)
   "Return derivative for f(arg) with respect to base variable,
 given d-arg = d(arg)/d(base). Uses standard calculus rules for common
@@ -95,9 +121,9 @@ functions; unknown functions are treated as black boxes (derivative 0)."
      (progn
        (let* ((u     arg)
               (du    d-arg) ;; chain rule
-              (one   (make-constant 1.0d0))
-              (two   (make-constant 2.0d0))
-              (minus-half (make-constant -0.5d0))
+              (one   (make-constant 1))
+              (two   (make-constant 2))
+              (minus-half (make-constant -1/2))
               ;; u^2
               (u2    (expr-ir:make-expr-pow u two))
               ;; 1 - u^2  =  1 + (-(u^2))
@@ -109,7 +135,6 @@ functions; unknown functions are treated as black boxes (derivative 0)."
               (core  (expr-ir:make-expr-mul (list du den))))
          ;; - du * (1 - u^2)^(-1/2)
          (expr-ir:make-expr-neg core))))
-
      ))
 
 ;;; ----------------------------------------------------------------------
@@ -223,6 +248,13 @@ independent variable: d(BASE-VAR)/d(BASE-VAR) = 1, others 0."
                            (%differentiate-unary-funcall fname
                                                          (first args)
                                                          (d (first args))))
+                          ;; special-case binary atan2(y, x)
+                          ((and (= (length args) 2)
+                                (member fname *function-names*))
+                           (%differentiate-binary-funcall fname
+                                                          (first args)  (d (first args))
+                                                          (second args) (d (second args))))
+
                           ;; unknown / multi-arg: treat as black box (derivative 0)
                           (t
                            (make-expr-const 0)))))
@@ -239,7 +271,8 @@ independent variable: d(BASE-VAR)/d(BASE-VAR) = 1, others 0."
                       (make-expr-const 0)))))
            dr
            )))
-    (d expr)))
+    (let ((dexpr (d expr)))
+      dexpr)))
 
 
 ;;; ----------------------------------------------------------------------
@@ -469,7 +502,7 @@ If no beneficial factoring is found, return TERMS unchanged (EQ)."
       ;; Atom
       sexpr))
 
-(defun factor-sum-of-products (expr &key (min-uses 2) (min-factors 1) (min-size 4))
+(defun factor-sum-of-products (expr &key (min-uses 2) (min-factors 1) (min-size 2))
   "Return a new EXPR-IR expression where obvious common products across
 sum terms have been factored out once (greedy heuristic):
 

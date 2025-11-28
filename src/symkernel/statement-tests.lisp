@@ -994,8 +994,7 @@ all REQUIRED-FACTORS (by EQ)."
                        block
                        :min-uses    2
                        :min-factors 2
-                       :max-factors 3
-                       :pass-id     99))
+                       :max-factors 3))
          (stmts (stmt-ir:block-statements after-block)))
     (declare (optimize (debug 3)))
     ;; 1. There should be a new temp assignment whose RHS is a product
@@ -1046,8 +1045,7 @@ all REQUIRED-FACTORS (by EQ)."
                        block
                        :min-uses    2
                        :min-factors 2
-                       :max-factors 3
-                       :pass-id     99))
+                       :max-factors 3))
          (stmts (stmt-ir:block-statements after-block)))
     ;; There should be no new CSE_P* temp defined for this pattern.
     (let ((temp-assignment
@@ -1081,8 +1079,7 @@ i(defun expr-nil-variable-p (expr)
                        block
                        :min-uses    2
                        :min-factors 2
-                       :max-factors 3
-                       :pass-id     99)))
+                       :max-factors 3)))
     (dolist (st (stmt-ir:block-statements after-block))
       (when (typep st 'assignment-statement)
         (let ((rhs (stmt-expression st)))
@@ -1094,19 +1091,6 @@ i(defun expr-nil-variable-p (expr)
                        'test-factor-temp-param-products-no-nil-rhs
                        "Assignment ~S has NIL variable RHS after factoring."
                        st))))))
-
-(defun sexpr-product-contains-named-factors-p (sexpr required-names)
-  "True if SEXPR is a product (* ...) whose factors include all REQUIRED-NAMES
-(as symbol-names, case-insensitive)."
-  (and (consp sexpr)
-       (eq (car sexpr) '*)
-       (let ((args (cdr sexpr)))
-         (every (lambda (req-name)
-                  (some (lambda (factor)
-                          (and (symbolp factor)
-                               (string= (symbol-name factor) req-name)))
-                        args))
-                required-names))))
 
 (defun count-product-subexprs-with-names-in-block (block factor-names)
   "Count how many product subexpressions in BLOCK contain all FACTOR-NAMES."
@@ -1159,12 +1143,11 @@ i(defun expr-nil-variable-p (expr)
            (count-product-subexprs-with-names-in-block
             block '("CSE_P1_T37" "CSE_P1_T5")))
          (after-block
-           (stmt-ir:factor-temp-param-products-optimization (stmt-ir:make-pass-id-counter)
+           (stmt-ir:factor-temp-param-products-optimization (stmt-ir:make-pass-id-counter :start 76)
             block
             :min-uses    2
             :min-factors 2
-            :max-factors 3
-            :pass-id     77))
+            :max-factors 3))
          (after-count
            (count-product-subexprs-with-names-in-block
             after-block '("CSE_P1_T37" "CSE_P1_T5")))
@@ -1203,12 +1186,11 @@ i(defun expr-nil-variable-p (expr)
            (count-product-subexprs-with-names-in-block
             block '("CSE_P1_T148" "KT")))
          (after-block
-           (stmt-ir:factor-temp-param-products-optimization (stmt-ir:make-pass-id-counter)
+           (stmt-ir:factor-temp-param-products-optimization (stmt-ir:make-pass-id-counter :start 87)
             block
             :min-uses    2
             :min-factors 2
-            :max-factors 3
-            :pass-id     88))
+            :max-factors 3))
          (after-count
            (count-product-subexprs-with-names-in-block
             after-block '("CSE_P1_T148" "KT")))
@@ -1287,24 +1269,7 @@ i(defun expr-nil-variable-p (expr)
                  "Expected a temp assignment CSE_P101_T* for CSE_P1_T13*CSE_P1_T7, but found none.")))
 
 
-(defun looks-like-cse-temp-symbol-p (sym)
-  (and (symbolp sym)
-       (let ((name (symbol-name sym)))
-         (and (>= (length name) 5)
-              (search "CSE_P" name :test #'char-equal)))))
 
-(defun sexpr-product-contains-named-factors-p (sexpr required-names)
-  "True if SEXPR is a product (* ...) whose factors include all REQUIRED-NAMES
-(as symbol-names, case-insensitive)."
-  (and (consp sexpr)
-       (eq (car sexpr) '*)
-       (let ((args (cdr sexpr)))
-         (every (lambda (req-name)
-                  (some (lambda (factor)
-                          (and (symbolp factor)
-                               (string= (symbol-name factor) req-name)))
-                        args))
-                required-names))))
 
 (defun count-direct-products-with-names-in-block (block required-names)
   "Count product subexpressions in RHS of non-temp assignments in BLOCK
@@ -1348,12 +1313,11 @@ that contain all REQUIRED-NAMES."
                                                   :max-passes 3
                                                   :min-uses 2
                                                   :min-size 1))
-         (factored-block (stmt-ir:factor-temp-param-products-optimization (stmt-ir:make-pass-id-counter)
+         (factored-block (stmt-ir:factor-temp-param-products-optimization (stmt-ir:make-pass-id-counter :start 99)
                           full-block-cse
                           :min-uses    2
                           :min-factors 2
-                          :max-factors 3
-                          :pass-id     123))
+                          :max-factors 3))
 
          ;; count direct occurrences of products containing both C148 and KT
          ;; in non-temp assignments
@@ -1371,7 +1335,7 @@ that contain all REQUIRED-NAMES."
               (and (typep stmt 'stmt-ir:assignment-statement)
                    (let ((name (stmt-ir:stmt-target-name stmt)))
                      (and (symbolp name)
-                          (search "CSE_P123_T"
+                          (search "CSE_P100_T"
                                   (symbol-name name)
                                   :test #'char-equal)))
                    (let* ((rhs (stmt-ir:stmt-expression stmt))
@@ -1386,7 +1350,7 @@ that contain all REQUIRED-NAMES."
     ;; 1) We introduced a temp with 2*C148*KT in its RHS
     (assert-true temp-assignment
                  'test-angle-like-pipeline_factor_temp_param
-                 "Expected pipeline to introduce a temp CSE_P123_T* whose RHS contains CSE_P1_T148 and KT.")
+                 "Expected pipeline to introduce a temp CSE_P100_T* whose RHS contains CSE_P1_T148 and KT.")
     ;; 2) No remaining direct occurrences of that subproduct in non-temp assignments
     (assert-true (zerop after-count)
                  'test-angle-like-pipeline_factor_temp_param
@@ -1446,12 +1410,11 @@ that contain all REQUIRED-NAMES."
          (before-count
            (count-products-with-named-factors-in-block block required-names))
          (after-block
-           (stmt-ir:factor-temp-param-products-optimization (stmt-ir:make-pass-id-counter)
+           (stmt-ir:factor-temp-param-products-optimization (stmt-ir:make-pass-id-counter :start 199)
             block
             :min-uses    2
             :min-factors 3
-            :max-factors 3
-            :pass-id     200))
+            :max-factors 3))
          (after-count
            (count-products-with-named-factors-in-block after-block required-names))
          ;; Any temp introduced by this pass?
@@ -1495,12 +1458,11 @@ that contain all REQUIRED-NAMES."
          (before-count
            (count-products-with-named-factors-in-block block required-names))
          (after-block
-           (stmt-ir:factor-temp-param-products-optimization (stmt-ir:make-pass-id-counter)
+           (stmt-ir:factor-temp-param-products-optimization (stmt-ir:make-pass-id-counter :start 200)
             block
             :min-uses    2
             :min-factors 3
-            :max-factors 3
-            :pass-id     201))
+            :max-factors 3))
          (after-count
            (count-products-with-named-factors-in-block after-block required-names))
          (temp-assignment

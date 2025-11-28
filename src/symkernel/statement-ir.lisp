@@ -270,6 +270,63 @@ passed through EXPR-IR:SIMPLIFY-EXPR."
   "When true, extra consistency checks (e.g. assignment ordering) are
 performed when building kernels.")
 
+
+
+(defun debug-block (block &key label (stream *trace-output*))
+  "Pretty-print a STMT-IR:BLOCK-STATEMENT and its nested statements.
+
+LABEL, if non-NIL, is printed as a comment header. STREAM defaults
+to *TRACE-OUTPUT* so it plays nicely with your existing tracing."
+  (let ((*package* (find-package :expr-var)))
+    (when label
+      (format stream "~&;;; ~A~%" label))
+    (debug-stmt block stream 0))
+  (terpri stream)
+  block)
+
+(defun debug-stmt (stmt stream indent)
+  "Internal helper: print STMT at given INDENT to STREAM."
+  (flet ((indent! ()
+           (dotimes (i indent)
+             (write-char #\Space stream))))
+    (typecase stmt
+      (block-statement
+       (indent!) (format stream "{~%")
+       (dolist (s (block-statements stmt))
+         (debug-stmt s stream (+ indent 2)))
+       (indent!) (format stream "}~%"))
+
+      (if-statement
+       (indent!)
+       (format stream "if (~S)~%"
+               (expr-ir:expr->sexpr (if-condition stmt)))
+       (indent!) (format stream "then~%")
+       (debug-stmt (if-then-block stmt) stream (+ indent 2))
+       (when (if-else-block stmt)
+         (indent!) (format stream "else~%")
+         (debug-stmt (if-else-block stmt) stream (+ indent 2))))
+
+      (accumulation-anchor-statement
+       (format stream "ACCUMULATE-HERE;~%"))
+
+      (assignment-statement
+       (let ((target  (stmt-target-name stmt))
+             (indices (stmt-target-indices stmt))
+             (expr    (stmt-expression stmt)))
+         (indent!)
+         (if indices
+             (format stream "~A~S := ~S~%"
+                     target indices (expr-ir:expr->sexpr expr))
+             (format stream "~A := ~S~%"
+                     target (expr-ir:expr->sexpr expr)))))
+
+      ;; Fallback: print any other statement with READ-able syntax.
+      (t
+       (indent!)
+       (format stream "~S~%" stmt)))))
+
+
+  
 (defun cse-temp-symbol-p (sym)
   "Return true if SYM looks like a CSE temp (e.g. CSE_P2_T17 or CSE_T17)."
   (and (symbolp sym)
@@ -419,6 +476,10 @@ Each statement is numbered. For each assignment we show:
             (expr   (stmt-expression stmt))
             (tname  (%c-ident target))
             (rhs    (expr-ir:expr->c-expr-string expr)))
+       (let ((*package* (find-package :expr-var))
+             (*print-pretty* nil))
+         (%indent indent stream)
+         (format stream "// ~a = ~a;~%" target (expr-ir:expr->sexpr expr)))
        (%indent indent stream)
        (format stream "~A = ~A;~%" tname rhs)))
 
@@ -447,6 +508,10 @@ Each statement is numbered. For each assignment we show:
     (block-statement
      ;; Generic block outside of if/function: just emit its contents
      (emit-block-c stmt indent stream))
+
+    (accumulation-anchor-statement
+     ;; Do nothing
+     nil)
 
     (t
      (error "emit-statement-c: unknown statement type ~S" stmt))))
@@ -1066,10 +1131,10 @@ Each pass uses a distinct temp namespace: CSE_P<pass>_T<n>."
   "Compatibility wrapper that runs CSE with a fresh, local pass-id counter."
   (Warn "cse-block-multi is a thin wrapper for debugging")
   (let ((counter (make-pass-id-counter)))
-    (cse-block-multi-with-counter counter block
-                                  :max-passes max-passes
-                                  :min-uses   min-uses
-                                  :min-size   min-size)))
+    (cse-block-multi-optimization counter block
+                                               :max-passes max-passes
+                                               :min-uses   min-uses
+                                               :min-size   min-size)))
 
 
 
@@ -1077,6 +1142,207 @@ Each pass uses a distinct temp namespace: CSE_P<pass>_T<n>."
 ;;; Copy propagation / dead trivial copies on blocks
 ;;; ------------------------------------------------------------
 
+(defun copy-propagate-optimization (pass-counter block)
+  "Eliminate trivial copies in BLOCK of the form:
+     t = u;
+   where the RHS is just a variable (symbol).
+
+We:
+  - maintain an env mapping symbols to their 'root' representative,
+  - rewrite all RHS expressions using this env,
+  - for trivial copies t = u:
+      * in straight-line/top-level code, we may coalesce or alias
+        and drop the copy (as before),
+      * inside IF branches, we keep the copy (so that definitions
+        remain explicit across control-flow joins) and do not
+        rely on branch-local aliasing outside the branch."
+  (declare (ignore pass-counter))
+  (labels
+      ((find-root (sym env)
+         "Follow env mapping sym -> ... until a fixed point."
+         (loop
+           for s = sym then (or (gethash s env) s)
+           for next = (gethash s env)
+           while next
+           finally (return s)))
+
+       (rewrite-sexpr (sexpr env)
+         (cond
+           ((symbolp sexpr)
+            (find-root sexpr env))
+           ((consp sexpr)
+            (mapcar (lambda (sub) (rewrite-sexpr sub env)) sexpr))
+           (t
+            sexpr)))
+
+       (rewrite-expr (expr env)
+         (let* ((sexpr     (expr-ir:expr->sexpr expr))
+                (new-sexpr (rewrite-sexpr sexpr env)))
+           (expr-ir:sexpr->expr-ir new-sexpr)))
+
+       ;; --- helpers for renaming a symbol in already-processed stmts ---
+
+       (rename-symbol-in-sexpr (sexpr from to)
+         (cond
+           ((symbolp sexpr)
+            (if (eq sexpr from) to sexpr))
+           ((consp sexpr)
+            (mapcar (lambda (sub)
+                      (rename-symbol-in-sexpr sub from to))
+                    sexpr))
+           (t
+            sexpr)))
+
+       (rename-symbol-in-expr (expr from to)
+         (expr-ir:sexpr->expr-ir
+          (rename-symbol-in-sexpr
+           (expr-ir:expr->sexpr expr)
+           from to)))
+
+       (rename-symbol-in-stmt (cycle from to)
+         (typecase cycle
+           (assignment-statement
+            (let* ((tgt      (stmt-target-name cycle))
+                   (idxs     (stmt-target-indices cycle))
+                   (new-tgt  (if (eq tgt from) to tgt))
+                   (new-idxs (and idxs
+                                  (mapcar (lambda (e)
+                                            (rename-symbol-in-expr e from to))
+                                          idxs)))
+                   (new-expr (rename-symbol-in-expr
+                              (stmt-expression cycle) from to)))
+              (make-assignment-stmt new-tgt new-expr new-idxs)))
+           (block-statement
+            (make-block-stmt
+             (mapcar (lambda (sub)
+                       (rename-symbol-in-stmt sub from to))
+                     (block-statements cycle))))
+           (if-statement
+            (let* ((new-cond (rename-symbol-in-expr
+                              (if-condition cycle) from to))
+                   (then-b  (if-then-block cycle))
+                   (else-b  (if-else-block cycle))
+                   (new-then (when then-b
+                               (make-block-stmt
+                                (mapcar (lambda (sub)
+                                          (rename-symbol-in-stmt sub from to))
+                                        (block-statements then-b)))))
+                   (new-else (when else-b
+                               (make-block-stmt
+                                (mapcar (lambda (sub)
+                                          (rename-symbol-in-stmt sub from to))
+                                        (block-statements else-b))))))
+              (make-if-stmt new-cond new-then new-else)))
+           (t
+            cycle)))
+
+       (rename-symbols-in-stmt-list (stmts from to)
+         (mapcar (lambda (cycle)
+                   (rename-symbol-in-stmt cycle from to))
+                 stmts))
+
+       (update-env-for-rename (env from to)
+         "Adjust ENV so that FROM is now treated as an alias of TO,
+and any entries that mapped to FROM now map to TO."
+         (maphash (lambda (k v)
+                    (when (eq v from)
+                      (setf (gethash k env) to)))
+                  env)
+         ;; FROM now aliases TO; TO should not be an alias.
+         (remhash to env)
+         (setf (gethash from env) to))
+
+       (symbol-defined-p (sym stmts)
+         "Return true if SYM appears as a target-name of any
+assignment-statement in STMTS."
+         (loop for cycle in stmts
+               thereis (and (typep cycle 'assignment-statement)
+                            (eq (stmt-target-name cycle) sym))))
+
+       (process-block (blk env &optional inside-if-p)
+         "Return (new-block new-env).
+
+INSIDE-IF-P non-NIL means we are processing the body of an IF branch.
+In that case, we must not drop trivial copies that may be the only
+definitions visible at the join; we keep those assignments instead of
+turning them into pure env aliases."
+         (let ((new-stmts '()))
+           (dolist (cycle (block-statements blk))
+             (typecase cycle
+               (assignment-statement
+                (let* ((target   (stmt-target-name cycle))
+                       (expr     (stmt-expression cycle))
+                       ;; rewrite RHS through current env
+                       (new-expr (rewrite-expr expr env))
+                       (sexpr    (expr-ir:expr->sexpr new-expr)))
+                  (cond
+                    ;; Trivial copy: target = sexpr; sexpr is a symbol
+                    ((and (symbolp sexpr)
+                          (not (eq target sexpr)))
+                     (let ((src sexpr)
+                           (dst target))
+                       (if inside-if-p
+                           ;; Inside IF branches: keep the assignment so the
+                           ;; definition is explicit at the join. We may
+                           ;; still rewrite RHS via env, but we do not drop
+                           ;; the copy nor rely on branch-local aliasing
+                           ;; after the IF.
+                           (progn
+                             (remhash dst env)
+                             (push (make-assignment-stmt
+                                    dst new-expr (stmt-target-indices cycle))
+                                   new-stmts))
+                           ;; Straight-line case (old behavior): coalesce
+                           ;; or alias and drop the copy.
+                           (if (symbol-defined-p src new-stmts)
+                               (progn
+                                 (setf new-stmts
+                                       (rename-symbols-in-stmt-list
+                                        new-stmts src dst))
+                                 (update-env-for-rename env src dst))
+                               (setf (gethash dst env)
+                                     (find-root src env))))))
+
+                    (t
+                     ;; Keep assignment; target now has its own definition
+                     (remhash target env)
+                     (push (make-assignment-stmt target new-expr
+                                                 (stmt-target-indices cycle))
+                           new-stmts)))))
+
+               (block-statement
+                (multiple-value-bind (sub-block new-env)
+                    (process-block cycle env inside-if-p)
+                  (setf env new-env)
+                  (push sub-block new-stmts)))
+
+               (if-statement
+                ;; Rewrite condition through env, and process branches with
+                ;; copies of env. We do not merge branch envs back; this
+                ;; treats the IF as a barrier for copy-propagation.
+                (let* ((cond-expr (rewrite-expr (if-condition cycle) env))
+                       (then-env (copy-env-hash-table env))
+                       (else-env (copy-env-hash-table env)))
+                  (multiple-value-bind (then-block then-env-out)
+                      (process-block (if-then-block cycle) then-env t)
+                    (declare (ignore then-env-out))
+                    (multiple-value-bind (else-block else-env-out)
+                        (if (if-else-block cycle)
+                            (process-block (if-else-block cycle) else-env t)
+                            (values nil else-env))
+                      (declare (ignore else-env-out))
+                      (push (make-if-stmt cond-expr then-block else-block)
+                            new-stmts)))))
+
+               (t
+                (push cycle new-stmts))))
+           (values (make-block-stmt (nreverse new-stmts)) env))))
+    (multiple-value-bind (new-block env)
+        (process-block block (make-hash-table :test #'eq))
+      (declare (ignore env))
+      new-block)))
+
+#+(or)
 (defun copy-propagate-optimization (pass-counter block)
   "Eliminate trivial copies in BLOCK of the form:
      t = u;
@@ -1583,6 +1849,46 @@ has had EXPR-IR:NORMALIZE-SIGNS-EXPR applied."
      (mapcar #'rewrite-stmt (block-statements block)))))
 
 
+;;; ----------------------------------------------------------------------
+;;; Optimization to apply rewrite expressions
+;;; ----------------------------------------------------------------------
+
+(defun rewrite-exprs-in-block-optimization (pass-counter block &key (rules expr-ir:*rewrite-rules-basic*) (max-iterations 5))
+  "Return a new BLOCK where every expr-ir expression has been rewritten
+via REWRITE-EXPR-IR-WITH-RULES using RULES.
+
+BLOCK is a STMT-IR:BLOCK-STATEMENT."
+  (labels
+      ((rewrite-expr (e)
+         (rewrite-expr-ir-with-rules e rules :max-iterations max-iterations))
+       (rewrite-stmt (st)
+         (typecase st
+           (stmt-ir:assignment-statement
+            (let* ((rhs (stmt-ir:stmt-expression st))
+                   (rhs2 (rewrite-expr rhs)))
+              (if (eq rhs rhs2)
+                  st
+                  (stmt-ir:make-assignment-stmt
+                   (stmt-ir:stmt-target-name st)
+                   rhs2
+                   (stmt-ir:stmt-target-indices st)))))
+           (stmt-ir:if-statement
+            (let* ((cond      (stmt-ir:if-condition st))
+                   (new-cond  (rewrite-expr cond))
+                   (then-blk  (stmt-ir:if-then-block st))
+                   (else-blk  (stmt-ir:if-else-block st))
+                   (new-then  (rewrite-block then-blk))
+                   (new-else  (and else-blk (rewrite-block else-blk))))
+              (stmt-ir:make-if-stmt new-cond new-then new-else)))
+           (stmt-ir:block-statement
+            (rewrite-block st))
+           (t st)))
+       (rewrite-block (blk)
+         (let ((new-stmts '()))
+           (dolist (st (stmt-ir:block-statements blk)
+                       (stmt-ir:make-block-stmt (nreverse new-stmts)))
+             (push (rewrite-stmt st) new-stmts)))))
+    (rewrite-block block)))
 
 
 ;;; -------------------------------
@@ -1634,6 +1940,43 @@ in RHSs, indices, and conditions."
     (comp-block block)))
 
 
+
+
+(defun linear-canonicalization-optimization (pass-counter block &key)
+  "Walk BLOCK and linear-canonicalize every expression, to help factoring and CSE.
+Only linear subexpressions are changed; non-linear ones are left as-is."
+  (declare (ignore pass-counter))
+  (labels
+      ((rewrite-expr (expr)
+         ;; You can wrap with SIMPLIFY-EXPR if you like:
+         ;; (expr-ir:simplify-expr
+         ;;   (expr-ir:canonicalize-linear-subexprs expr))
+         (expr-ir:simplify-expr
+          (expr-ir:canonicalize-linear-subexprs expr)))
+
+       (rewrite-stmt (st)
+         (typecase st
+           (assignment-statement
+            (make-assignment-stmt
+             (stmt-target-name st)
+             (rewrite-expr (stmt-expression st))
+             (stmt-target-indices st)))
+
+           (if-statement
+            (let* ((new-cond (rewrite-expr (if-condition st)))
+                   (then-blk (if-then-block st))
+                   (else-blk (if-else-block st))
+                   (new-then (rewrite-stmt then-blk))
+                   (new-else (and else-blk (rewrite-stmt else-blk))))
+              (make-if-stmt new-cond new-then new-else)))
+
+           (block-statement
+            (make-block-stmt
+             (mapcar #'rewrite-stmt (block-statements st))))
+
+           (t
+            st))))
+    (rewrite-stmt block)))
 
 
 ;;; -------------------------------
@@ -1783,6 +2126,7 @@ RESULTS-LIST is a list of plists:
                      (run-optimization pass-counter opt current
                                        :name cur-name
                                        :measure measure :log-stream log-stream)
+                   (stmt-ir:debug-block new-block :label (format nil "block after optimization ~s" cur-name))
                    (push (list :opt-name (format nil "~a ~a" cur-name (optimization-name opt))
                                :before   before
                                :after    after
@@ -1791,3 +2135,308 @@ RESULTS-LIST is a list of plists:
                    (setf current new-block)))))
     (let ((total-after (funcall measure current)))
       (values current (nreverse results) total-before total-after))))
+
+;;; ----------------------------------------------------------------------
+;;; accumulation control
+;;; ----------------------------------------------------------------------
+
+
+(defclass accumulation-anchor-statement ()
+  ()
+  (:documentation
+   "Marker statement indicating where gradient/Hessian scalar
+assignments (G_*/H_*_*) should be inserted before transform-eg-h-block.
+Has no runtime effect by itself."))
+
+(defun make-accum-anchor-stmt ()
+  (make-instance 'accumulation-anchor-statement))
+
+
+(defmacro accumulate-here ()
+  "Place this in a stmt-block inside the kernel body where you want
+gradient/Hessian accumulation code to be spliced.
+
+Example:
+
+  (stmt-block
+    ...
+    (stmt-ir:make-if-stmt
+      (expr-ir:parse-expr \"r < r_cut\")
+      (stmt-block
+        ... ; compute energy, dE/dr, d2E/dr2
+        (accumulate-here))     ; <--- here
+      (stmt-block))
+    ...)"
+  `(stmt-ir:make-accum-anchor-stmt))
+
+(defun block-has-accum-anchor-p (block)
+  "Return T if BLOCK (a stmt-ir:block-statement) contains at least
+one accumulation-anchor-statement anywhere inside."
+  (labels ((scan-stmt (st)
+             (typecase st
+               (stmt-ir:accumulation-anchor-statement
+                t)
+               (stmt-ir:block-statement
+                (some #'scan-stmt (stmt-ir:block-statements st)))
+               (stmt-ir:if-statement
+                (or (scan-stmt (stmt-ir:if-then-block st))
+                    (and (stmt-ir:if-else-block st)
+                         (scan-stmt (stmt-ir:if-else-block st)))))
+               (t
+                nil))))
+    (scan-stmt block)))
+
+(defun splice-derivatives-at-accum-anchor
+    (block grad-stmts hess-stmts
+           &key compute-grad compute-hess)
+  "Return a new BLOCK where any accumulation-anchor-statement has been
+replaced by the given gradient/Hessian assignment statements.
+
+GRAD-STMTS and HESS-STMTS are lists of stmt-ir:assignment-statement
+(or similar). If COMPUTE-GRAD or COMPUTE-HESS is NIL, the corresponding
+statements are not inserted. If both are NIL, anchors are simply removed."
+  (labels
+      ((rewrite-stmt-list (stmts)
+         (loop for st in stmts
+               nconc (rewrite-stmt st)))
+
+       (rewrite-stmt (st)
+         (typecase st
+           (stmt-ir:accumulation-anchor-statement
+            ;; Replace anchor by grad/hess, or drop it entirely.
+            (let ((inserted '()))
+              (when compute-grad
+                (setf inserted (nconc inserted (copy-list grad-stmts))))
+              (when compute-hess
+                (setf inserted (nconc inserted (copy-list hess-stmts))))
+              inserted))
+
+           (stmt-ir:block-statement
+            (list (stmt-ir:make-block-stmt
+                   (rewrite-stmt-list (stmt-ir:block-statements st)))))
+
+           (stmt-ir:if-statement
+            (let* ((then-blk (stmt-ir:if-then-block st))
+                   (else-blk (stmt-ir:if-else-block st))
+                   (new-then (stmt-ir:make-block-stmt
+                              (rewrite-stmt-list
+                               (stmt-ir:block-statements then-blk))))
+                   (new-else (when else-blk
+                               (stmt-ir:make-block-stmt
+                                (rewrite-stmt-list
+                                 (stmt-ir:block-statements else-blk))))))
+              (list (stmt-ir:make-if-stmt
+                     (stmt-ir:if-condition st)
+                     new-then
+                     new-else))))
+
+           (t
+            (list st)))))
+    (stmt-ir:make-block-stmt
+     (rewrite-stmt-list (stmt-ir:block-statements block)))))
+
+
+(defun make-kernel-from-block
+    (&key name pipeline layout coord-vars coord-load-stmts base-block params
+       compute-energy compute-grad compute-hess derivatives)
+  (let* ((energy-var 'energy)
+         (manual-deriv-spec (normalize-derivatives-spec derivatives))
+         ;; Expand D! requests first
+         (base-block* (expand-derivative-requests base-block))
+         (pass-counter (stmt-ir:make-pass-id-counter)))
+    ;; Optional geometry checking / auto-fill stays the same, but use base-block*
+    (when manual-deriv-spec
+      (check-intermediate-geometry! base-block* coord-vars manual-deriv-spec))
+    (when manual-deriv-spec
+      (auto-fill-intermediate-geometry-from-ad
+       base-block* coord-vars manual-deriv-spec
+       :compute-second-derivs t
+       :reuse-assignments t))
+
+    (labels ((the-name (nm)
+               (format nil "~a ~a" name nm)))
+      ;; 1. Build gradient/Hessian scalar assignments, but do *not* append yet
+      (let* ((grad-stmts (and compute-grad
+                              (make-gradient-assignments-from-block
+                               base-block* energy-var coord-vars
+                               #'general-grad-name
+                               manual-deriv-spec)))
+             (hess-stmts (and compute-hess
+                              (make-hessian-assignments-from-block
+                               base-block* energy-var coord-vars
+                               #'general-hess-name
+                               manual-deriv-spec)))
+             (has-anchor (block-has-accum-anchor-p base-block*))
+             ;; 2. Combine base block + grad/hess, either via anchor or by append
+             (combined-block
+               (cond
+                 (has-anchor
+                  (splice-derivatives-at-accum-anchor
+                   base-block*
+                   (or grad-stmts '())
+                   (or hess-stmts '())
+                   :compute-grad compute-grad
+                   :compute-hess compute-hess))
+                 (t
+                  ;; old behavior: append at end
+                  (let* ((stmts (copy-list
+                                 (stmt-ir:block-statements base-block*))))
+                    (when grad-stmts
+                      (setf stmts (append stmts grad-stmts)))
+                    (when hess-stmts
+                      (setf stmts (append stmts hess-stmts)))
+                    (stmt-ir:make-block-stmt stmts)))))
+             ;; 3. Run optimization pipeline on the combined block
+             (opt-block combined-block))
+        (when pipeline
+          (multiple-value-bind (opt-block* results total-before total-after)
+              (stmt-ir:run-optimization-pipeline
+               pass-counter pipeline opt-block
+               :name (the-name "e-g-hess")
+               :log-stream *trace-output*)
+            (declare (ignore results total-before total-after))
+            (setf opt-block opt-block*)))
+        ;; 4. Prepend coord load, if any
+        (let* ((block-with-coords
+                 (if coord-load-stmts
+                     (stmt-ir:make-block-stmt
+                      (append coord-load-stmts
+                              (list opt-block)))
+                     opt-block))
+               ;; 5. Transform energy/grad/hess scalar assignments into
+               ;;    *Energy +=, ForceAcc, DiagHessAcc, OffDiagHessAcc
+               (transformed
+                 (transform-eg-h-block
+                  block-with-coords
+                  layout
+                  coord-vars
+                  #'general-grad-name
+                  #'general-hess-name))
+               (locals (infer-kernel-locals transformed params coord-vars)))
+          ;; 6. Wrap into a C function, as before
+          (stmt-ir:make-c-function
+           name
+           transformed
+           :return-type "void"
+           :parameters  params
+           :locals      locals))))))
+
+
+;;; ----------------------------------------------------------------------
+;;; copy alias optimizations
+;;; ----------------------------------------------------------------------
+
+(defun copy-expr-alias-env (env)
+  (let ((new (make-hash-table :test #'equal)))
+    (maphash (lambda (k v)
+               (setf (gethash k new) v))
+             env)
+    new))
+
+(defun rewrite-sexpr-using-aliases (sexpr env)
+  "Rewrite SEXPR by replacing any subexpression that exactly matches a key
+in ENV (sexpr -> symbol) by that symbol."
+  (cond
+    ((atom sexpr)
+     sexpr)
+    (t
+     (let* ((op       (car sexpr))
+            (args     (cdr sexpr))
+            (new-args (mapcar (lambda (sub)
+                                (rewrite-sexpr-using-aliases sub env))
+                              args))
+            (candidate (cons op new-args))
+            (alias     (gethash candidate env)))
+       (if alias
+           alias
+           candidate)))))
+
+(defun rewrite-expr-using-aliases (expr env)
+  (let* ((sx  (expr-ir:expr->sexpr expr))
+         (sx2 (rewrite-sexpr-using-aliases sx env)))
+    (expr-ir:sexpr->expr-ir sx2)))
+
+(defun good-alias-rhs-p (sx target)
+  "Heuristic: which RHS expressions should we use as aliases?
+We generally want non-trivial, non-constant, non-single-variable terms."
+  (declare (ignore target))
+  (cond
+    ;; constants: not helpful
+    ((numberp sx) nil)
+    ;; single symbol RHS: that's just a copy, let copy-propagation handle it
+    ((symbolp sx) nil)
+    ;; anything else is fair game
+    (t t)))
+
+(defun note-alias-from-assignment (stmt env)
+  "If STMT is 'TARGET := EXPR', record EXPR's sexpr as an alias mapping
+EXPR -> TARGET, provided it passes GOOD-ALIAS-RHS-P."
+  (when (typep stmt 'assignment-statement)
+    (let* ((target (stmt-target-name stmt))
+           (expr   (stmt-expression stmt))
+           (sx     (expr-ir:expr->sexpr expr)))
+      (when (good-alias-rhs-p sx target)
+        (setf (gethash sx env) target)))))
+
+(defun alias-assigned-exprs-optimization (pass-counter block)
+  "General aliasing optimization.
+
+For every assignment
+
+  T := <EXPR>
+
+we record an alias mapping <EXPR> -> T, and then in all later statements
+in the same control-flow region we rewrite any subexpression equal to <EXPR>
+to the variable T.
+
+- Aliases flow forward within a block.
+- Aliases are visible inside THEN/ELSE blocks if defined before the IF.
+- Aliases defined inside a branch do not leak out to the parent block."
+  (declare (ignore pass-counter))
+  (labels
+      ((process-block (blk env)
+         (let ((new-stmts '()))
+           (dolist (st (block-statements blk))
+             (typecase st
+               (assignment-statement
+                ;; First, rewrite RHS with current aliases
+                (let* ((expr      (stmt-expression st))
+                       (new-expr  (rewrite-expr-using-aliases expr env))
+                       (new-stmt  (make-assignment-stmt
+                                   (stmt-target-name st)
+                                   new-expr
+                                   (stmt-target-indices st))))
+                  ;; Keep the rewritten assignment
+                  (push new-stmt new-stmts)
+                  ;; Then possibly register a new alias based on its RHS
+                  (note-alias-from-assignment new-stmt env)))
+
+               (block-statement
+                (multiple-value-bind (sub-block env-out)
+                    (process-block st env)
+                  (declare (ignore env-out))
+                  (push sub-block new-stmts)))
+
+               (if-statement
+                (let* ((new-cond (rewrite-expr-using-aliases
+                                  (if-condition st) env))
+                       (then-env (copy-expr-alias-env env))
+                       (else-env (copy-expr-alias-env env)))
+                  (multiple-value-bind (then-block then-env-out)
+                      (process-block (if-then-block st) then-env)
+                    (declare (ignore then-env-out))
+                    (multiple-value-bind (else-block else-env-out)
+                        (if (if-else-block st)
+                            (process-block (if-else-block st) else-env)
+                            (values nil else-env))
+                      (declare (ignore else-env-out))
+                      (push (make-if-stmt new-cond then-block else-block)
+                            new-stmts)))))
+
+               (t
+                (push st new-stmts))))
+           (values (make-block-stmt (nreverse new-stmts)) env))))
+    (multiple-value-bind (new-block env-out)
+        (process-block block (make-hash-table :test #'equal))
+      (declare (ignore env-out))
+      new-block)))

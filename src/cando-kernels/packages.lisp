@@ -2,6 +2,10 @@
 (defpackage :energy-kernels
   (:use :cl :opt-exp :expr-ir :stmt-ir)
   (:export
-   #:generate-kernel-code
-   ))
+   #:rewrite-expr-ir-with-rules
+   #:rewrite-sexpr-with-rules
+   #:*rewrite-rules-basic*
+   #:write-c-code
+   #:*post-eg-h-pipeline*
+   #:write-all))
 

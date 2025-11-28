@@ -9,6 +9,12 @@
    :name :kernel-full
    :optimizations
    (list
+
+    ;; linear canonicalization to unify linear forms before factoring + CSE
+    (stmt-ir:make-optimization
+     :name :linear-canonicalization
+     :function #'stmt-ir:linear-canonicalization-optimization)
+
     ;; factor sums
     (stmt-ir:make-optimization
      :name :factor-sums
@@ -34,6 +40,12 @@
     (stmt-ir:make-optimization
      :name :copy-propagate
      :function #'stmt-ir:copy-propagate-optimization)
+
+     ;; expt aliasing
+    (stmt-ir:make-optimization
+     :name :alias-assigned-exprs
+     :function #'stmt-ir:alias-assigned-exprs-optimization)
+
     ;; sign normalization
     (stmt-ir:make-optimization
      :name :normalize-signs
@@ -41,13 +53,11 @@
 
 
 
-
-
 (defkernel *stretch-energy-kernel*
   (:c-function-name stretch_energy_kernel)
   (:compute (energy grad hess))
   (:pipeline *pipeline*)
-  ;; C function signature
+
   (:params ((double kb)
             (double r0)
             (size_t i3x1)
@@ -59,37 +69,86 @@
             (double* dvec)
             (double* hdvec)))
 
-  ;; mapping atom index -> base index, axis -> offset
   (:layout ((1 . I3X1) (2 . I3X2))
            ((X . 0) (Y . 1) (Z . 2)))
 
-  ;; coordinate vars for AD
-  (:coord-vars (x1 y1 z1 x2 y2 z2))
+  (:coord-vars (x1 y1 z1
+                   x2 y2 z2))
 
-  ;; how to load coords from position[]
   (:coord-load
    (coords-from-position
     ((x1 y1 z1 i3x1)
      (x2 y2 z2 i3x2))))
 
-  ;; symbolic kernel (base block)
   (:body
    (stmt-block
-     ;; final energy scalar
-     (=. energy "kb*(-r0 + Sqrt((-x1 + x2)^2 + (-y1 + y2)^2 + (-z1 + z2)^2))^2"))))
+     (=. dx "x1 - x2")
+     (=. dy "y1 - y2")
+     (=. dz "z1 - z2")
+     (=. r2 "dx*dx + dy*dy + dz*dz")
+     (=. r  "sqrt(r2)")
+     (=. dr "r - r0")
+     ;; E(r) = 0.5 * kb * (r - r0)^2
+     (=. energy "0.5*kb*dr*dr")))
+
+  (:derivatives
+   (:mode :manual
+    :intermediates (r)
+
+    ;; dr/dq
+    :intermediate->coord
+    ((r ((x1 "dx / r")
+         (y1 "dy / r")
+         (z1 "dz / r")
+         (x2 "-dx / r")
+         (y2 "-dy / r")
+         (z2 "-dz / r"))))
+
+    ;; d²r/(dqi dqj)
+    :intermediate->coord2
+    ((r (
+         ((x1 x1) "(r*r - dx*dx)/(r^3)")
+         ((x1 y1) "(-dx*dy)/(r^3)")
+         ((x1 z1) "(-dx*dz)/(r^3)")
+         ((x1 x2) "(dx*dx - r*r)/(r^3)")
+         ((x1 y2) "dx*dy/(r^3)")
+         ((x1 z2) "dx*dz/(r^3)")
+
+         ((y1 y1) "(r*r - dy*dy)/(r^3)")
+         ((y1 z1) "(-dy*dz)/(r^3)")
+         ((y1 x2) "dx*dy/(r^3)")
+         ((y1 y2) "(dy*dy - r*r)/(r^3)")
+         ((y1 z2) "dy*dz/(r^3)")
+
+         ((z1 z1) "(r*r - dz*dz)/(r^3)")
+         ((z1 x2) "dx*dz/(r^3)")
+         ((z1 y2) "dy*dz/(r^3)")
+         ((z1 z2) "(dz*dz - r*r)/(r^3)")
+
+         ((x2 x2) "(r*r - dx*dx)/(r^3)")
+         ((x2 y2) "(-dx*dy)/(r^3)")
+         ((x2 z2) "(-dx*dz)/(r^3)")
+
+         ((y2 y2) "(r*r - dy*dy)/(r^3)")
+         ((y2 z2) "(-dy*dz)/(r^3)")
+
+         ((z2 z2) "(r*r - dz*dz)/(r^3)"))))
+
+    ;; E(r) = 0.5*kb*(r - r0)^2
+    ;; dE/dr = kb*(r - r0), d²E/dr² = kb
+    :energy->intermediate
+    (:gradient ((r "kb*(r - r0)"))
+     :hessian  (((r r) "kb")))
+
+    :hessian-modes ((r :full))
+    :geometry-check :warn)))
 
 
-(generate-kernel-code "~/tmp/stretch.c" :kernel *stretch-energy-kernel*)
-
-
-#+(or)
 (defkernel *angle-energy-kernel*
-  ;; what to generate
   (:c-function-name angle_energy_kernel)
-  (:compute (energy grad hess))    ; or (energy) or (energy grad) etc.
+  (:compute (energy grad hess))
   (:pipeline *pipeline*)
 
-  ;; C function signature
   (:params ((double kt)
             (double t0)
             (size_t i3x1)
@@ -102,118 +161,94 @@
             (double* dvec)
             (double* hdvec)))
 
-
-  ;; mapping atom index -> base index, axis -> offset
   (:layout ((1 . I3X1) (2 . I3X2) (3 . I3X3))
            ((X . 0) (Y . 1) (Z . 2)))
 
-  ;; coordinate vars for AD
-  (:coord-vars (x1 y1 z1 x2 y2 z2 x3 y3 z3))
+  (:coord-vars (x1 y1 z1
+                   x2 y2 z2
+                   x3 y3 z3))
 
-  ;; how to load coords from position[]
   (:coord-load
    (coords-from-position
     ((x1 y1 z1 i3x1)
      (x2 y2 z2 i3x2)
      (x3 y3 z3 i3x3))))
 
-  ;; symbolic kernel (base block)
   (:body
    (stmt-block
-     (=. energy "kt*(-t0 + acos(((x1 - x2)*(-x2 + x3) + (y1 - y2)*(-y2 + y3) + (z1 - z2)*(-z2 + z3))/(Sqrt((x1 - x2)^2 + (y1 - y2)^2 + (z1 - z2)^2)*Sqrt((-x2 + x3)^2 + (-y2 + y3)^2 + (-z2 + z3)^2))))^2"))))
+     ;; bond vectors about atom 2
+     (=. vx1 "x1 - x2")
+     (=. vy1 "y1 - y2")
+     (=. vz1 "z1 - z2")
 
-(defkernel *angle-energy-kernel*
-  ;; what to generate
-  (:c-function-name angle_energy_kernel)
-  (:compute (energy grad hess))    ; or (energy) or (energy grad) etc.
-  (:pipeline *pipeline*)
+     (=. vx2 "x3 - x2")
+     (=. vy2 "y3 - y2")
+     (=. vz2 "z3 - z2")
 
-  ;; C function signature
-  (:params ((double kt)
-            (double t0)
-            (size_t i3x1)
-            (size_t i3x2)
-            (size_t i3x3)
-            (double* position)
-            (double* energy_accumulate)
-            (double* force)
-            (double* hessian)
-            (double* dvec)
-            (double* hdvec)))
+     ;; dot products and norms
+     (=. dot   "vx1*vx2 + vy1*vy2 + vz1*vz2")
+     (=. n1_sq "vx1*vx1 + vy1*vy1 + vz1*vz1")
+     (=. n2_sq "vx2*vx2 + vy2*vy2 + vz2*vz2")
+     (=. n1    "sqrt(n1_sq)")
+     (=. n2    "sqrt(n2_sq)")
 
+     (=. cos_theta "dot / (n1*n2)")
+     (=. sin_theta "sqrt(1 - cos_theta^2)")
+     (=. theta     "acos(cos_theta)")
+     (=. dtheta    "theta - t0")
 
-  ;; mapping atom index -> base index, axis -> offset
-  (:layout ((1 . I3X1) (2 . I3X2) (3 . I3X3))
-           ((X . 0) (Y . 1) (Z . 2)))
+     ;; E(theta) = kt * (theta - t0)^2  (kt includes the 1/2 if desired)
+     (=. energy "kt*dtheta*dtheta")))
 
-  ;; coordinate vars for AD
-  (:coord-vars (x1 y1 z1 x2 y2 z2 x3 y3 z3))
+  (:derivatives
+   (:mode :manual
+    :intermediates (theta)
 
-  ;; how to load coords from position[]
-  (:coord-load
-   (coords-from-position
-    ((x1 y1 z1 i3x1)
-     (x2 y2 z2 i3x2)
-     (x3 y3 z3 i3x3))))
+    ;; dtheta/dcoord (manual, checked against AD)
+    :intermediate->coord
+    ((theta
+      ((x1 "(-vx2/(n1*n2*sin_theta) + dot*vx1/(n1^3*n2*sin_theta))")
+       (y1 "(-vy2/(n1*n2*sin_theta) + dot*vy1/(n1^3*n2*sin_theta))")
+       (z1 "(-vz2/(n1*n2*sin_theta) + dot*vz1/(n1^3*n2*sin_theta))")
 
-  ;; symbolic kernel (base block)
-  (:body
-   (stmt-block
-     ;; vectors
-     (=. ax "x1 - x2")
-     (=. ay "y1 - y2")
-     (=. az "z1 - z2")
-     (=. bx "x3 - x2")
-     (=. by "y3 - y2")
-     (=. bz "z3 - z2")
+       (x3 "(-vx1/(n1*n2*sin_theta) + dot*vx2/(n1*n2^3*sin_theta))")
+       (y3 "(-vy1/(n1*n2*sin_theta) + dot*vy2/(n1*n2^3*sin_theta))")
+       (z3 "(-vz1/(n1*n2*sin_theta) + dot*vz2/(n1*n2^3*sin_theta))")
 
-     ;; norms and dot
-     (=. a2 "ax*ax + ay*ay + az*az")
-     (=. b2 "bx*bx + by*by + bz*bz")
-     (=. ab "ax*bx + ay*by + az*bz")
-     (=. ra "Sqrt(a2)")
-     (=. rb "Sqrt(b2)")
-     (=. cos_th "ab/(ra*rb)")
-     (=. theta "Acos(cos_th)")
-     (=. angle_dev "theta - t0")
+       (x2 "(vx2/(n1*n2*sin_theta)
+               - dot*vx1/(n1^3*n2*sin_theta)
+               + vx1/(n1*n2*sin_theta)
+               - dot*vx2/(n1*n2^3*sin_theta))")
+       (y2 "(vy2/(n1*n2*sin_theta)
+               - dot*vy1/(n1^3*n2*sin_theta)
+               + vy1/(n1*n2*sin_theta)
+               - dot*vy2/(n1*n2^3*sin_theta))")
+       (z2 "(vz2/(n1*n2*sin_theta)
+               - dot*vz1/(n1^3*n2*sin_theta)
+               + vz1/(n1*n2*sin_theta)
+               - dot*vz2/(n1*n2^3*sin_theta))"))))
 
-     ;; energy
-     (=. energy "kt*angle_dev*angle_dev"))))
+    ;; no :intermediate->coord2 needed for :outer-product-only
 
-(generate-kernel-code "~/tmp/angle.c" :kernel *angle-energy-kernel*)
+    ;; E(theta) = kt * (theta - t0)^2
+    ;; dE/dtheta  = 2*kt*(theta - t0)
+    ;; d²E/dtheta² = 2*kt
+    :energy->intermediate
+    (:gradient ((theta "2*kt*(theta - t0)"))
+     :hessian  (((theta theta) "2*kt")))
 
+    :hessian-modes ((theta :outer-product-only))
+    :geometry-check :warn)))
 
 
-
-
-(let* ((ri (svector x1 y1 z1 ))
-       (rj (svector x2 y2 z2 ))
-       (rk (svector x3 y3 z3 ))
-       (rl (svector x4 y4 z4 ))
-       (ff (sv-sub ri rj))
-       (gg (sv-sub rj rk))
-       (hh (sv-sub rl rk))
-       (aa (sv-cross ff gg))
-       (bb (sv-cross hh gg))
-       (lena (sv-len aa))
-       (lenb (sv-len bb))
-       (reclenA `(receprocal ,lena))
-       )
-  (format t "lena = ~s~%" lena))
-
-#+(or)
 (defkernel *dihedral-energy-kernel*
-  ;; what to generate
-  (:c-function-name angle_energy_kernel)
-  (:compute (energy grad hess))    ; or (energy) or (energy grad) etc.
+  (:c-function-name dihedral_energy_kernel)
+  (:compute (energy grad hess))
   (:pipeline *pipeline*)
 
-  ;; C function signature
-  (:params ((double V)
-            (double DN)
-            (int  IN)
-            (double cosPhase)
-            (double sinPhase)
+  (:params ((double V)       ;; amplitude
+            (double n)       ;; multiplicity
+            (double phase)   ;; phase offset δ
             (size_t i3x1)
             (size_t i3x2)
             (size_t i3x3)
@@ -225,63 +260,339 @@
             (double* dvec)
             (double* hdvec)))
 
-
-  ;; mapping atom index -> base index, axis -> offset
   (:layout ((1 . I3X1) (2 . I3X2) (3 . I3X3) (4 . I3X4))
            ((X . 0) (Y . 1) (Z . 2)))
 
-  ;; coordinate vars for AD
-  (:coord-vars (x1 y1 z1 x2 y2 z2 x3 y3 z3 x4 y4 z4))
+  (:coord-vars (x1 y1 z1
+                   x2 y2 z2
+                   x3 y3 z3
+                   x4 y4 z4))
 
-  ;; how to load coords from position[]
   (:coord-load
    (coords-from-position
     ((x1 y1 z1 i3x1)
      (x2 y2 z2 i3x2)
      (x3 y3 z3 i3x3)
-     (x4 y4 z4 i3x4)
-     )))
+     (x4 y4 z4 i3x4))))
 
-  ;; symbolic kernel (base block)
   (:body
    (stmt-block
-     ;; vectors
-     (=. ri { x1 y1 z1 })
-     (=. rj { x2 y2 z2 })
-     (=. rk { x3 y3 z3 })
-     (=. rl { x4 y4 z4 })
+     ;; bond vectors
+     (=. v1x "x2 - x1")
+     (=. v1y "y2 - y1")
+     (=. v1z "z2 - z1")
 
-     (=. ff (sv-sub ri rj))
-     (=. gg (sv-sub rj rk))
-     (=. hh (sv-sub rl rk))
+     (=. v2x "x3 - x2")
+     (=. v2y "y3 - y2")
+     (=. v2z "z3 - z2")
 
-     (=. aa (sv-cross ff gg))
-     (=. bb (sv-cross hh gg))
+     (=. v3x "x4 - x3")
+     (=. v3y "y4 - y3")
+     (=. v3z "z4 - z3")
 
-     (=. lena `(sqrt
+     ;; plane normals
+     (=. c1x "v1y*v2z - v1z*v2y")
+     (=. c1y "v1z*v2x - v1x*v2z")
+     (=. c1z "v1x*v2y - v1y*v2x")
 
-     (=. ax "x1 - x2")
-     (=. ay "y1 - y2")
-     (=. az "z1 - z2")
-     (=. bx "x3 - x2")
-     (=. by "y3 - y2")
-     (=. bz "z3 - z2")
+     (=. c2x "v2y*v3z - v2z*v3y")
+     (=. c2y "v2z*v3x - v2x*v3z")
+     (=. c2z "v2x*v3y - v2y*v3x")
 
-     ;; norms and dot
-     (=. a2 "ax*ax + ay*ay + az*az")
-     (=. b2 "bx*bx + by*by + bz*bz")
-     (=. ab "ax*bx + ay*by + az*bz")
-     (=. ra "Sqrt(a2)")
-     (=. rb "Sqrt(b2)")
-     (=. cos_th "ab/(ra*rb)")
-     (=. theta "Acos(cos_th)")
-     (=. angle_dev "theta - t0")
+     ;; norms and dot products
+     (=. c1_sq "c1x*c1x + c1y*c1y + c1z*c1z")
+     (=. c2_sq "c2x*c2x + c2y*c2y + c2z*c2z")
+     (=. v2_sq "v2x*v2x + v2y*v2y + v2z*v2z")
+     (=. v2_len "sqrt(v2_sq)")
 
-     ;; energy
-     (=. energy "kt*angle_dev*angle_dev"))))
+     (=. dot12 "v1x*v2x + v1y*v2y + v1z*v2z")
+     (=. dot23 "v2x*v3x + v2y*v3y + v2z*v3z")
 
-   ))
+     ;; torsion via atan2
+     (=. t1 "v2_len*(v1x*c2x + v1y*c2y + v1z*c2z)")
+     (=. t2 "c1x*c2x + c1y*c2y + c1z*c2z")
+     (=. phi "atan2(t1, t2)")
+
+     ;; Amber-style torsion:
+     ;; E(phi) = V * (1 + cos(n*phi - phase))
+     (=. nphi  "n*phi")
+     (=. angle "nphi - phase")
+     (=. energy "V*(1.0 + cos(angle))")))
+
+  (:derivatives
+   (:mode :manual
+    :intermediates (phi)
+
+    ;; no manual geometry; AD provides dphi/dcoord
+
+    ;; E(phi) = V*(1 + cos(angle)), angle = n*phi - phase
+    ;; dE/dphi  = -V*n*sin(angle)
+    ;; d²E/dphi² = -V*n^2*cos(angle)
+    :energy->intermediate
+    (:gradient ((phi "-V*n*sin(angle)"))
+     :hessian  (((phi phi) "-V*n*n*cos(angle)")))
+
+    :hessian-modes ((phi :outer-product-only))
+    :geometry-check :warn)))
 
 
 
+
+(defkernel *nonbond-energy-kernel*
+  (:c-function-name nonbond_energy_kernel)
+  (:compute (energy grad hess))
+  (:pipeline *pipeline*)
+
+  (:params ((double A) ;; LJ A coefficient  (A / r^12)
+            (double B) ;; LJ B coefficient  (B / r^6)
+            (double qq) ;; Coulomb prefactor (qq / r)
+            (size_t i3x1)
+            (size_t i3x2)
+            (double* position)
+            (double* energy_accumulate)
+            (double* force)
+            (double* hessian)
+            (double* dvec)
+            (double* hdvec)))
+
+  (:layout ((1 . I3X1) (2 . I3X2))
+           ((X . 0) (Y . 1) (Z . 2)))
+
+  (:coord-vars (x1 y1 z1
+                   x2 y2 z2))
+
+  (:coord-load
+   (coords-from-position
+    ((x1 y1 z1 i3x1)
+     (x2 y2 z2 i3x2))))
+
+  (:body
+   (stmt-block
+     (=. dx "x1 - x2")
+     (=. dy "y1 - y2")
+     (=. dz "z1 - z2")
+     (=. r2 "dx*dx + dy*dy + dz*dz")
+     (=. r  "sqrt(r2)")
+     (=. invr  "1.0 / r")
+     (=. invr2 "invr*invr")
+     (=. invr6 "invr2*invr2*invr2")
+
+     ;; E(r) = A/r^12 - B/r^6 + qq/r
+     (=. e_lj   "A*invr6*invr6 - B*invr6")
+     (=. e_coul "qq*invr")
+     (=. energy "e_lj + e_coul")))
+
+  (:derivatives
+   (:mode :manual
+    :intermediates (r)
+
+    ;; radial geometry as in stretch
+    :intermediate->coord
+    ((r ((x1 "dx / r")
+         (y1 "dy / r")
+         (z1 "dz / r")
+         (x2 "-dx / r")
+         (y2 "-dy / r")
+         (z2 "-dz / r"))))
+
+    :intermediate->coord2
+    ((r (
+         ((x1 x1) "(r*r - dx*dx)/(r^3)")
+         ((x1 y1) "(-dx*dy)/(r^3)")
+         ((x1 z1) "(-dx*dz)/(r^3)")
+         ((x1 x2) "(dx*dx - r*r)/(r^3)")
+         ((x1 y2) "dx*dy/(r^3)")
+         ((x1 z2) "dx*dz/(r^3)")
+
+         ((y1 y1) "(r*r - dy*dy)/(r^3)")
+         ((y1 z1) "(-dy*dz)/(r^3)")
+         ((y1 x2) "dx*dy/(r^3)")
+         ((y1 y2) "(dy*dy - r*r)/(r^3)")
+         ((y1 z2) "dy*dz/(r^3)")
+
+         ((z1 z1) "(r*r - dz*dz)/(r^3)")
+         ((z1 x2) "dx*dz/(r^3)")
+         ((z1 y2) "dy*dz/(r^3)")
+         ((z1 z2) "(dz*dz - r*r)/(r^3)")
+
+         ((x2 x2) "(r*r - dx*dx)/(r^3)")
+         ((x2 y2) "(-dx*dy)/(r^3)")
+         ((x2 z2) "(-dx*dz)/(r^3)")
+
+         ((y2 y2) "(r*r - dy*dy)/(r^3)")
+         ((y2 z2) "(-dy*dz)/(r^3)")
+
+         ((z2 z2) "(r*r - dz*dz)/(r^3)"))))
+
+    ;; E(r) = A/r^12 - B/r^6 + qq/r
+    ;; dE/dr   = -12*A/r^13 + 6*B/r^7 - qq/r^2
+    ;; d²E/dr² = 156*A/r^14 - 42*B/r^8 + 2*qq/r^3
+    :energy->intermediate
+    (:gradient ((r "-12*A/(r^13) + 6*B/(r^7) - qq/(r^2)"))
+     :hessian  (((r r) "156*A/(r^14) - 42*B/(r^8) + 2*qq/(r^3)")))
+
+    :hessian-modes ((r :full))
+    :geometry-check :warn)))
+
+
+
+(defkernel *nonbond-dd-cutoff-kernel*
+  (:c-function-name nonbond_dd_cutoff_kernel)
+  (:compute (energy grad hess))
+  (:pipeline *pipeline*)
+
+  (:params ((double A)        ;; LJ A coefficient  (A / r^12)
+            (double B)        ;; LJ B coefficient  (B / r^6)
+            (double qq)       ;; Coulomb prefactor
+            (double dd)       ;; epsilon(r) = dd*r
+            (double r_switch) ;; switching start
+            (double r_cut)    ;; cutoff
+            (size_t i3x1)
+            (size_t i3x2)
+            (double* position)
+            (double* energy_accumulate)
+            (double* force)
+            (double* hessian)
+            (double* dvec)
+            (double* hdvec)))
+
+  (:layout ((1 . I3X1) (2 . I3X2))
+           ((X . 0) (Y . 1) (Z . 2)))
+
+  (:coord-vars (x1 y1 z1
+                   x2 y2 z2))
+
+  (:coord-load
+   (coords-from-position
+    ((x1 y1 z1 i3x1)
+     (x2 y2 z2 i3x2))))
+
+  (:body
+   (stmt-block
+     ;; geometry
+     (=. dx "x1 - x2")
+     (=. dy "y1 - y2")
+     (=. dz "z1 - z2")
+     (=. r2 "dx*dx + dy*dy + dz*dz")
+     (=. r  "sqrt(r2)")
+
+     ;; outer cutoff: only do work if r < r_cut
+     (stmt-ir:make-if-stmt
+      (expr-ir:parse-expr "r < r_cut")
+      (stmt-block
+        ;; channel work (invr, invr2, invr6, e_lj, e_coul, e_base)
+        (=. invr  "r^-1")
+        (=. invr2 "invr*invr")
+        (=. invr3 "invr*invr2")
+        (=. invr6 "invr2*invr2*invr2")
+        (=. e_lj   "A*invr6*invr6 - B*invr6")
+        (=. e_coul "qq*invr2/dd")
+        (=. e_base "e_lj + e_coul")
+
+        ;; base radial derivatives via AD
+        (D! e_base r)
+        (D! de_base_dr r)
+
+        ;; inner piecewise structure as before:
+        (stmt-ir:make-if-stmt
+         (expr-ir:parse-expr "r < r_switch")
+         (stmt-block
+           (=. energy  "e_base")
+           (=. dE_dr   "de_base_dr")
+           (=. d2E_dr2 "dde_base_dr_dr"))
+         (stmt-block
+           ;; smoothing region
+           (=. drs       "r - r_switch")
+           (=. inv_range "1.0 / (r_cut - r_switch)")
+           (=. t  "drs*inv_range")
+           (=. t2 "t*t")
+           (=. t3 "t2*t")
+           (=. t4 "t2*t2")
+           (=. t5 "t3*t2")
+           ;; S(t) = 1 - 10 t^3 + 15 t^4 - 6 t^5
+           (=. s "1.0 - 10.0*t3 + 15.0*t4 - 6.0*t5")
+           ;; dS/dt, d²S/dt²
+           (=. ds_dt   "-30.0*t2 + 60.0*t3 - 30.0*t4")
+           (=. d2s_dt2 "-60.0*t + 180.0*t2 - 120.0*t3")
+           ;; dS/dr, d²S/dr²
+           (=. ds_dr   "ds_dt*inv_range")
+           (=. d2s_dr2 "d2s_dt2*inv_range*inv_range")
+
+           ;; E(r) = S(r)*E_base(r)
+           (=. energy "s*e_base")
+
+           ;; dE/dr   = S'*E_base + S*dE_base/dr
+           ;; d²E/dr² = S''*E_base + 2*S'*dE_base/dr + S*d2E_base/dr2
+           (=. dE_dr   "ds_dr*e_base + s*dE_base_dr")
+           (=. d2E_dr2 "d2s_dr2*e_base + 2.0*ds_dr*dE_base_dr + s*ddE_base_dr_dr"))
+         )
+        (ACCUMULATE-HERE)
+        )
+      ;; else-branch: optionally nothing
+      )
+     ))
+
+  (:derivatives
+   (:mode :manual
+    :intermediates (r)
+
+    ;; radial geometry
+    :intermediate->coord
+    ((r ((x1 "dx / r")
+         (y1 "dy / r")
+         (z1 "dz / r")
+         (x2 "-dx / r")
+         (y2 "-dy / r")
+         (z2 "-dz / r"))))
+
+    :intermediate->coord2
+    ((r (
+         ((x1 x1) "(r*r - dx*dx)/(r^3)")
+         ((x1 y1) "(-dx*dy)/(r^3)")
+         ((x1 z1) "(-dx*dz)/(r^3)")
+         ((x1 x2) "(dx*dx - r*r)/(r^3)")
+         ((x1 y2) "dx*dy/(r^3)")
+         ((x1 z2) "dx*dz/(r^3)")
+
+         ((y1 y1) "(r*r - dy*dy)/(r^3)")
+         ((y1 z1) "(-dy*dz)/(r^3)")
+         ((y1 x2) "dx*dy/(r^3)")
+         ((y1 y2) "(dy*dy - r*r)/(r^3)")
+         ((y1 z2) "dy*dz/(r^3)")
+
+         ((z1 z1) "(r*r - dz*dz)/(r^3)")
+         ((z1 x2) "dx*dz/(r^3)")
+         ((z1 y2) "dy*dz/(r^3)")
+         ((z1 z2) "(dz*dz - r*r)/(r^3)")
+
+         ((x2 x2) "(r*r - dx*dx)/(r^3)")
+         ((x2 y2) "(-dx*dy)/(r^3)")
+         ((x2 z2) "(-dx*dz)/(r^3)")
+
+         ((y2 y2) "(r*r - dy*dy)/(r^3)")
+         ((y2 z2) "(-dy*dz)/(r^3)")
+
+         ((z2 z2) "(r*r - dz*dz)/(r^3)"))))
+
+    ;; radial link energy ↔ r via branchwise dE_dr, d2E_dr2
+    :energy->intermediate
+    (:gradient ((r "dE_dr"))
+     :hessian  (((r r) "d2E_dr2")))
+
+    :hessian-modes ((r :full))
+    :geometry-check :warn)))
+
+
+
+(defun write-all (pathname)
+  (loop for kernel in (list
+                       *stretch-energy-kernel*
+                       *angle-energy-kernel*
+                       *dihedral-energy-kernel*
+                       *nonbond-energy-kernel*
+                       *nonbond-dd-cutoff-kernel*)
+        for name = (string-downcase (symbol-name (kernel-name kernel)))
+        for pn = (merge-pathnames (make-pathname :name name :type "c") (pathname pathname))
+        do (format t "writing = ~s~%" pn)
+        do (write-c-code kernel pn)))
 

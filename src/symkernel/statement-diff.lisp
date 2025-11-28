@@ -9,23 +9,28 @@
 ;;; Build derivative environment over a block of assignments
 ;;; ----------------------------------------------------------------------
 
+
 (defun build-derivative-env-for-block (statements base-var)
   "Given a list of STATEMENTS (typically assignment-statement objects)
 and a base variable symbol BASE-VAR, build and return a derivative
-environment (hash-table) mapping each intermediate variable name (string)
+environment mapping each intermediate variable name (string)
 to its derivative expression d(var)/d(BASE-VAR)."
   (let ((env (expr-ir:make-deriv-env)))
-    ;; Optionally seed env[base-var] = 1; lookup-var-derivative will also
-    ;; handle this based on name, but this doesn't hurt:
+    ;; Seed d(base)/d(base) = 1
     (setf (gethash (expr-ir:var-key base-var) env)
           (expr-ir:make-expr-const 1))
     (dolist (st statements env)
       (when (typep st 'assignment-statement)
-        (let* ((name (stmt-target-name st))
-               (rhs  (stmt-expression st))
-               (drhs (expr-ir:differentiate-expr rhs base-var env))
-               (key  (expr-ir:var-key name)))
-          (setf (gethash key env) drhs))))))
+        (let* ((name (stmt-target-name st)))
+          ;; Do not overwrite derivative for the base variable itself
+          (unless (eql name base-var)
+            (let* ((rhs  (stmt-expression st))
+                   (drhs (expr-ir:differentiate-expr rhs base-var env))
+                   (key  (expr-ir:var-key name)))
+              (setf (gethash key env) drhs))))))
+    env))
+
+
 
 ;;; ----------------------------------------------------------------------
 ;;; Get derivative of a specific target variable in the block
@@ -40,6 +45,7 @@ and BASE-VAR are symbols naming variables in the expression IR.
 
 Returns an expression IR node for the derivative, or NIL if TARGET-VAR
 never appears as an assignment target in STATEMENTS."
+  (declare (optimize (debug 3)))
   (let* ((env (build-derivative-env-for-block statements base-var))
          (key (expr-ir:var-key target-var)))
     (multiple-value-bind (d presentp)
@@ -121,4 +127,109 @@ yields (for base-var 'x):
           (setf (gethash key env) drhs)
           (push dst result))))))
 
+;;; ----------------------------------------------------------------------
+;;; Derivative request statements and the D macro
+;;; ----------------------------------------------------------------------
 
+(defclass derivative-request-statement (statement)
+  ((target-var
+    :initarg :target-var
+    :accessor dr-target-var
+    :documentation "Variable whose derivative we want, e.g. e_base or energy.")
+   (base-var
+    :initarg :base-var
+    :accessor dr-base-var
+    :documentation "Base variable (coordinate or intermediate) we differentiate with respect to."))
+  (:documentation
+   "Placeholder used in the kernel DSL to request a derivative d(TARGET-VAR)/d(BASE-VAR)
+to be computed later and turned into a normal assignment."))
+
+(defun make-derivative-request-stmt (target-var base-var)
+  "Create a derivative-request-statement asking for d(TARGET-VAR)/d(BASE-VAR)."
+  (make-instance 'derivative-request-statement
+                 :target-var target-var
+                 :base-var   base-var))
+
+
+
+;;; -------------------------------
+;;; Expand derivative requests
+;;; -------------------------------
+
+#+(or)
+(defun expand-derivative-requests-in-block (block)
+  "Walk BLOCK (a STMT-IR:BLOCK-STATEMENT) and replace each
+DERIVATIVE-REQUEST-STATEMENT with an ASSIGNMENT-STATEMENT that computes
+the requested derivative using EXPR-IR's AD machinery.
+
+We assume the derivative request object provides:
+  (derivative-request-target stmt)  -> EXPR-IR variable symbol
+  (derivative-request-base   stmt)  -> EXPR-IR variable symbol
+
+and we rely on STMT-IR:DIFFERENTIATE-TARGET-IN-BLOCK from
+statement-diff.lisp to compute d(target)/d(base) over the assignments
+seen so far."
+  (labels
+      ((rewrite-block (blk)
+         (let ((new-stmts      '())
+               ;; assignments seen so far in this block, in *program order*
+               (assigns-so-far '()))
+           (dolist (st (block-statements blk))
+             (typecase st
+               (assignment-statement
+                ;; keep the assignment and remember it
+                (push st new-stmts)
+                (push st assigns-so-far))
+
+               (derivative-request-statement
+                ;; expand D!(target, base) at this point
+                (let* ((target (derivative-request-target st))
+                       (base   (derivative-request-base st))
+                       ;; assignments so far in program order
+                       (stmts  (nreverse assigns-so-far))
+                       ;; d(target)/d(base) as an expr-ir node
+                       (dex    (differentiate-target-in-block stmts base target)))
+                  (unless dex
+                    (error "No assignment for ~S before derivative request ~S"
+                           target st))
+                  (let* ((dex-s (expr-ir:simplify-expr dex))
+                         ;; choose whatever naming convention you want here:
+                         ;; you can use MAKE-DERIVATIVE-NAME, or your own
+                         ;; 'dE_base_dr' style function.
+                         (dvar  (make-derivative-name target base))
+                         (dst   (make-assignment-stmt dvar dex-s)))
+                    ;; emit the new derivative assignment *in place of*
+                    ;; the request, and also add it to assigns-so-far so
+                    ;; later D! calls can differentiate it again (for
+                    ;; 2nd derivatives like d2E_base_dr2).
+                    (push dst new-stmts)
+                    (push dst assigns-so-far))))
+
+               (if-statement
+                ;; recursively rewrite then/else blocks
+                (let* ((cond     (if-condition st))
+                       (then-blk (rewrite-block (if-then-block st)))
+                       (else-blk (and (if-else-block st)
+                                      (rewrite-block (if-else-block st))))
+                       (new-if   (make-if-stmt cond then-blk else-blk)))
+                  (push new-if new-stmts)))
+
+               (block-statement
+                ;; nested block: rewrite inside, but do not fold its
+                ;; assignments into ASSIGNS-SO-FAR (we treat each block
+                ;; independently here).
+                (let ((sub (rewrite-block st)))
+                  (push sub new-stmts)))
+
+               (t
+                ;; any other statement: keep as-is
+                (push st new-stmts))))
+           (make-block-stmt (nreverse new-stmts)))))
+    (rewrite-block block)))
+
+#+(or)
+(defun expand-derivative-requests-optimization (pass-counter block &key &allow-other-keys)
+  "Optimization wrapper: expand all DERIVATIVE-REQUEST-STATEMENTs
+into concrete ASSIGNMENT-STATEMENTs."
+  (declare (ignore pass-counter))
+  (expand-derivative-requests-in-block block))

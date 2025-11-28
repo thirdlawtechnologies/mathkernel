@@ -6,8 +6,7 @@
 (in-package :expr-ir)
 
 
-(defparameter *function-names* '(:cos :sin :exp :log :sqrt :acos))
-
+(defparameter *function-names* '(:cos :sin :exp :log :sqrt :acos :atan2))
 
 ;;; ----------------------------------------------------------------------
 ;;; Base classes
@@ -153,11 +152,23 @@ Within each class, order by a printable name where possible."
                 (symbol-name (variable-name expr)))
                (function-call-expression
                 (symbol-name (function-call-name expr)))
+               (nary-expression
+                (loop for arg in (expression-arguments expr)
+                      collect (multiple-value-list (expression-sort-key arg))))
+               (negate-expression
+                (multiple-value-list (negate-argument-expression expr)))
+               (power-expression
+                (append
+                 (multiple-value-list (power-base-expression expr))
+                 (multiple-value-list (power-exponent-expression expr))))
                (t
-                (format nil "~S" (type-of expr))))))
+                (error "What do we get here ~s" (class-of expr))))))
     (list (class-rank expression)
           (expr-name expression))))
 
+(defun sexpr-sort-key (sexpr)
+  (let ((expr (sexpr->expr-ir sexpr)))
+    (expression-sort-key expr)))
 
 ;;; ----------------------------------------------------------------------
 ;;; Unary / binary arithmetic operators
@@ -195,7 +206,7 @@ Within each class, order by a printable name where possible."
     :accessor function-call-name
     :type symbol
     :documentation
-    "Symbol naming the function (e.g. :sin, :cos, :exp, :log, :sqrt, :fabs).")
+    "Symbol naming the function (e.g. :sin, :cos, :exp, :log, :sqrt, :fabs :acos :atan2).")
    (argument-list
     :initarg :argument-list
     :accessor function-call-arguments
@@ -321,8 +332,8 @@ This is a pure pass that:
                ;; logical n-ary (AND/OR/etc.)
                (logical-nary-expression
                 (make-instance 'logical-nary-expression
-                               :operator (logical-nary-operator e)
-                               :arguments (mapcar #'simp (logical-nary-arguments e))))
+                               :operator (logical-operator e)
+                               :arguments (mapcar #'simp (logical-arguments e))))
 
                ;; logical NOT
                (logical-not-expression
@@ -461,13 +472,13 @@ Variable and function names are lower-cased."
                    (c-fname   (case (intern fname-str :keyword)
                                 (:sqrt "sqrt")
                                 ((:acos :arccos) "acos")
+                                (:atan2  "ATAN2")
                                 (:sin  "sin")
                                 (:cos  "cos")
                                 (:tan  "tan")
                                 (:exp  "exp")
                                 (:log  "log")
                                 (:fabs "fabs")
-                                (:acos "acos")
                                 (t fname-str))))
               (format nil "~A(~{~A~^, ~})" c-fname args)))
 
@@ -656,6 +667,13 @@ out of products/sums and flattening where possible."
 ;;; Expression -> prefix Lisp S-expressions
 ;;; ----------------------------------------------------------------------
 
+(defun function-name->sexpr-symbol (sym)
+  (multiple-value-bind (symbol status)
+      (find-symbol (symbol-name sym) :cl)
+    (if status
+        symbol
+        (intern (symbol-name sym) :expr-var))))
+
 (defun expr->sexpr (expr)
   "Convert an expression IR node to a standard Lisp S-expression in prefix form.
 This is a structural mapping; / is represented via * and expt, not reconstructed."
@@ -678,7 +696,7 @@ This is a structural mapping; / is represented via * and expt, not reconstructed
                (function-call-expression
                 (let* ((fn (function-call-name e))
                        (ffn (if (keywordp fn)
-                                (intern (symbol-name fn) :cl)
+                                (function-name->sexpr-symbol fn)
                                 fn)))
                   (cons ffn
                         (mapcar #'rec (function-call-arguments e)))))
@@ -792,15 +810,13 @@ This is a structural mapping; / is represented via * and expt, not reconstructed
                   (wrap s prec)))
                (logical-nary-expression
                 (let* ((op (logical-operator e))
-                       (op-str (ecase op
-                                 (:and "&&")
-                                 (:or  "||")))
                        (args (logical-arguments e))
                        (parts (mapcar (lambda (x)
                                         (rec x prec))
                                       args))
-                       (s (format nil "~{~a~^ ~a ~}"
-                                  parts op-str)))
+                       (s (ecase op
+                            (:and (format nil "~{~a ~^&&~}" parts))
+                            (:or (format nil "~{~a ~^||~}" parts)))))
                   (wrap s prec)))
                (logical-not-expression
                 (let* ((arg (logical-not-argument-expression e))
@@ -809,3 +825,468 @@ This is a structural mapping; / is represented via * and expt, not reconstructed
                (t
                 (error "Don't know how to print ~S as infix." e)))))))
     (rec expr nil)))
+
+(defun draw-sexpr-tree (sexpr &key (stream *standard-output*) (label nil))
+  "Draw SEXPR as an ASCII tree.
+
+Treats a list as (OP ARG1 ARG2 ...), with OP as the node label and
+each argument as a child subtree.
+
+Example:
+
+  (+ (* x x) (* y y))
+
+prints something like:
+
+  +
+  |- *
+  |  |- x
+  |  `- x
+  `- *
+     |- y
+     `- y"
+  (when label
+    (format stream "~&~A~%" label))
+  (let* ((expr-var-pkg (ignore-errors (find-package :expr-var)))
+         (*package*    (or expr-var-pkg *package*)) ; hide expr-var:: prefixes
+         (*print-pretty* t)
+         (*print-escape* t)
+         (*print-case* :downcase)
+         (*print-right-margin* 100))
+
+    (labels
+        ((node-label (node)
+           (if (and (consp node) (not (null node)))
+               (car node)
+               node))
+
+         (node-children (node)
+           (if (and (consp node) (not (null node)))
+               (cdr node)
+               nil))
+
+         (print-line (prefix connector label)
+           (format stream "~&~A~A~A~%" prefix connector label))
+
+         (recur (node prefix is-last)
+           (let ((lbl (node-label node))
+                 (children (node-children node)))
+             (if (null prefix)
+                 ;; root: no connector
+                 (print-line "" "" lbl)
+                 (print-line prefix (if is-last "`- " "|- ") lbl))
+             (when children
+               (let* ((n (length children))
+                      (i 0)
+                      (child-prefix (concatenate 'string
+                                                 prefix
+                                                 (if is-last "   " "|  "))))
+                 (dolist (child children)
+                   (incf i)
+                   (recur child child-prefix (= i n))))))))
+      ;; root call: no prefix, treated specially in recur
+      (recur sexpr nil t))))
+
+(defun split-string-by-lines (s &key (omit-nulls t))
+  (loop for start = 0 then (1+ end)
+        for end = (position #\Newline s :start start)
+        collect (subseq s start (or end (length s)))
+        while end
+        finally (when (and (not omit-nulls)
+                           (char= (char s (1- (length s))) #\Newline))
+                  (collect ""))))
+
+(defun side-by-side-sexpr (s1 s2 &key label1 label2 (stream *standard-output*))
+  (let ((t1 (split-string-by-lines
+             (with-output-to-string (sout)
+              (draw-sexpr-tree s1 :label label1 :stream sout))))
+        (t2 (split-string-by-lines
+             (with-output-to-string (sout)
+               (draw-sexpr-tree s2 :label label2 :stream sout)))))
+    (let* ((mlen (max (length t1) (length t2)))
+           (max-width 0))
+      (loop for l1 in t1
+            for l2 in t2
+            do (setf max-width (max max-width (length l1) (length l2))))
+      (loop for idx from 0 below mlen
+            for l1 = (or (nth idx t1) "")
+            for l2 = (or (nth idx t2) "")
+            do (format stream "~va # ~va #~%" max-width l1 max-width l2)))))
+
+(defun debug-sexpr (sexpr &key (label nil) (stream *standard-output*))
+  "Pretty-print S-EXPR with expr-var as the current package so
+variable symbols print without package prefixes."
+  (when label
+    (format stream "~&~A:~%" label))
+  (let ((*package* (find-package :expr-var))
+        (*print-pretty* t)
+        (*print-right-margin* 100)
+        (*print-case* :downcase)
+        (*print-escape* t))  ;; keep escapes, just drop package noise
+    (pprint sexpr stream)))
+
+(defun debug-expr (expr &key (label nil) (stream *standard-output*))
+  "Pretty-print S-EXPR with expr-var as the current package so
+variable symbols print without package prefixes."
+  (when label
+    (format stream "~&~A:~%" label))
+  (let ((*package* (find-package :expr-var))
+        (*print-pretty* t)
+        (*print-right-margin* 100)
+        (*print-case* :downcase)
+        (*print-escape* t)
+        (sexpr (expr-ir:expr->sexpr expr)))  ;; keep escapes, just drop package noise
+    (pprint sexpr stream)))
+
+
+(in-package :expr-ir)
+
+;;; ----------------------------------------------------------------------
+;;; Linear form representation
+;;; ----------------------------------------------------------------------
+
+(defstruct linear-form
+  (const 0)
+  (terms nil))   ; list of (var-symbol . coeff)
+
+(defun make-linear-zero ()
+  (make-linear-form :const 0 :terms nil))
+
+(defun linear-form-add (lf1 lf2)
+  "Return LF1 + LF2 as a new LINEAR-FORM."
+  (let* ((const (+ (linear-form-const lf1)
+                   (linear-form-const lf2)))
+         (terms (copy-list (linear-form-terms lf1)))
+         (result (make-linear-form :const const
+                                   :terms terms)))
+    (dolist (term (linear-form-terms lf2) result)
+      (destructuring-bind (var . coeff2) term
+        (let ((cell (assoc var terms)))
+          (if cell
+              (incf (cdr cell) coeff2)
+              (push (cons var coeff2) terms)))))
+    (setf (linear-form-terms result) terms)
+    result))
+
+(defun linear-form-scale (lf scalar)
+  "Return SCALAR * LF as a new LINEAR-FORM."
+  (let ((result (make-linear-form
+                 :const (* scalar (linear-form-const lf))
+                 :terms nil)))
+    (dolist (term (linear-form-terms lf) result)
+      (destructuring-bind (var . coeff) term
+        (push (cons var (* scalar coeff))
+              (linear-form-terms result))))))
+
+(defun linear-form->expr (lf)
+  "Convert LINEAR-FORM LF back into an expression IR node in canonical form.
+
+LF represents:
+  const + sum_i coeff_i * var_i."
+  (let ((const (linear-form-const lf))
+        (terms (linear-form-terms lf))
+        (add-args '()))
+    ;; constant term
+    (unless (numeric-zero-p const)
+      (push (make-expr-const const) add-args))
+    ;; variable terms
+    (dolist (term terms)
+      (destructuring-bind (var . coeff) term
+        (unless (numeric-zero-p coeff)
+          (let ((var-expr (make-expr-var var)))
+            (cond
+              ((numeric-one-p coeff)
+               (push var-expr add-args))
+              ((numeric-minus-one-p coeff)
+               (push (make-expr-neg var-expr) add-args))
+              (t
+               (push (make-expr-mul
+                      (list (make-expr-const coeff)
+                            var-expr))
+                     add-args)))))))
+    ;; build final expression
+    (cond
+      ;; no terms at all -> 0
+      ((null add-args)
+       (make-expr-const 0))
+      ;; single term
+      ((null (cdr add-args))
+       (first add-args))
+      ;; general sum
+      (t
+       (make-expr-add add-args)))))
+
+;;; ----------------------------------------------------------------------
+;;; Linear canonicalization walker
+;;; ----------------------------------------------------------------------
+
+(defun canonicalize-linear-subexprs (expr-or-sexpr)
+  "Return a new expression where any linear numeric subexpressions have been
+recognized as linear combinations of variables and rewritten into a canonical
+form (constant + sum of coeff * var).
+
+EXPR-OR-SEXPR can be either:
+  - an expression IR node (subclass of EXPRESSION), or
+  - a prefix S-expression understood by SEXPR->EXPR-IR."
+  (let ((expr (if (typep expr-or-sexpr 'expression)
+                  expr-or-sexpr
+                  (sexpr->expr-ir expr-or-sexpr))))
+    (multiple-value-bind (expr2 lf linear-p)
+        (linearize-expression-internal expr)
+      (declare (ignore lf linear-p))
+      expr2)))
+
+(defun linearize-expression-internal (expr)
+  "Internal worker for CANONICALIZE-LINEAR-SUBEXPRS.
+
+Returns three values:
+  1) a possibly rewritten expression,
+  2) a LINEAR-FORM object or NIL,
+  3) T if the expression is linear in its variables, NIL otherwise."
+  (labels
+      ((rec (e)
+         (typecase e
+           ;; constants: c
+           (constant-expression
+            (let ((v (expression-value e)))
+              (values e
+                      (make-linear-form :const v :terms nil)
+                      t)))
+
+           ;; variables: x
+           (variable-expression
+            (let* ((name (variable-name e))
+                   (lf   (make-linear-form
+                          :const 0
+                          :terms (list (cons name 1)))))
+              (values e lf t)))
+
+           ;; sums: e1 + e2 + ...
+           (add-expression
+            (let* ((args (expression-arguments e))
+                   (new-args '())
+                   (lf-acc (make-linear-zero))
+                   (all-linear t))
+              (dolist (arg args)
+                (multiple-value-bind (arg2 lf-a lin-a)
+                    (rec arg)
+                  (push arg2 new-args)
+                  (if lin-a
+                      (setf lf-acc (linear-form-add lf-acc lf-a))
+                      (setf all-linear nil))))
+              (setf new-args (nreverse new-args))
+              (if all-linear
+                  (let ((lf lf-acc))
+                    (values (linear-form->expr lf) lf t))
+                  (values (make-expr-add new-args) nil nil))))
+
+           ;; products: e1 * e2 * ...
+           (multiply-expression
+            (let* ((args      (expression-arguments e))
+                   (new-args  '())
+                   (lfs       '())
+                   (lin-flags '()))
+              ;; recurse on children
+              (dolist (arg args)
+                (multiple-value-bind (arg2 lf-a lin-a)
+                    (rec arg)
+                  (push arg2 new-args)
+                  (push lf-a lfs)
+                  (push lin-a lin-flags)))
+              (setf new-args  (nreverse new-args))
+              (setf lfs       (nreverse lfs))
+              (setf lin-flags (nreverse lin-flags))
+
+              ;; classify factors
+              (let ((scalar        1) ;; product of pure-constant linear factors
+                    (var-lf        nil) ;; the single linear form with variables, if any
+                    (var-lf-count  0)
+                    (nonlinear?    nil))
+                (loop for lf    in lfs
+                      for lin?  in lin-flags do
+                        (cond
+                          ;; non-linear factor present
+                          ((not lin?)
+                           (setf nonlinear? t))
+
+                          ;; linear factor
+                          (t
+                           (let ((terms (and lf (linear-form-terms lf)))
+                                 (c     (and lf (linear-form-const lf))))
+                             (if (null terms)
+                                 ;; pure constant linear factor
+                                 (setf scalar (* scalar c))
+                                 ;; has variable terms: candidate for primary linear factor
+                                 (progn
+                                   (incf var-lf-count)
+                                   (if var-lf
+                                       ;; more than one variable-linear factor => treat as non-linear
+                                       (setf nonlinear? t)
+                                       (setf var-lf lf))))))))
+
+                ;; decide what to do
+                (cond
+                  ;; Case A: product is entirely linear (no non-linear factors, at most one var-lf)
+                  ((and (not nonlinear?)
+                        ;; either pure constant, or single linear factor with vars
+                        (or (= var-lf-count 0)
+                            (= var-lf-count 1)))
+                   (let* ((lf (if var-lf
+                                  (linear-form-scale var-lf scalar)
+                                  (make-linear-form :const scalar :terms nil))))
+                     (values (linear-form->expr lf) lf t)))
+
+                  ;; Case B: there are non-linear factors, but exactly one var-lf:
+                  ;; treat whole product as non-linear, but canonicalize the linear part
+                  ((and nonlinear?
+                        (= var-lf-count 1)
+                        var-lf)
+                   (let* ((scaled-lf (linear-form-scale var-lf scalar))
+                          (lin-expr  (linear-form->expr scaled-lf))
+                          (other-factors '()))
+                     ;; rebuild product: drop linear-constant factors and the old var-lf,
+                     ;; then append the canonical linear expr at the end
+                     (loop for arg2  in new-args
+                           for lf    in lfs
+                           for lin?  in lin-flags do
+                             (cond
+                               ;; pure constant linear factor -> absorbed into scalar
+                               ((and lin? lf (null (linear-form-terms lf)))
+                                nil)
+                               ;; variable linear factor -> replaced by lin-expr later
+                               ((and lin? lf (linear-form-terms lf))
+                                nil)
+                               (t
+                                (push arg2 other-factors))))
+                     (setf other-factors (nreverse other-factors))
+                     (let* ((all-factors (append other-factors (list lin-expr)))
+                            (prod-expr  (if (null all-factors)
+                                            ;; degenerate, but be defensive
+                                            (make-expr-const 0)
+                                            (make-expr-mul all-factors))))
+                       ;; whole product is NOT linear, but children include a canonical linear factor
+                       (values prod-expr nil nil))))
+
+                  ;; Case C: anything else (multiple var-lfs, or weird combination):
+                  ;; treat as general non-linear product, but keep recursed children.
+                  (t
+                   (values (make-expr-mul new-args) nil nil))))))
+           #+(or)(multiply-expression
+            (let* ((args (expression-arguments e))
+                   (new-args '())
+                   (lfs '())
+                   (lin-flags '()))
+              ;; recurse on children
+              (dolist (arg args)
+                (multiple-value-bind (arg2 lf-a lin-a)
+                    (rec arg)
+                  (push arg2 new-args)
+                  (push lf-a lfs)
+                  (push lin-a lin-flags)))
+              (setf new-args (nreverse new-args))
+              (setf lfs (nreverse lfs))
+              (setf lin-flags (nreverse lin-flags))
+              ;; determine if whole product is linear
+              (let ((nonlinear nil)
+                    (primary-lf nil)
+                    (scalar 1))
+                (loop for lf in lfs
+                      for lin? in lin-flags do
+                      (cond
+                        ((not lin?)
+                         (setf nonlinear t))
+                        (t
+                         (let ((terms (linear-form-terms lf))
+                               (c     (linear-form-const lf)))
+                           (if (null terms)
+                               ;; pure constant factor
+                               (setf scalar (* scalar c))
+                               ;; has variable terms
+                               (if primary-lf
+                                   (setf nonlinear t)
+                                   (setf primary-lf lf))))))
+                      finally
+                        (if (or nonlinear (null lfs))
+                            ;; not a linear product; keep structure
+                            (return (values (make-expr-mul new-args)
+                                            nil nil))
+                            ;; linear: either scalar * primary-lf, or constant only
+                            (let* ((lf (if primary-lf
+                                           (linear-form-scale primary-lf scalar)
+                                           (make-linear-form
+                                            :const scalar :terms nil))))
+                              (return (values (linear-form->expr lf)
+                                              lf t))))))))
+
+           ;; numeric negation: -e
+           (negate-expression
+            (multiple-value-bind (arg2 lf-a lin-a)
+                (rec (negate-argument-expression e))
+              (if lin-a
+                  (let ((lf (linear-form-scale lf-a -1)))
+                    (values (linear-form->expr lf) lf t))
+                  (values (make-expr-neg arg2) nil nil))))
+
+           ;; powers: treat as non-linear (but canonicalize children)
+           (power-expression
+            (multiple-value-bind (base2 lf-base lin-base)
+                (rec (power-base-expression e))
+              (declare (ignore lf-base lin-base))
+              (multiple-value-bind (exp2 lf-exp lin-exp)
+                  (rec (power-exponent-expression e))
+                (declare (ignore lf-exp lin-exp))
+                (values (make-expr-pow base2 exp2) nil nil))))
+
+           ;; function calls: non-linear, but recurse into args
+           (function-call-expression
+            (let* ((fname (function-call-name e))
+                   (args  (function-call-arguments e))
+                   (new-args '()))
+              (dolist (arg args)
+                (multiple-value-bind (arg2 lf-a lin-a)
+                    (rec arg)
+                  (declare (ignore lf-a lin-a))
+                  (push arg2 new-args)))
+              (values (make-expr-funcall fname (nreverse new-args))
+                      nil nil)))
+
+           ;; comparisons: recurse into numeric children
+           (comparison-expression
+            (multiple-value-bind (l lf-l lin-l)
+                (rec (comparison-left-expression e))
+              (declare (ignore lf-l lin-l))
+              (multiple-value-bind (r lf-r lin-r)
+                  (rec (comparison-right-expression e))
+                (declare (ignore lf-r lin-r))
+                (values (make-instance 'comparison-expression
+                                       :operator (comparison-operator e)
+                                       :left-expression l
+                                       :right-expression r)
+                        nil nil))))
+
+           ;; logical AND/OR: recurse into arguments
+           (logical-nary-expression
+            (let ((new-args '()))
+              (dolist (arg (logical-nary-arguments e))
+                (multiple-value-bind (arg2 lf-a lin-a)
+                    (rec arg)
+                  (declare (ignore lf-a lin-a))
+                  (push arg2 new-args)))
+              (values (make-instance 'logical-nary-expression
+                                     :operator (logical-nary-operator e)
+                                     :arguments (nreverse new-args))
+                      nil nil)))
+
+           ;; logical NOT: recurse into argument
+           (logical-not-expression
+            (multiple-value-bind (arg2 lf-a lin-a)
+                (rec (logical-not-argument-expression e))
+              (declare (ignore lf-a lin-a))
+              (values (make-instance 'logical-not-expression
+                                     :argument-expression arg2)
+                      nil nil)))
+
+           ;; Fallback: unknown node type; leave as-is.
+           (t
+            (values e nil nil)))))
+    (rec expr)))

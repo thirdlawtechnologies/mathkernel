@@ -98,6 +98,7 @@
            (expt (expt (first vals) (second vals)))
            (sin (sin (first vals)))
            (cos (cos (first vals)))
+           (atan2 (atan (second vals) (first vals))) ; Common lisp evaluates like (atan x y) not like C atan2(y,x)
            (tan (tan (first vals)))
            (exp (exp (first vals)))
            (log (log (first vals)))

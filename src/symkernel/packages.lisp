@@ -108,7 +108,23 @@
    #:ev
 
    #:factor-sum-of-products
-   #:normalize-signs-expr))
+   #:normalize-signs-expr
+   #:debug-sexpr
+   #:debug-expr
+   #:*rewrite-rules-basic*
+   #:*optimization-rules*
+   #:draw-sexpr-tree
+   #:sexpr-sort-key
+   #:side-by-side-sexpr
+   #:canonicalize-linear-subexprs
+   #:make-template-rule
+   #:make-function-rule
+   #:apply-rules-to-sexpr-once
+   #:wildcard-base-name
+   #:lookup-wild
+   #:*lequivalence-canonicalization-rules*
+   #:*equivalence-canonicalization-rules*
+   #:with-kernel-rewrite-rules))
 
 
 
@@ -181,13 +197,28 @@
    #:make-optimization-pipeline
    #:make-optimization
    #:run-optimization-pipeline
-   #:make-pass-id-counter))
+   #:make-pass-id-counter
+   #:make-derivative-request-stmt
+   #:derivative-request-statement
+   #:dr-target-var
+   #:dr-base-var
+   #:make-derivative-name
+   #:sexpr-size
+   #:linear-canonicalization-optimization
+   #:debug-block
+   #:make-accum-anchor-stmt
+   #:accumulation-anchor-statement
+   #:block-has-accum-anchor-p
+   #:accumulate-here
+   #:splice-derivatives-at-accum-anchor
+   #:alias-assigned-exprs-optimization))
 
 (defpackage :stmt-ir.tests
   (:use :cl :expr-ir :stmt-ir)
   (:export #:run-statement-tests))
 
-(defpackage :expr-var)
+(defpackage :expr-var
+  (:use :cl))
 
 ;;;; Symbols go in this package
 (defpackage :expr-user

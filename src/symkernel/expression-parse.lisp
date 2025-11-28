@@ -37,9 +37,6 @@
          (string< (with-output-to-string (s) (prin1 a s))
                   (with-output-to-string (s) (prin1 b s))))))))
 
-(defun sort-expressions (exprs)
-  (sort (copy-list exprs) #'expression<))
-
 ;;; ----------------------------------------------------------------------
 ;;; Canonicalizing constructors
 ;;; ----------------------------------------------------------------------
@@ -52,9 +49,9 @@
     ((stringp sym)
      (intern sym :expr-var))
     ((symbolp sym)
-  (if (eq (symbol-package sym) (find-package :expr-var))
-      sym
-      (intern (symbol-name sym) :expr-var)))
+     (if (eq (symbol-package sym) (find-package :expr-var))
+         sym
+         (intern (symbol-name sym) :expr-var)))
     (t (error "Handle ~s" sym))))
 
 (defun ensure-keyword (sym)
@@ -76,12 +73,6 @@
   "Construct a variable-expression."
   (check-type name symbol)
   (make-variable (ev name)))
-
-(defun %numeric-constant-p (expr)
-  (typep expr 'constant-expression))
-
-(defun %numeric-constant-value (expr)
-  (expression-value expr))
 
 (defun make-expr-add (arguments)
   "Canonical constructor for ADD-EXPRESSION.
@@ -552,12 +543,6 @@ ENV is reserved for future use (e.g. to distinguish some function names)."
                (char= (token-value tok) ch))
       (ps-advance ps)
       t)))
-
-(defun ps-match-type (ps type)
-  (let ((tok (ps-current ps)))
-    (when (eq (token-type tok) type)
-      (ps-advance ps)
-      tok)))
 
 (defun ps-expect (ps type &optional message)
   (let ((tok (ps-current ps)))
