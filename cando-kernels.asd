@@ -4,7 +4,7 @@
   :version "0.0.1"
   :author "Christian Schafmeister <chris.schaf@verizon.net>"
   :licence "LGPL-3.0"
-  :depends-on (:symkernel)
+  :depends-on (:mathkernel)
   :serial t
   :components ((:module "src"
                 :components ((:module "cando-kernels"
