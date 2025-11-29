@@ -39,14 +39,19 @@ that had more depth and it seemed to have a much better grasp of the problem.
 Over the next four days I asked for features one at a time and ChatGPT kept giving me code that I would test.
 I asked it for regression tests and kept adding them and testing functions and finding and fixing bugs.
 There were no serious bugs and the project seemed to improve smoothly.  I learned a lot about automatic
-differentiation, rule rewriting and optimization passes. 
+differentiation, rule rewriting and optimization passes.
 
 After five days - 10,846 lines of code (simple wc count)
 
 Thoughts:
-1. I'm amazed... and so excited by how powerful this is.
-2. ChatGPT generated bugs - no question. I spent about half the time finding and fixing them with
-ChatGPT help
-3. ChatGPT has a problem with closing parentheses for very long functions.  I found that it helped
-to ask it to write the code as an abstract syntax tree and then convert that to code.  It also likes to
-use 't' as a variable (a Common Lisp no no).  I told it to stop doing that.
+1. I didn't trust ChatGPT to calculate symbolic derivatives properly or to generate
+   code to calculate symbolic derivatives.  So I spent two days vibe-coding the facility
+   to compare them to each other.  You will notice some of the kernels have hardcoded partial
+   derivatives. If you supply them and ask for automatic differentiation it will compare them
+   to each other.  They matched from the start!
+2. I'm amazed... and so excited by how powerful this is.
+3. ChatGPT generated bugs - no question. I spent about half the time finding and fixing them with
+   ChatGPT help.
+4. ChatGPT has a problem with closing parentheses for very long functions.  I found that it helped
+   to ask it to write the code as an abstract syntax tree and then convert that to code.  It also likes to
+   use 't' as a variable (a Common Lisp no no).  I told it to stop doing that.
