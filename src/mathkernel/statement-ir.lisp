@@ -440,6 +440,141 @@ Each statement is numbered. For each assignment we show:
       (format t "~&;;; ---- CSE TEMP TRACE (~A) ----~%" label)
       (rec-block block)
       (format t "~&;;; ---- END CSE TEMP TRACE (~A) ----~%" label))))
+
+;;; ------------------------------------------------------------
+;;; Reorder assignments after cse
+;;; ------------------------------------------------------------
+
+(defun vars-used-in-expr (expr)
+  "Return a list of symbol names used in EXPR (expression IR), based on its sexpr.
+We do not try to distinguish parameters vs locals here; later we intersect
+with the set of assignment targets in the block."
+  (let ((vars '()))
+    (labels ((walk (sx)
+               (cond
+                 ((symbolp sx)
+                  (pushnew sx vars :test #'eq))
+                 ((consp sx)
+                  (dolist (sub sx)
+                    (walk sub))))))
+      (walk (expr-ir:expr->sexpr expr))
+      vars)))
+
+(defun reorder-assignment-run-def-before-use (stmts)
+  "Given a list of ASSIGNMENT-STATEMENTs (no if/block nodes),
+return a new list where for any statement S and any variable V
+that is both used in S and assigned somewhere in STMTS, the
+assignment to V appears earlier than S.
+
+We do a simple dependency-aware scheduling:
+  - 'defs' = all symbols that are assignment targets in STMTS
+  - 'defined' = symbols whose assignments we have already emitted
+  - repeatedly scan 'pending' and move 'ready' statements to 'result'
+    until no progress, then append leftovers (cycle would indicate
+    a self-dependency bug in the input)."
+  (labels ((collect-defs (sts)
+             (loop for st in sts
+                   collect (stmt-target-name st)))
+
+           (ready-p (st defs defined)
+             (let* ((used (vars-used-in-expr (stmt-expression st))))
+               (loop for v in used
+                     ;; only care about dependencies on vars that are
+                     ;; also assigned in this run
+                     when (and (member v defs :test #'eq)
+                               (not (member v defined :test #'eq)))
+                       do (return-from ready-p nil)
+                     finally (return t))))
+           )
+    (let* ((defs     (collect-defs stmts))
+           (defined  '())
+           (pending  (copy-list stmts))
+           (result   '()))
+      (loop
+        ;; If nothing left, we're done.
+        (when (null pending)
+          (return (nreverse result)))
+        (let ((progress nil)
+              (next-pending '()))
+          (dolist (st pending)
+            (if (ready-p st defs defined)
+                (progn
+                  (push st result)
+                  (pushnew (stmt-target-name st) defined :test #'eq)
+                  (setf progress t))
+                (push st next-pending)))
+          (setf pending (nreverse next-pending))
+          ;; No statement was schedulable: break to avoid infinite loop.
+          (unless progress
+            ;; We just append remaining pending (they may contain a cycle
+            ;; but that's an input bug, and we're no worse than before).
+            (setf result (nreverse (nconc pending result)))
+            (return (nreverse result))))))))
+
+(defun reorder-block-def-before-use (block)
+  "Return a new BLOCK-STATEMENT where, within each contiguous run of
+ASSIGNMENT-STATEMENTs, assignments are reordered to ensure that any
+variable used in an assignment and also assigned in that run is defined
+earlier in the run.
+
+We do not move assignments across IF- or BLOCK-STATEMENT boundaries;
+those act as barriers. We recurse into nested blocks and if branches."
+  (debug-block block :label "Before sort")
+  (labels
+      ;; recurse into a single statement
+      ((reorder-stmt (st)
+         (typecase st
+           (assignment-statement
+            st)
+           (block-statement
+            (make-block-stmt
+             (reorder-stmt-list (block-statements st))))
+           (if-statement
+            (let* ((cond (if-condition st))
+                   (then-b (if-then-block st))
+                   (else-b (if-else-block st))
+                   (new-then (when then-b
+                               (make-block-stmt
+                                (reorder-stmt-list
+                                 (block-statements then-b)))))
+                   (new-else (when else-b
+                               (make-block-stmt
+                                (reorder-stmt-list
+                                 (block-statements else-b))))))
+              (make-if-stmt cond new-then new-else)))
+           (t
+            st)))
+
+       ;; reorder list of statements, partitioning into assignment runs
+       (reorder-stmt-list (stmts)
+         (labels ((flush-run (run acc)
+                    (if run
+                        ;; reorder this run and cons onto acc
+                        (cons (reorder-assignment-run-def-before-use
+                               (nreverse run))
+                              acc)
+                        acc)))
+           (let ((acc '())
+                 (run '()))
+             (dolist (st stmts)
+               (if (typep st 'assignment-statement)
+                   ;; still in a run of assignments
+                   (push st run)
+                   ;; barrier: flush current run, emit barrier (recursed)
+                   (progn
+                     (setf acc (flush-run run acc)
+                           run '())
+                     (push (list (reorder-stmt st)) acc)))
+               )
+             ;; flush final run
+             (setf acc (flush-run run acc))
+             ;; acc is a list of lists; flatten in order
+             (apply #'nconc (nreverse acc))))))
+    (let ((sorted-block (make-block-stmt
+                         (reorder-stmt-list (block-statements block)))))
+      (debug-block sorted-block :label "sorted block")
+      sorted-block)))
+
 ;;; ------------------------------------------------------------
 ;;; Helpers
 ;;; ------------------------------------------------------------
@@ -468,20 +603,33 @@ Each statement is numbered. For each assignment we show:
 ;;; Statement / block emitters
 ;;; ------------------------------------------------------------
 
+(defun emit-assignment-statement-c (stmt indent stream)
+  "Emit an assignment. If this is the first time we see this local,
+   emit a declaration + initialization; otherwise emit a plain assignment."
+  (declare (optimize (debug 3)))
+  (let* ((name (stmt-target-name stmt))
+         (expr (stmt-expression stmt))
+         (ctype (and *c-local-types*
+                     (gethash name *c-local-types*)))
+         (already-declared
+           (and *c-declared-locals*
+                (gethash name *c-declared-locals*))))
+    (format stream "~&~v@T" (* 2 indent))
+    (when (and ctype (not already-declared))
+      ;; declare it here
+      (setf (gethash name *c-declared-locals*) t)
+      (format stream "~a " ctype))
+    ;; assignment (either \"x = ...\" or \"DOUBLE x = ...\")
+    (format stream "~a = " (string-downcase (symbol-name name)))
+    (format stream "~a" (expr->c-expr-string expr))
+    (format stream ";~%")))
+
+
 (defun emit-statement-c (stmt indent stream)
   "Emit one statement to STREAM at INDENT (indent = logical level)."
   (typecase stmt
     (assignment-statement
-     (let* ((target (stmt-target-name stmt))
-            (expr   (stmt-expression stmt))
-            (tname  (%c-ident target))
-            (rhs    (expr-ir:expr->c-expr-string expr)))
-       (let ((*package* (find-package :expr-var))
-             (*print-pretty* nil))
-         (%indent indent stream)
-         (format stream "// ~a = ~a;~%" target (expr-ir:expr->sexpr expr)))
-       (%indent indent stream)
-       (format stream "~A = ~A;~%" tname rhs)))
+     (emit-assignment-statement-c stmt indent stream))
 
     (raw-c-statement
      (let ((code (raw-c-text stmt)))
@@ -528,48 +676,51 @@ Each statement is numbered. For each assignment we show:
 ;;; ------------------------------------------------------------
 ;;; Function emitter
 ;;; ------------------------------------------------------------
+(defparameter *c-local-types* nil
+  "Hash table mapping local variable symbols -> C type strings
+   for the current function being emitted.")
 
-(defun emit-c-parameter-list (params stream)
-  "PARAMS is a list of (ctype name)."
-  (loop
-    for (ctype pname) in params
-    for i from 0
-    do (progn
-         (when (> i 0) (format stream ", "))
-         (format stream "~A ~A"
-                 ctype
-                 (%c-ident pname)))))
+(defparameter *c-declared-locals* nil
+  "Hash table recording which locals have already been declared
+   in the current function being emitted.")
 
+(defun build-c-local-type-table (locals)
+  "LOCALS is whatever (infer-kernel-locals) returns.
+Expected shape: a list of (ctype name) pairs.
+Return a hash-table mapping NAME -> CTYPE."
+  (let ((ht (make-hash-table :test #'eq)))
+    (dolist (loc locals ht)
+      (destructuring-bind (ctype name) loc
+        (setf (gethash name ht) ctype)))))
 
-(defun emit-c-locals (locals indent stream)
-  "LOCALS is a list of (ctype name)."
-  (dolist (local locals)
-    (destructuring-bind (ctype lname) local
-      (%indent indent stream)
-      (format stream "~A ~A;~%" ctype (%c-ident lname)))))
-
+(defun emit-c-function (fn stream)
+  "Emit a C function from FN to STREAM, declaring locals at first assignment."
+  (let* ((name       (c-function-name fn))
+         (ret-type   (c-function-return-type fn))  ; e.g. \"void\"
+         (params     (c-function-parameters fn))   ; list of (ctype name)
+         (locals     (c-function-locals fn))
+         (body       (c-function-body fn))
+         (*c-local-types*    (build-c-local-type-table locals))
+         (*c-declared-locals* (make-hash-table :test #'eq)))
+    ;; function header
+    (format stream "~a ~a(" ret-type (string-downcase name))
+    (loop for (ptype pname) in params
+          for i from 0
+          do (progn
+               (when (> i 0) (format stream ", "))
+               (format stream "~a ~a" ptype (string-downcase pname))))
+    (format stream ")~%{~%")
+    ;; body
+    (emit-statement-c body 1 stream)
+    (format stream "}~%")))
 
 (defun c-function->c-source-string (cfun)
   "Render a STMT-IR:C-FUNCTION as a complete C function definition string."
   (unless (typep cfun 'c-function)
     (error "c-function->c-source-string: expected C-FUNCTION, got ~S" cfun))
   (with-output-to-string (s)
-    (let* ((fname   (%c-ident (c-function-name cfun)))
-           (rettype (c-function-return-type cfun))
-           (params  (c-function-parameters cfun))
-           (locals  (c-function-locals cfun))
-           (body    (c-function-body cfun)))
-      ;; Function header
-      (format s "~A ~A(" rettype fname)
-      (emit-c-parameter-list params s)
-      (format s ")~%{~%")
-      ;; Locals
-      (when locals
-        (emit-c-locals locals 1 s)
-        (terpri s))
-      ;; Body
-      (emit-block-c body 1 s)
-      (format s "}~%"))))
+    (emit-c-function cfun s)))
+
 
 
 ;;; ------------------------------------------------------------
@@ -1124,7 +1275,9 @@ Each pass uses a distinct temp namespace: CSE_P<pass>_T<n>."
                    (equal before-symbol-list after-symbol-list))
           (return current-block))
         (setf current-block next-block)))
-    current-block))
+    ;; Reorder assignments so expressions aren't used before their variables are defined
+    (let ((block-fixed (reorder-block-def-before-use current-block)))
+      block-fixed)))
 
 
 (defun cse-block-multi (block &key (max-passes 5) (min-uses 2) (min-size 5))
@@ -2236,90 +2389,6 @@ statements are not inserted. If both are NIL, anchors are simply removed."
      (rewrite-stmt-list (stmt-ir:block-statements block)))))
 
 
-(defun make-kernel-from-block
-    (&key name pipeline layout coord-vars coord-load-stmts base-block params
-       compute-energy compute-grad compute-hess derivatives)
-  (let* ((energy-var 'energy)
-         (manual-deriv-spec (normalize-derivatives-spec derivatives))
-         ;; Expand D! requests first
-         (base-block* (expand-derivative-requests base-block))
-         (pass-counter (stmt-ir:make-pass-id-counter)))
-    ;; Optional geometry checking / auto-fill stays the same, but use base-block*
-    (when manual-deriv-spec
-      (check-intermediate-geometry! base-block* coord-vars manual-deriv-spec))
-    (when manual-deriv-spec
-      (auto-fill-intermediate-geometry-from-ad
-       base-block* coord-vars manual-deriv-spec
-       :compute-second-derivs t
-       :reuse-assignments t))
-
-    (labels ((the-name (nm)
-               (format nil "~a ~a" name nm)))
-      ;; 1. Build gradient/Hessian scalar assignments, but do *not* append yet
-      (let* ((grad-stmts (and compute-grad
-                              (make-gradient-assignments-from-block
-                               base-block* energy-var coord-vars
-                               #'general-grad-name
-                               manual-deriv-spec)))
-             (hess-stmts (and compute-hess
-                              (make-hessian-assignments-from-block
-                               base-block* energy-var coord-vars
-                               #'general-hess-name
-                               manual-deriv-spec)))
-             (has-anchor (block-has-accum-anchor-p base-block*))
-             ;; 2. Combine base block + grad/hess, either via anchor or by append
-             (combined-block
-               (cond
-                 (has-anchor
-                  (splice-derivatives-at-accum-anchor
-                   base-block*
-                   (or grad-stmts '())
-                   (or hess-stmts '())
-                   :compute-grad compute-grad
-                   :compute-hess compute-hess))
-                 (t
-                  ;; old behavior: append at end
-                  (let* ((stmts (copy-list
-                                 (stmt-ir:block-statements base-block*))))
-                    (when grad-stmts
-                      (setf stmts (append stmts grad-stmts)))
-                    (when hess-stmts
-                      (setf stmts (append stmts hess-stmts)))
-                    (stmt-ir:make-block-stmt stmts)))))
-             ;; 3. Run optimization pipeline on the combined block
-             (opt-block combined-block))
-        (when pipeline
-          (multiple-value-bind (opt-block* results total-before total-after)
-              (stmt-ir:run-optimization-pipeline
-               pass-counter pipeline opt-block
-               :name (the-name "e-g-hess")
-               :log-stream *trace-output*)
-            (declare (ignore results total-before total-after))
-            (setf opt-block opt-block*)))
-        ;; 4. Prepend coord load, if any
-        (let* ((block-with-coords
-                 (if coord-load-stmts
-                     (stmt-ir:make-block-stmt
-                      (append coord-load-stmts
-                              (list opt-block)))
-                     opt-block))
-               ;; 5. Transform energy/grad/hess scalar assignments into
-               ;;    *Energy +=, ForceAcc, DiagHessAcc, OffDiagHessAcc
-               (transformed
-                 (transform-eg-h-block
-                  block-with-coords
-                  layout
-                  coord-vars
-                  #'general-grad-name
-                  #'general-hess-name))
-               (locals (infer-kernel-locals transformed params coord-vars)))
-          ;; 6. Wrap into a C function, as before
-          (stmt-ir:make-c-function
-           name
-           transformed
-           :return-type "void"
-           :parameters  params
-           :locals      locals))))))
 
 
 ;;; ----------------------------------------------------------------------

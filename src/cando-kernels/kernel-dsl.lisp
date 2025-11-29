@@ -383,14 +383,18 @@ Expands to a LIST of RAW-C statements that load xyz from
 position[i3xN + {0,1,2}]."
   `(list
     ,@(loop for (x y z idx) in specs
+            for idxlc = (string-downcase idx)
+            for xlc = (string-downcase x)
+            for ylc = (string-downcase y)
+            for zlc = (string-downcase z)
             append
             (list
              `(stmt-ir:make-raw-c-statement
-               ,(format nil "~A = position[~A + 0];" x idx))
+               ,(format nil "~a ~A = position[~A + 0];" (symbol-name 'double) xlc idxlc))
              `(stmt-ir:make-raw-c-statement
-               ,(format nil "~A = position[~A + 1];" y idx))
+               ,(format nil "~a ~A = position[~A + 1];" (symbol-name 'double) ylc idxlc))
              `(stmt-ir:make-raw-c-statement
-               ,(format nil "~A = position[~A + 2];" z idx))))))
+               ,(format nil "~a ~A = position[~A + 2];" (symbol-name 'double) zlc idxlc))))))
 
 
 ;;; ------------------------------------------------------------
@@ -1224,8 +1228,8 @@ inside BLOCK into explicit derivative assignments."
     (&key name pipeline layout coord-vars coord-load-stmts base-block params
           compute-energy compute-grad compute-hess derivatives
           extra-equivalence-rules extra-optimization-rules
-          post-eg-h-pipeline)
-
+       post-eg-h-pipeline)
+  (declare (optimize (debug 3)))
   (labels ((the-name (nm)
              (format nil "~a ~a" name nm)))
     (let* ((energy-var        'energy)
