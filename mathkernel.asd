@@ -1,5 +1,5 @@
 
-(asdf:defsystem #:symkernel
+(asdf:defsystem #:mathkernel
   :description "Optimize mathematical expressions using a compiler implemented in common lisp "
   :version "0.0.1"
   :author "Christian Schafmeister <chris.schaf@verizon.net>"
@@ -7,7 +7,7 @@
   :depends-on ()
   :serial t
   :components ((:module "src"
-                :components ((:module "symkernel"
+                :components ((:module "mathkernel"
                               :components ((:file "packages")
                                            (:file "math")
                                            (:file "expression-ir")
