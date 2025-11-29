@@ -25,6 +25,11 @@ Ask ChatGPT what that means if you want to learn more.  It's math for building m
 ## Authors
 
 This application was vibe-coded using ChatGPT5.1 by Christian Schafmeister over five days starting on Nov 23 2025.
+I implemented an application like this 25 years ago in Mathematica and it drives me crazy everytime I have to get it
+working again to make changes. We implemented Cando (https://github.com/cando-developers/cando.git) and 
+Clasp (https://github.com/clasp-developers/clasp.git). Cando is a Common Lisp implementation to write complex molecular
+modelling code. Why?  Because if you are going to write software to build molecules you should write it in the language
+of the universe (lisp).  Also - Python sucks.
 
 I started with a $20/month OpenAI account and things started very nicely but after a day I noticed
 that ChatGPT was running out of steam and starting to ping-pong between approaches and forgetting that
