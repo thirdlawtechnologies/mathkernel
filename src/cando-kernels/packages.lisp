@@ -7,5 +7,9 @@
    #:*rewrite-rules-basic*
    #:write-c-code
    #:*post-eg-h-pipeline*
-   #:write-all))
+   #:write-all
+   #:define-multiple-kernels
+   #:push-kernel
+   #:build-multiple-kernels
+   #:with-kernals))
 

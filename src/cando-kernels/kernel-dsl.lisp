@@ -1,4 +1,4 @@
-d;;;; ------------------------------------------------------------
+;;;; ------------------------------------------------------------
 ;;;; kernel-dsl.lisp
 ;;;; ------------------------------------------------------------
 ;;;; Small DSL for defining energy kernels (E, optional grad/Hess) on top of
@@ -59,8 +59,8 @@ RAW-SPEC is a property list with keys:
                       raw-spec
                       (error "DERIVATIVES spec must be a property list, got ~S"
                              raw-spec)))
-           (mode             (or (getf plist :mode) :manual))
-           (raw-intermediates (or (getf plist :intermediates) '()))
+           (mode             (getf plist :mode :manual))
+           (raw-intermediates (getf plist :intermediates '()))
            ;; normalize intermediates into expr-var package
            (intermediates    (mapcar #'expr-ir:ev raw-intermediates))
            (du-dq            (make-hash-table :test #'equal))
@@ -71,7 +71,7 @@ RAW-SPEC is a property list with keys:
            (geometry-check   (or (getf plist :geometry-check) :none)))
 
       ;; ∂u/∂q entries
-      (dolist (entry (or (getf plist :intermediate->coord) '()))
+      (dolist (entry (getf plist :intermediate->coord '()))
         ;; entry = (u ((q1 "expr") (q2 "expr") ...))
         (destructuring-bind (u coord-list) entry
           (let ((u* (expr-ir:ev u)))
@@ -82,7 +82,7 @@ RAW-SPEC is a property list with keys:
                   (setf (gethash (list u* q*) du-dq) expr)))))))
 
       ;; ∂²u/(∂qi ∂qj) entries
-      (dolist (entry (or (getf plist :intermediate->coord2) '()))
+      (dolist (entry (getf plist :intermediate->coord2 '()))
         ;; entry = (u (((qi qj) "expr") ...))
         (destructuring-bind (u pair-list) entry
           (let ((u* (expr-ir:ev u)))
@@ -98,13 +98,13 @@ RAW-SPEC is a property list with keys:
         (when e-int
           (let ((grad-list (getf e-int :gradient))
                 (hess-list (getf e-int :hessian)))
-            (dolist (g (or grad-list '()))
+            (dolist (g grad-list)
               ;; g = (u "expr")
               (destructuring-bind (u expr-str) g
                 (let ((expr (expr-ir:infix->expr-ir expr-str))
                       (u*   (expr-ir:ev u)))
                   (setf (gethash u* dE-du) expr))))
-            (dolist (h (or hess-list '()))
+            (dolist (h hess-list)
               ;; h = ((u v) "expr")
               (destructuring-bind ((u v) expr-str) h
                 (let ((expr (expr-ir:infix->expr-ir expr-str))
@@ -114,7 +114,7 @@ RAW-SPEC is a property list with keys:
 
       ;; Hessian modes per intermediate (optional)
       ;; e.g. :hessian-modes ((r :full) (theta :outer-product-only))
-      (dolist (entry (or (getf plist :hessian-modes) '()))
+      (dolist (entry (getf plist :hessian-modes '()))
         (destructuring-bind (u mode-key) entry
           (setf (gethash (expr-ir:ev u) hessian-modes) mode-key)))
 
@@ -637,7 +637,6 @@ calling ForceAcc(i_base, offset, g_x1); otherwise return NIL."
   - for energy assignment E = ..., append \"*Energy += E;\",
   - for gradient scalar G_* assignments, append ForceAcc(...) macro calls,
   - for Hessian scalar H_*_* assignments, append DiagHessAcc/OffDiagHessAcc calls."
-  (declare (ignore coord-vars grad-target-fn hess-target-fn))
   (unless (typep block 'stmt-ir:block-statement)
     (error "transform-eg-h-block: expected BLOCK-STATEMENT, got ~S" block))
   (let ((new-stmts '()))
@@ -686,7 +685,7 @@ calling ForceAcc(i_base, offset, g_x1); otherwise return NIL."
 
 
 
-(defun build-deriv-env-for-block (block base-var)
+(defun build-deriv-env-for-block-propagate (block base-var)
   "Propagate derivatives d(* )/d(BASE-VAR) through BLOCK and
 return the resulting DERIV-ENV (an EXPR-IR derivative environment).
 
@@ -731,7 +730,7 @@ Otherwise, fall back to pure AD on ENERGY-VAR wrt each coordinate."
                     (let ((ht (make-hash-table :test #'eq)))
                       (dolist (q coord-vars)
                         (setf (gethash q ht)
-                              (build-deriv-env-for-block base-block q)))
+                              (build-deriv-env-for-block-propagate base-block q)))
                       ht)))
             (grad-assignments '()))
        (dolist (q coord-vars (nreverse grad-assignments))
@@ -759,7 +758,7 @@ Otherwise, fall back to pure AD on ENERGY-VAR wrt each coordinate."
     (t
      (let ((grad-assignments '()))
        (dolist (q coord-vars (nreverse grad-assignments))
-         (let* ((deriv-env (build-deriv-env-for-block base-block q))
+         (let* ((deriv-env (build-deriv-env-for-block-propagate base-block q))
                 (dE-dq     (expr-ir:lookup-var-derivative energy-var q deriv-env))
                 (dE-dq-s   (expr-ir:simplify-expr dE-dq)))
            (unless (and (typep dE-dq-s 'expr-ir:constant-expression)
@@ -1006,7 +1005,7 @@ Existing manual entries in DU-DQ / D2U-DQ2 are preserved (never overwritten)."
     ;; build derivative envs wrt each coordinate
     (dolist (q coord-vars)
       (setf (gethash q envs)
-            (build-deriv-env-for-block base-block q)))
+            (build-deriv-env-for-block-propagate base-block q)))
     ;; For du/dq
     (dolist (u intermediates)
       (dolist (q coord-vars)
@@ -1363,12 +1362,10 @@ inside BLOCK into explicit derivative assignments."
   (mapcar #'expr-ir:expr-var-symbol vars))
 
 
-(defmacro defkernel (name &body clauses)
+(defmacro push-kernel (destination c-function-name compute-mode &body clauses)
   (labels ((clause-value (key)
              (cadr (assoc key clauses))))
-    (let* ((c-function-name (clause-value :c-function-name))
-           (compute-list    (clause-value :compute))
-           (pipeline        (clause-value :pipeline))
+    (let* ((pipeline        (clause-value :pipeline))
            (params          (clause-value :params))
            (layout-cl       (assoc :layout clauses))
            (coord-vars      (mapcar #'expr-ir:ev (clause-value :coord-vars)))
@@ -1383,11 +1380,9 @@ inside BLOCK into explicit derivative assignments."
            (atom->ibase     (second layout-cl))
            (axis->offset    (third layout-cl))
            (coord-names     (mapcar #'symbol-name coord-vars))
-           (want-grad       (and compute-list
-                                 (not (null (member 'grad compute-list)))))
-           (want-hess       (and compute-list
-                                 (not (null (member 'hess compute-list))))))
-      `(defparameter ,name
+           (want-grad      (not (null (member compute-mode '(:gradient :hessian)))))
+           (want-hess      (eq compute-mode :hessian)))
+      `(push 
          (let* ((layout (make-kernel-layout
                          :atom->ibase ',atom->ibase
                          :axis->offset ',axis->offset))
@@ -1395,7 +1390,7 @@ inside BLOCK into explicit derivative assignments."
                 (coord-load-stmts ,coord-load)
                 (base-block ,body-form))
            (make-kernel-from-block
-            :name ',c-function-name
+            :name ',(format nil "~a_~a" c-function-name (string-downcase compute-mode))
             :pipeline ,pipeline
             :layout layout
             :coord-vars coord-vars
@@ -1408,51 +1403,23 @@ inside BLOCK into explicit derivative assignments."
             :derivatives ',deriv-spec
             ;; NEW: per‑kernel rewrite rules (may be NIL)
             :extra-equivalence-rules ,extra-eq-rules
-            :extra-optimization-rules ,extra-opt-rules))))))
+            :extra-optimization-rules ,extra-opt-rules))
+         ,destination))))
+
+(defmacro build-multiple-kernels ((destination c-function-name compute-mode-list) &body clauses)
+  `(progn
+     ,@(loop for compute-mode in compute-mode-list
+             collect `(push-kernel ,destination ,c-function-name ,compute-mode
+                        ,@clauses))))
 
 
+(defun write-all (pathname)
+  (loop for kernel in *kernels*
+        for name = (string-downcase (kernel-name kernel))
+        for pn = (merge-pathnames (make-pathname :name name :type "c") (pathname pathname))
+        do (format t "writing = ~s~%" pn)
+        do (write-c-code kernel pn)))
 
-
-#+(or)
-(defmacro defkernel (name &body clauses)
-  (labels ((clause-value (key)
-             (cadr (assoc key clauses))))
-    (let* ((c-function-name (clause-value :c-function-name))
-           (compute-list   (clause-value :compute))
-           (pipeline       (clause-value :pipeline))
-           (params         (clause-value :params))
-           (layout-cl      (assoc :layout clauses))
-           (coord-vars     (mapcar #'expr-ir:ev (clause-value :coord-vars)))
-           (coord-load     (clause-value :coord-load))
-           (body-form      (clause-value :body))
-           (deriv-cl       (assoc :derivatives clauses))
-           (deriv-spec     (and deriv-cl (second deriv-cl)))
-           (atom->ibase    (second layout-cl))
-           (axis->offset   (third layout-cl))
-           (coord-names    (mapcar #'symbol-name coord-vars))
-           (want-grad      (and compute-list
-                                (not (null (member 'grad compute-list)))))
-           (want-hess      (and compute-list
-                                (not (null (member 'hess compute-list))))))
-      `(defparameter ,name
-         (let* ((layout (make-kernel-layout
-                         :atom->ibase ',atom->ibase
-                         :axis->offset ',axis->offset))
-                (coord-vars (vars ,@coord-names))
-                (coord-load-stmts ,coord-load)
-                (base-block ,body-form))
-           (make-kernel-from-block
-            :name ',c-function-name
-            :pipeline ,pipeline
-            :layout layout
-            :coord-vars coord-vars
-            :coord-load-stmts coord-load-stmts
-            :base-block base-block
-            :params ',params
-            :compute-energy t
-            :compute-grad ,want-grad
-            :compute-hess ,want-hess
-            :derivatives ',deriv-spec))))))
-
-
-
+(defmacro with-kernals ((destination) &body body)
+  (let ((,destination nil))
+    ,@body))
