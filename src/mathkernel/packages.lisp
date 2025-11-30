@@ -218,7 +218,7 @@
 (defpackage :expr-var
   (:use :cl))
 
-(defpackage :math-kernel
+(defpackage :mathkernel
   (:use :cl :opt-exp :expr-ir :stmt-ir)
   (:export
    #:=.
@@ -238,8 +238,8 @@
    #:with-kernels))
 
 ;;;; Symbols go in this package
-(defpackage :math-kernel-user
-  (:use :cl :expr-ir :opt-exp :math-kernel)
+(defpackage :mathkernel-user
+  (:use :cl :expr-ir :opt-exp :mathkernel)
   (:export
    #:with-kernels
    #:coords-from-position

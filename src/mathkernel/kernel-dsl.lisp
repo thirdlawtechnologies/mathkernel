@@ -4,7 +4,7 @@
 ;;;; Small DSL for defining energy kernels (E, optional grad/Hess) on top of
 ;;;; expr-ir / stmt-ir and the energy-kernels utilities.
 
-(in-package :math-kernel)
+(in-package :mathkernel)
 
 ;;; ------------------------------------------------------------
 ;;; Manual derivative specification
@@ -1413,7 +1413,7 @@ inside BLOCK into explicit derivative assignments."
                         ,@clauses))))
 
 
-(defun write-all (kernels pathname)
+(defun write-all (kernels &key (pathname (or (uiop/os:getenv "KERNEL_PATH") "/tmp/kernels/")))
   (loop for kernel in kernels
         for name = (string-downcase (kernel-name kernel))
         for pn = (merge-pathnames (make-pathname :name name :type "c") (pathname pathname))

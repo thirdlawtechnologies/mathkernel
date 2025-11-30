@@ -2,7 +2,7 @@
 ;;;; energy-kernels.lisp
 ;;;; -------------------------------
 
-(in-package :math-kernel-user)
+(in-package :mathkernel-user)
 
 (defparameter *pipeline*
   (stmt-ir:make-optimization-pipeline
@@ -850,6 +850,6 @@
 
 
 
-  (write-all kernels "~/tmp/code/kernels/")
+  (write-all kernels)
   )
 
