@@ -1,4 +1,4 @@
-;;;; ------------------------------------------------------------
+d;;;; ------------------------------------------------------------
 ;;;; kernel-dsl.lisp
 ;;;; ------------------------------------------------------------
 ;;;; Small DSL for defining energy kernels (E, optional grad/Hess) on top of
@@ -11,15 +11,34 @@
 ;;; ------------------------------------------------------------
 
 
-(defstruct manual-deriv-spec
-  mode               ;; :manual, :hybrid, ...
-  intermediates      ;; list of expr-ir vars
-  du-dq              ;; hash (list u q) -> expr
-  d2u-dq2            ;; hash (list u qi qj) -> expr
-  dE-du              ;; hash u -> expr
-  d2E-dudu           ;; hash (list u v) -> expr
-  hessian-modes      ;; hash u -> :full | :outer-product-only | :none
-  geometry-check-mode) ;; :none | :warn | :error
+(defclass manual-deriv-spec ()
+  ((mode
+    :initarg :mode
+    :accessor manual-deriv-spec-mode)
+   (intermediates
+    :initarg :intermediates
+    :accessor manual-deriv-spec-intermediates)
+   (du-dq
+    :initarg :du-dq
+    :accessor manual-deriv-spec-du-dq)
+   (d2u-dq2
+    :initarg :d2u-dq2
+    :accessor manual-deriv-spec-d2u-dq2)
+   (dE-du
+    :initarg :dE-du
+    :accessor manual-deriv-spec-dE-du)
+   (d2E-dudu
+    :initarg :d2E-dudu
+    :accessor manual-deriv-spec-d2E-dudu)
+   (hessian-modes
+    :initarg :hessian-modes
+    :accessor manual-deriv-spec-hessian-modes)
+   (geometry-check-mode
+    :initarg :geometry-check-mode
+    :accessor manual-deriv-spec-geometry-check-mode)))
+
+(defun make-manual-deriv-spec (&rest initargs)
+  (apply #'make-instance 'manual-deriv-spec initargs))
 
 
 
@@ -281,6 +300,7 @@ Signals warnings or errors if mismatches are found, depending on mode."
 (defun coord-name->ibase+offset (coord-name layout)
   "COORD-NAME = \"X1\" / \"Y12\" / \"Z3\".
 Return (ibase-symbol, offset-int) using LAYOUT."
+  (declare (optimize (debug 3)))
   (let* ((s coord-name)
          (len (length s)))
     (when (< len 2)
@@ -326,6 +346,7 @@ Later assignments for the same variable override earlier ones."
               (stmt-ir:stmt-expression st))))))
 
 
+#+(or)
 (defun expand-sexpr-with-assignments (sexpr assign-map &optional (max-depth 4))
   "Recursively expand SEXPR by inlining variable definitions from
 ASSIGN-MAP, which maps VAR-SYM -> EXPR-IR.
@@ -1115,8 +1136,6 @@ known to execute before this BLOCK (e.g. assignments in enclosing blocks)."
   "Top-level entry: expand all derivative requests (D TARGET BASE)
 inside BLOCK into explicit derivative assignments."
   (let ((new-block (%expand-derivative-requests-in-block block '())))
-    (stmt-ir:debug-block block :label "before derivative")
-    (stmt-ir:debug-block new-block :label "after derivative")
     new-block))
 
 

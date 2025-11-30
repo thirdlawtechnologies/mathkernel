@@ -25,15 +25,6 @@
 Keys are variable-name strings (UPCASE). Values are expression IR nodes."
   (make-hash-table :test #'equal))
 
-#+(or)
-(defun denv-get (env var)
-  (gethash var (deriv-env-dvar env)
-           (make-constant 0)))
-
-#+(or)
-(defun denv-add! (env var expr)
-  (setf (gethash var (deriv-env-dvar env))
-        (expr-ir:add-expressions (denv-get env var) expr)))
 
 (defun set-var-derivative (var deriv-expr deriv-env)
   "Record d(VAR)/d(base-var) = DERIV-EXPR in DERIV-ENV.

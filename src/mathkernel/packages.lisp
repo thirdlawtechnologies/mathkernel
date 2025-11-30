@@ -208,9 +208,7 @@
    #:debug-block
    #:make-accum-anchor-stmt
    #:accumulation-anchor-statement
-   #:block-has-accum-anchor-p
    #:accumulate-here
-   #:splice-derivatives-at-accum-anchor
    #:alias-assigned-exprs-optimization))
 
 (defpackage :stmt-ir.tests

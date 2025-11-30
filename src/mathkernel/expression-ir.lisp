@@ -5,7 +5,6 @@
 
 (in-package :expr-ir)
 
-
 (defparameter *function-names* '(:cos :sin :exp :log :sqrt :acos :atan2))
 
 ;;; ----------------------------------------------------------------------
@@ -49,6 +48,7 @@
 ;;; Constants and variables
 ;;; ----------------------------------------------------------------------
 
+
 (defclass constant-expression (numeric-expression)
   ((value
     :initarg :value
@@ -57,6 +57,7 @@
   (:documentation
    "Numeric literal. Invariants:
     - Stored in a canonical numeric representation (e.g. rationals reduced)."))
+
 
 (defclass variable-expression (numeric-expression)
   ((name
@@ -516,32 +517,6 @@ Variable and function names are lower-cased."
             (error "expr->c-expr-string: unknown expr node of type ~S: ~S"
                    (type-of e) e)))))
     (emit expr)))
-
-(defun add-expressions (a b)
-  "Return an expression representing A + B, doing minimal local
-simplification:
-
-  - if A is the constant 0, return B
-  - if B is the constant 0, return A
-  - otherwise build a canonical ADD-EXPRESSION via MAKE-EXPR-ADD."
-
-  ;; Treat NIL as 0 for convenience (in case callers pass it).
-  (when (null a)
-    (setf a (make-constant 0)))
-  (when (null b)
-    (setf b (make-constant 0)))
-
-  (flet ((zero-const-p (e)
-           (and (typep e 'constant-expression)
-                (zerop (expression-value e)))))
-    (cond
-      ((zero-const-p a) b)
-      ((zero-const-p b) a)
-      (t
-       ;; Let MAKE-EXPR-ADD handle flattening, constant folding, ordering, etc.
-       (make-expr-add (list a b))))))
-
-
 
 ;;; ----------------------------------------------------------------------
 ;;; Normalization pass

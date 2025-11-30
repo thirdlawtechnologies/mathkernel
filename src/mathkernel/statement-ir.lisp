@@ -519,7 +519,6 @@ earlier in the run.
 
 We do not move assignments across IF- or BLOCK-STATEMENT boundaries;
 those act as barriers. We recurse into nested blocks and if branches."
-  (debug-block block :label "Before sort")
   (labels
       ;; recurse into a single statement
       ((reorder-stmt (st)
@@ -572,7 +571,6 @@ those act as barriers. We recurse into nested blocks and if branches."
              (apply #'nconc (nreverse acc))))))
     (let ((sorted-block (make-block-stmt
                          (reorder-stmt-list (block-statements block)))))
-      (debug-block sorted-block :label "sorted block")
       sorted-block)))
 
 ;;; ------------------------------------------------------------
@@ -2006,6 +2004,7 @@ has had EXPR-IR:NORMALIZE-SIGNS-EXPR applied."
 ;;; Optimization to apply rewrite expressions
 ;;; ----------------------------------------------------------------------
 
+#+(or)
 (defun rewrite-exprs-in-block-optimization (pass-counter block &key (rules expr-ir:*rewrite-rules-basic*) (max-iterations 5))
   "Return a new BLOCK where every expr-ir expression has been rewritten
 via REWRITE-EXPR-IR-WITH-RULES using RULES.
@@ -2279,7 +2278,6 @@ RESULTS-LIST is a list of plists:
                      (run-optimization pass-counter opt current
                                        :name cur-name
                                        :measure measure :log-stream log-stream)
-                   (stmt-ir:debug-block new-block :label (format nil "block after optimization ~s" cur-name))
                    (push (list :opt-name (format nil "~a ~a" cur-name (optimization-name opt))
                                :before   before
                                :after    after
@@ -2322,6 +2320,7 @@ Example:
     ...)"
   `(stmt-ir:make-accum-anchor-stmt))
 
+#+(or)
 (defun block-has-accum-anchor-p (block)
   "Return T if BLOCK (a stmt-ir:block-statement) contains at least
 one accumulation-anchor-statement anywhere inside."
@@ -2339,6 +2338,7 @@ one accumulation-anchor-statement anywhere inside."
                 nil))))
     (scan-stmt block)))
 
+#+(or)
 (defun splice-derivatives-at-accum-anchor
     (block grad-stmts hess-stmts
            &key compute-grad compute-hess)
