@@ -18,6 +18,6 @@
                                            (:file "expression-diff")
                                            (:file "statement-diff")
                                            (:file "statement-tests")
-                                           (:file "energy-blocks")
+                                           (:file "kernel-dsl")
                                            ))))))
 

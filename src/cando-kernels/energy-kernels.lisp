@@ -2,7 +2,7 @@
 ;;;; energy-kernels.lisp
 ;;;; -------------------------------
 
-(in-package :energy-kernels)
+(in-package :math-kernel-user)
 
 (defparameter *pipeline*
   (stmt-ir:make-optimization-pipeline
@@ -53,9 +53,9 @@
 
 
 
-(energy-kernels:with-kernels (kernels)
- 
-  (build-multiple-kernels (*kernels* "stretch" (:energy :gradient :hessian))
+(with-kernels (kernels)
+
+  (build-multiple-kernels (kernels "stretch" (:energy :gradient :hessian))
     (:pipeline *pipeline*)
     (:params ((double kb)
               (double r0)
@@ -143,7 +143,7 @@
       :geometry-check :warn)))
 
 
-  (build-multiple-kernels (*kernels* "angle" (:energy :gradient :hessian))
+  (build-multiple-kernels (kernels "angle" (:energy :gradient :hessian))
     (:pipeline *pipeline*)
     (:params ((double kt)
               (double t0)
@@ -237,7 +237,7 @@
       :geometry-check :warn)))
 
 
-  (build-multiple-kernels (*kernels* "dihedral" (:energy :gradient :hessian))
+  (build-multiple-kernels (kernels "dihedral" (:energy :gradient :hessian))
     (:pipeline *pipeline*)
     (:params ((double V)   ;; amplitude
               (double n)   ;; multiplicity
@@ -331,7 +331,7 @@
 
 
 
-  (build-multiple-kernels (*kernels* "nonbond" (:energy :gradient :hessian))
+  (build-multiple-kernels (kernels "nonbond" (:energy :gradient :hessian))
     (:pipeline *pipeline*)
     (:params ((double A) ;; LJ A coefficient  (A / r^12)
               (double B) ;; LJ B coefficient  (B / r^6)
@@ -426,7 +426,7 @@
 
 
 
-  (build-multiple-kernels (*kernels* "nonbond_dd_cutoff" (:energy :gradient :hessian))
+  (build-multiple-kernels (kernels "nonbond_dd_cutoff" (:energy :gradient :hessian))
     (:pipeline *pipeline*)
 
     (:params ((double A)      ;; LJ A coefficient  (A / r^12)
@@ -571,7 +571,7 @@
       :geometry-check :warn)))
 
 
-  (build-multiple-kernels (*kernels* "chiral_restraint" (:energy :gradient :hessian))
+  (build-multiple-kernels (kernels "chiral_restraint" (:energy :gradient :hessian))
     ;; Optimization pipeline
     (:pipeline *pipeline*)
 
@@ -681,7 +681,7 @@
        (accumulate-here))))
 
 
-  (build-multiple-kernels (*kernels* "anchor" (:energy :gradient :hessian))
+  (build-multiple-kernels (kernels "anchor" (:energy :gradient :hessian))
     (:pipeline *pipeline*)
     (:layout ((1 . I3X1))
              ((X . 0) (Y . 1) (Z . 2)))
@@ -736,7 +736,7 @@
 
 
 
-  (build-multiple-kernels (*kernels* "dihedral_restraint" (:energy :gradient :hessian))
+  (build-multiple-kernels (kernels "dihedral_restraint" (:energy :gradient :hessian))
     (:pipeline *pipeline*)
 
     ;; Parameters:
@@ -850,6 +850,6 @@
 
 
 
-  (write-all "~/tmp/code/kernels/")
+  (write-all kernels "~/tmp/code/kernels/")
   )
 

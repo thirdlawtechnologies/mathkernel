@@ -4,7 +4,7 @@
 ;;;; Small DSL for defining energy kernels (E, optional grad/Hess) on top of
 ;;;; expr-ir / stmt-ir and the energy-kernels utilities.
 
-(in-package :energy-kernels)
+(in-package :math-kernel)
 
 ;;; ------------------------------------------------------------
 ;;; Manual derivative specification
@@ -1413,13 +1413,13 @@ inside BLOCK into explicit derivative assignments."
                         ,@clauses))))
 
 
-(defun write-all (pathname)
-  (loop for kernel in *kernels*
+(defun write-all (kernels pathname)
+  (loop for kernel in kernels
         for name = (string-downcase (kernel-name kernel))
         for pn = (merge-pathnames (make-pathname :name name :type "c") (pathname pathname))
         do (format t "writing = ~s~%" pn)
         do (write-c-code kernel pn)))
 
-(defmacro with-kernals ((destination) &body body)
-  (let ((,destination nil))
-    ,@body))
+(defmacro with-kernels ((destination) &body body)
+  `(let ((,destination nil))
+     ,@body))

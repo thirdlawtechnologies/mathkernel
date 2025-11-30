@@ -218,9 +218,32 @@
 (defpackage :expr-var
   (:use :cl))
 
-;;;; Symbols go in this package
-(defpackage :expr-user
-  (:use :cl :expr-ir :opt-exp)
+(defpackage :math-kernel
+  (:use :cl :opt-exp :expr-ir :stmt-ir)
   (:export
+   #:=.
+   #:D!
+   #:accumulate-here
+   #:stmt-block
+   #:coords-from-position
+   #:rewrite-expr-ir-with-rules
+   #:rewrite-sexpr-with-rules
+   #:*rewrite-rules-basic*
+   #:write-c-code
+   #:*post-eg-h-pipeline*
+   #:write-all
+   #:define-multiple-kernels
+   #:push-kernel
+   #:build-multiple-kernels
+   #:with-kernels))
+
+;;;; Symbols go in this package
+(defpackage :math-kernel-user
+  (:use :cl :expr-ir :opt-exp :math-kernel)
+  (:export
+   #:with-kernels
+   #:coords-from-position
+   #:stmt-block
+   #:=.
    ))
 

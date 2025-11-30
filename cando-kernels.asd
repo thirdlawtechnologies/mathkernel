@@ -8,8 +8,6 @@
   :serial t
   :components ((:module "src"
                 :components ((:module "cando-kernels"
-                              :components ((:file "packages")
-                                           (:file "kernel-dsl")
-                                           (:file "energy-kernels")
+                              :components ((:file "energy-kernels")
                                            ))))))
 
