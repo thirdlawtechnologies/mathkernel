@@ -1060,7 +1060,7 @@ all REQUIRED-FACTORS (by EQ)."
                    "Temp was created even though 2 * CSE_P1_T148 * kt only appears once."))))
 
 
-i(defun expr-nil-variable-p (expr)
+(defun expr-nil-variable-p (expr)
   "True if EXPR is a variable-expression whose symbol name is \"NIL\"."
   (and (typep expr 'expr-ir:variable-expression)
        (string= (symbol-name (expr-ir:variable-name expr)) "NIL")))
