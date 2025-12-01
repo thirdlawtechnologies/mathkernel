@@ -404,8 +404,8 @@ To control where E/G/H accumulation is emitted, you added:
   - Walks the block structure.
   - When it sees `ACCUMULATE-HERE-STATEMENT`, it emits the:
     - `*energy_accumulate += ENERGY;` if energy is computed.
-    - `ForceAcc(...)` calls for grad.
-    - `DiagHessAcc/OffDiagHessAcc` calls for Hessian.
+    - `KernelForceAcc(...)` calls for grad.
+    - `DiagHessAcc/KernelOffDiagHessAccc` calls for Hessian.
   - The accumulation is therefore *scoped* to the branch where `accumulate-here` appears.
 - This is how you solved “accumulate only when the energy term is active” for cutoff-based nonbond.
 

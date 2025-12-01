@@ -81,66 +81,15 @@
 
     (:body
      (stmt-block
-       (=. dx "x1 - x2")
-       (=. dy "y1 - y2")
-       (=. dz "z1 - z2")
+       (=. dx "x2 - x1")
+       (=. dy "y2 - y1")
+       (=. dz "z2 - z1")
        (=. r2 "dx*dx + dy*dy + dz*dz")
        (=. r  "sqrt(r2)")
        (=. dr "r - r0")
-       ;; E(r) = 0.5 * kb * (r - r0)^2
-       (=. energy "0.5*kb*dr*dr")))
-
-    (:derivatives
-     (:mode :manual
-      :intermediates (r)
-
-      ;; dr/dq
-      :intermediate->coord
-      ((r ((x1 "dx / r")
-           (y1 "dy / r")
-           (z1 "dz / r")
-           (x2 "-dx / r")
-           (y2 "-dy / r")
-           (z2 "-dz / r"))))
-
-      ;; d²r/(dqi dqj)
-      :intermediate->coord2
-      ((r (
-           ((x1 x1) "(r*r - dx*dx)/(r^3)")
-           ((x1 y1) "(-dx*dy)/(r^3)")
-           ((x1 z1) "(-dx*dz)/(r^3)")
-           ((x1 x2) "(dx*dx - r*r)/(r^3)")
-           ((x1 y2) "dx*dy/(r^3)")
-           ((x1 z2) "dx*dz/(r^3)")
-
-           ((y1 y1) "(r*r - dy*dy)/(r^3)")
-           ((y1 z1) "(-dy*dz)/(r^3)")
-           ((y1 x2) "dx*dy/(r^3)")
-           ((y1 y2) "(dy*dy - r*r)/(r^3)")
-           ((y1 z2) "dy*dz/(r^3)")
-
-           ((z1 z1) "(r*r - dz*dz)/(r^3)")
-           ((z1 x2) "dx*dz/(r^3)")
-           ((z1 y2) "dy*dz/(r^3)")
-           ((z1 z2) "(dz*dz - r*r)/(r^3)")
-
-           ((x2 x2) "(r*r - dx*dx)/(r^3)")
-           ((x2 y2) "(-dx*dy)/(r^3)")
-           ((x2 z2) "(-dx*dz)/(r^3)")
-
-           ((y2 y2) "(r*r - dy*dy)/(r^3)")
-           ((y2 z2) "(-dy*dz)/(r^3)")
-
-           ((z2 z2) "(r*r - dz*dz)/(r^3)"))))
-
-      ;; E(r) = 0.5*kb*(r - r0)^2
-      ;; dE/dr = kb*(r - r0), d²E/dr² = kb
-      :energy->intermediate
-      (:gradient ((r "kb*(r - r0)"))
-       :hessian  (((r r) "kb")))
-
-      :hessian-modes ((r :full))
-      :geometry-check :warn)))
+       ;; E(r) = kb * (r - r0)^2
+       (=. energy "kb*dr*dr")))
+    )
 
 
   (build-multiple-kernels (kernels "angle" (:energy :gradient :hessian))
@@ -149,7 +98,7 @@
               (double t0)
               (size_t i3x1)
               (size_t i3x2)
-              (size_t i3x3)
+              (0ksize_t i3x3)
               (double* position)
               (double* energy_accumulate)
               (double* force)
@@ -195,52 +144,13 @@
 
        ;; E(theta) = kt * (theta - t0)^2  (kt includes the 1/2 if desired)
        (=. energy "kt*dtheta*dtheta")))
-
-    (:derivatives
-     (:mode :manual
-      :intermediates (theta)
-
-      ;; dtheta/dcoord (manual, checked against AD)
-      :intermediate->coord
-      ((theta
-        ((x1 "(-vx2/(n1*n2*sin_theta) + dot*vx1/(n1^3*n2*sin_theta))")
-         (y1 "(-vy2/(n1*n2*sin_theta) + dot*vy1/(n1^3*n2*sin_theta))")
-         (z1 "(-vz2/(n1*n2*sin_theta) + dot*vz1/(n1^3*n2*sin_theta))")
-
-         (x3 "(-vx1/(n1*n2*sin_theta) + dot*vx2/(n1*n2^3*sin_theta))")
-         (y3 "(-vy1/(n1*n2*sin_theta) + dot*vy2/(n1*n2^3*sin_theta))")
-         (z3 "(-vz1/(n1*n2*sin_theta) + dot*vz2/(n1*n2^3*sin_theta))")
-
-         (x2 "(vx2/(n1*n2*sin_theta)
-               - dot*vx1/(n1^3*n2*sin_theta)
-               + vx1/(n1*n2*sin_theta)
-               - dot*vx2/(n1*n2^3*sin_theta))")
-         (y2 "(vy2/(n1*n2*sin_theta)
-               - dot*vy1/(n1^3*n2*sin_theta)
-               + vy1/(n1*n2*sin_theta)
-               - dot*vy2/(n1*n2^3*sin_theta))")
-         (z2 "(vz2/(n1*n2*sin_theta)
-               - dot*vz1/(n1^3*n2*sin_theta)
-               + vz1/(n1*n2*sin_theta)
-               - dot*vz2/(n1*n2^3*sin_theta))"))))
-
-      ;; no :intermediate->coord2 needed for :outer-product-only
-
-      ;; E(theta) = kt * (theta - t0)^2
-      ;; dE/dtheta  = 2*kt*(theta - t0)
-      ;; d²E/dtheta² = 2*kt
-      :energy->intermediate
-      (:gradient ((theta "2*kt*(theta - t0)"))
-       :hessian  (((theta theta) "2*kt")))
-
-      :hessian-modes ((theta :outer-product-only))
-      :geometry-check :warn)))
+    )
 
 
   (build-multiple-kernels (kernels "dihedral" (:energy :gradient :hessian))
     (:pipeline *pipeline*)
-    (:params ((double V)   ;; amplitude
-              (double n)   ;; multiplicity
+    (:params ((double V)     ;; amplitude
+              (double n)     ;; multiplicity
               (double phase) ;; phase offset δ
               (size_t i3x1)
               (size_t i3x2)
@@ -333,8 +243,8 @@
 
   (build-multiple-kernels (kernels "nonbond" (:energy :gradient :hessian))
     (:pipeline *pipeline*)
-    (:params ((double A) ;; LJ A coefficient  (A / r^12)
-              (double B) ;; LJ B coefficient  (B / r^6)
+    (:params ((double A)  ;; LJ A coefficient  (A / r^12)
+              (double B)  ;; LJ B coefficient  (B / r^6)
               (double qq) ;; Coulomb prefactor (qq / r)
               (size_t i3x1)
               (size_t i3x2)
@@ -429,10 +339,10 @@
   (build-multiple-kernels (kernels "nonbond_dd_cutoff" (:energy :gradient :hessian))
     (:pipeline *pipeline*)
 
-    (:params ((double A)      ;; LJ A coefficient  (A / r^12)
-              (double B)      ;; LJ B coefficient  (B / r^6)
-              (double qq)     ;; Coulomb prefactor
-              (double dd)     ;; epsilon(r) = dd*r
+    (:params ((double A)        ;; LJ A coefficient  (A / r^12)
+              (double B)        ;; LJ B coefficient  (B / r^6)
+              (double qq)       ;; Coulomb prefactor
+              (double dd)       ;; epsilon(r) = dd*r
               (double r_switch) ;; switching start
               (double r_cut)    ;; cutoff
               (size_t i3x1)

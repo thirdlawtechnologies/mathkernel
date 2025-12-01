@@ -597,19 +597,19 @@ emit a RAW-C-STMT that accumulates it into *energy_accumulate."
 
 (defun make-force-macro-call-from-grad-target (target-sym layout)
   "If TARGET-SYM is a gradient scalar like G_X1, return a RAW-C-STATEMENT
-calling ForceAcc(i_base, offset, g_x1); otherwise return NIL."
+calling KernelGradientAcc(i_base, offset, g_x1); otherwise return NIL."
   (let ((coord (grad-target-name->coord target-sym)))
     (when coord
       (multiple-value-bind (ibase off) (coord-name->ibase+offset coord layout)
         (let* ((ibase-str (string-downcase (symbol-name ibase)))
                (v-name    (string-downcase (symbol-name target-sym)))
-               (code (format nil "ForceAcc(~A, ~D, ~A);"
+               (code (format nil "KernelGradientAcc(~A, ~D, ~A);"
                              ibase-str off v-name)))
           (stmt-ir:make-raw-c-statement code))))))
 
 (defun make-hess-macro-call-from-target (target-sym layout)
   "If TARGET-SYM is a Hessian scalar like H_X1_X2, return a RAW-C-STATEMENT
-  calling DiagHessAcc/OffDiagHessAcc with that variable as v.
+  calling KernelDiagHessAcc/KernelOffDiagHessAcc with that variable as v.
   Otherwise return NIL."
   (multiple-value-bind (c1 c2)
       (hess-target-name->coords target-sym)
@@ -617,8 +617,8 @@ calling ForceAcc(i_base, offset, g_x1); otherwise return NIL."
       (multiple-value-bind (ibase1 off1) (coord-name->ibase+offset c1 layout)
         (multiple-value-bind (ibase2 off2) (coord-name->ibase+offset c2 layout)
           (let* ((macro (if (string= c1 c2)
-                            "DiagHessAcc"
-                            "OffDiagHessAcc"))
+                            "KernelDiagHessAcc"
+                            "KernelOffDiagHessAcc"))
                  (ibase1-str (string-downcase (symbol-name ibase1)))
                  (ibase2-str (string-downcase (symbol-name ibase2)))
                  ;; use the scalar name as the C variable
@@ -635,8 +635,8 @@ calling ForceAcc(i_base, offset, g_x1); otherwise return NIL."
   "Walk BLOCK and:
   - keep all assignments,
   - for energy assignment E = ..., append \"*Energy += E;\",
-  - for gradient scalar G_* assignments, append ForceAcc(...) macro calls,
-  - for Hessian scalar H_*_* assignments, append DiagHessAcc/OffDiagHessAcc calls."
+  - for gradient scalar G_* assignments, append KernelGradientAcc(...) macro calls,
+  - for Hessian scalar H_*_* assignments, append KernelDiagHessAcc/KernelOffDiagHessAcc calls."
   (unless (typep block 'stmt-ir:block-statement)
     (error "transform-eg-h-block: expected BLOCK-STATEMENT, got ~S" block))
   (let ((new-stmts '()))
@@ -664,9 +664,9 @@ calling ForceAcc(i_base, offset, g_x1); otherwise return NIL."
          (let* ((target (stmt-ir:stmt-target-name st))
                 ;; Energy write
                 (energy-stmt (make-energy-write-call-from-assignment target))
-                ;; Gradient → ForceAcc
+                ;; Gradient → KernelGradientAcc
                 (force-stmt  (make-force-macro-call-from-grad-target target layout))
-                ;; Hessian → Diag/OffDiagHessAcc
+                ;; Hessian → Diag/KernelOffDiagHessAcc
                 (hess-stmt   (make-hess-macro-call-from-target target layout)))
            (when energy-stmt
              (push energy-stmt new-stmts))
@@ -1175,7 +1175,7 @@ inside BLOCK into explicit derivative assignments."
                (stmt-ir:make-block-stmt
                 (append coord-load (list core-block)))
                core-block))
-         ;; turn energy/grad/hess assignments into ForceAcc/DiagHessAcc/... macros
+         ;; turn energy/grad/hess assignments into KernelGradientAcc/KernelDiagHessAcc/... macros
          (transformed
            (transform-eg-h-block
             block-with-coords

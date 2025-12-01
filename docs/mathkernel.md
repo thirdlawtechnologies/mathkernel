@@ -40,7 +40,7 @@ The pipeline from a `defkernel` form to compiled C looks like:
    The final block is wrapped in a C function with:
    - scalar locals inferred from the statements
    - pointer parameters for positions, forces, Hessians, etc.
-   - calls to macros like `ForceAcc`, `DiagHessAcc`, `OffDiagHessAcc`
+   - calls to macros like `KernelForceAcc`, `DiagHessAcc`, `KernelOffDiagHessAccc`
 
 
 ---
@@ -141,7 +141,7 @@ The `:layout` clause is split into two maps:
 
 - **atom→ibase**  
   `(1 . I3X1)` means “atom 1’s 3‑vector index is `i3x1` in the C parameter list”.
-  That is used when emitting `position[I3X1 + axis]`, `ForceAcc(i3x1, axis, ...)`,
+  That is used when emitting `position[I3X1 + axis]`, `KernelForceAcc(i3x1, axis, ...)`,
   etc.
 
 - **axis→offset**  
@@ -149,7 +149,7 @@ The `:layout` clause is split into two maps:
 
 These maps are carried in a `kernel-layout` object and used by
 `transform-eg-h-block` to translate scalar gradient/Hessian names into
-`ForceAcc` / `DiagHessAcc` / `OffDiagHessAcc` calls with the right indices.
+`KernelForceAcc` / `DiagHessAcc` / `KernelOffDiagHessAccc` calls with the right indices.
 
 
 ### 3.2 Coord-vars and coord-load
@@ -679,8 +679,8 @@ it is a placeholder in the statement tree.
 
 - Traversing the block with a current “accumulation context”.
 - When it encounters `accumulate-here`:
-  - it emits the energy accumulation and the `ForceAcc` /
-    `DiagHessAcc` / `OffDiagHessAcc` macros for whatever gradient/Hessian
+  - it emits the energy accumulation and the `KernelForceAcc` /
+    `DiagHessAcc` / `KernelOffDiagHessAccc` macros for whatever gradient/Hessian
     scalar variables exist at that point.
   - it does **not** add any accumulation outside of guarded regions.
 
@@ -747,9 +747,9 @@ For the C backend we then:
    - if‑statements → `if (...) { ... } else { ... }`
    - EG/H macros:
      - `ENERGY := ...` + accumulation → `*energy_accumulate += energy;`
-     - `G_X1 := ...` → `ForceAcc(i3x1, 0, g_x1);`
+     - `G_X1 := ...` → `KernelForceAcc(i3x1, 0, g_x1);`
      - `H_X1_X1 := ...` → `DiagHessAcc(i3x1, 0, i3x1, 0, h_x1_x1);`
-     - `H_X1_Y1 := ...` → `OffDiagHessAcc(...)`, etc.
+     - `H_X1_Y1 := ...` → `KernelOffDiagHessAccc(...)`, etc.
 
 
 ### 9.2 Pow/exponent optimizations and named temporaries
