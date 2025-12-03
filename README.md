@@ -44,6 +44,7 @@ differentiation, rule rewriting and optimization passes.
 After five days - 10,846 lines of code (simple wc count)
 
 Thoughts:
+0. Most of this was vibe-coded using gpt-5.1 at the reasoning level "high".  When I set the reasoning lower then things go off the rails and I start getting bad code.
 1. I didn't trust ChatGPT to calculate symbolic derivatives properly or to generate
    code to calculate symbolic derivatives.  So I spent two days vibe-coding the facility
    to compare them to each other.  You will notice some of the kernels have hardcoded partial
