@@ -10,32 +10,121 @@
 ;;; Manual derivative specification
 ;;; ------------------------------------------------------------
 
-
 (defclass manual-deriv-spec ()
   ((mode
     :initarg :mode
-    :accessor manual-deriv-spec-mode)
+    :accessor manual-deriv-spec-mode
+    :documentation
+    "Overall mode for how this spec is used when building gradients and
+Hessians.
+
+Allowed values:
+  :manual  – Use only the derivatives explicitly provided in this spec.
+             Missing pieces are treated as zero (i.e. the corresponding
+             channel simply does not contribute).
+  :hybrid  – Use manual dE/du and d²E/(du dv) from this spec, but fill in
+             missing du/dq entries automatically using AD on the kernel
+             base block. Second‑derivative geometry (d²u/dq²) is never
+             auto‑generated; if absent, the corresponding term is omitted.
+
+If NIL or omitted when normalizing the :DERIVATIVES clause, the default
+is :manual." )
    (intermediates
     :initarg :intermediates
-    :accessor manual-deriv-spec-intermediates)
+    :accessor manual-deriv-spec-intermediates
+    :documentation
+    "List of intermediate scalar variables u that participate in the
+manual chain rule.
+
+Each element is an EXPR-VAR symbol (e.g. EXPR-VAR:R, EXPR-VAR:THETA)
+corresponding to the intermediates referenced elsewhere in this spec.")
    (du-dq
     :initarg :du-dq
-    :accessor manual-deriv-spec-du-dq)
+    :accessor manual-deriv-spec-du-dq
+    :documentation
+    "Hash table mapping (u q) → ∂u/∂q expressions.
+
+Key:
+  (list u q) where u and q are EXPR-VAR symbols.
+Value:
+  EXPR-IR node representing ∂u/∂q.
+
+These entries typically come from the :INTERMEDIATE->COORD section of the
+:DERIVATIVES clause, but may also be auto‑filled from AD in :hybrid mode
+by AUTO-FILL-INTERMEDIATE-GEOMETRY-FROM-AD.")
    (d2u-dq2
     :initarg :d2u-dq2
-    :accessor manual-deriv-spec-d2u-dq2)
+    :accessor manual-deriv-spec-d2u-dq2
+    :documentation
+    "Hash table mapping (u qi qj) → ∂²u/(∂qi ∂qj) expressions.
+
+Key:
+  (list u qi qj) with u, qi, qj EXPR-VAR symbols; only the upper
+  triangle (i ≤ j) is stored, but lookups are symmetric.
+Value:
+  EXPR-IR node representing the mixed second derivative.
+
+Entries originate from :INTERMEDIATE->COORD2 in the :DERIVATIVES clause.
+They are never auto‑generated; if missing, the dE/du * d²u term in the
+Hessian is simply omitted for that channel.")
    (dE-du
     :initarg :dE-du
-    :accessor manual-deriv-spec-dE-du)
+    :accessor manual-deriv-spec-dE-du
+    :documentation
+    "Hash table mapping u → ∂E/∂u expressions.
+
+Key:
+  u, an EXPR-VAR symbol naming an intermediate.
+Value:
+  EXPR-IR node for ∂E/∂u.
+
+These come from the :GRADIENT subsection of :ENERGY->INTERMEDIATE in the
+:DERIVATIVES clause and are used for both gradient and Hessian chain
+rules.")
    (d2E-dudu
     :initarg :d2E-dudu
-    :accessor manual-deriv-spec-d2E-dudu)
+    :accessor manual-deriv-spec-d2E-dudu
+    :documentation
+    "Hash table mapping (u v) → ∂²E/(∂u ∂v) expressions.
+
+Key:
+  (list u v) with u, v EXPR-VAR symbols; the table is treated
+  symmetrically, so (v u) may also be used for lookup.
+Value:
+  EXPR-IR node for the mixed second derivative.
+
+These come from the :HESSIAN subsection of :ENERGY->INTERMEDIATE.")
    (hessian-modes
     :initarg :hessian-modes
-    :accessor manual-deriv-spec-hessian-modes)
+    :accessor manual-deriv-spec-hessian-modes
+    :documentation
+    "Per‑intermediate flags controlling how each channel contributes to
+Hessian entries.
+
+This is a hash table mapping u (an EXPR-VAR symbol) to one of:
+  :full               – include both outer‑product and curvature terms
+                        for this channel in the Hessian.
+  :outer-product-only – include only terms involving d²E/(du²) * du/dqi
+                        * du/dqj, i.e. no geometry curvature d²u terms.
+  :none               – ignore this intermediate when assembling the
+                        Hessian.
+
+If an intermediate has no entry in this table, :full is assumed." )
    (geometry-check-mode
     :initarg :geometry-check-mode
-    :accessor manual-deriv-spec-geometry-check-mode)))
+    :accessor manual-deriv-spec-geometry-check-mode
+    :documentation
+    "Controls how manual intermediate geometry (:INTERMEDIATE->COORD and
+:INTERMEDIATE->COORD2) is validated against AD‑generated derivatives.
+
+Allowed values:
+  :none  – Do not perform any consistency checks.
+  :warn  – Compare manual du/dq and d²u/dq² against AD; print warnings if
+           mismatches are detected but continue compilation.
+  :error – As for :warn, but signal an error on mismatch.
+
+CHECK-INTERMEDIATE-GEOMETRY! consults this slot when a MANUAL-DERIV-SPEC
+is present in a kernel.")))
 
 (defun make-manual-deriv-spec (&rest initargs)
   (apply #'make-instance 'manual-deriv-spec initargs))
@@ -1172,24 +1261,34 @@ inside BLOCK into explicit derivative assignments."
          ;; inject coord loads
          (block-with-coords
            (if coord-load
-               (stmt-ir:make-block-stmt
-                (append coord-load (list core-block)))
+               (progn
+                 (format t "[KERNEL ~a] 6'. codegen: wrap CORE-BLOCK with coordinate loads -> BLOCK-WITH-COORDS~%"
+                         (kernel-name kernel))
+                 (format t "------- About to dump block~%")
+                 (stmt-ir:debug-block core-block :stream *standard-output*)
+                 (format t "------- Done dump block~%")
+                 (stmt-ir:make-block-stmt
+                  (append coord-load (list core-block))))
                core-block))
          ;; turn energy/grad/hess assignments into KernelGradientAcc/KernelDiagHessAcc/... macros
          (transformed
-           (transform-eg-h-block
-            block-with-coords
-            layout
-            coord-vars
-            #'general-grad-name
-            #'general-hess-name))
+           (progn
+             (format t "[KERNEL ~a] 7'. codegen: transform BLOCK-WITH-COORDS -> TRANSFORMED via transform-eg-h-block~%"
+                     (kernel-name kernel))
+             (transform-eg-h-block
+              block-with-coords
+              layout
+              coord-vars
+              #'general-grad-name
+              #'general-hess-name)))
          (locals (infer-kernel-locals transformed params coord-vars)))
     (stmt-ir:make-c-function
      (kernel-name kernel)
      transformed
-     :return-type "void"
+     :return-type (kernel-return-type kernel)
      :parameters  params
-     :locals      locals)))
+     :locals      locals
+     :return-expr (kernel-return-expr kernel))))
 
 (defun write-c-code (kernel pathname)
   (ensure-directories-exist pathname)
@@ -1227,6 +1326,15 @@ inside BLOCK into explicit derivative assignments."
    (extra-optimization-rules
     :accessor kernel-extra-optimization-rules
     :initarg :extra-optimization-rules
+    :initform nil)
+   ;; C return type and optional auto-return expression
+   (return-type
+    :accessor kernel-return-type
+    :initarg :return-type
+    :initform "void")
+   (return-expr
+    :accessor kernel-return-expr
+    :initarg :return-expr
     :initform nil)))
 
 
@@ -1246,14 +1354,24 @@ inside BLOCK into explicit derivative assignments."
     (&key name pipeline layout coord-vars coord-load-stmts base-block params
           compute-energy compute-grad compute-hess derivatives
           extra-equivalence-rules extra-optimization-rules
-       post-eg-h-pipeline)
+          post-eg-h-pipeline
+          ;; C return type and optional auto-return expression.
+          ;; If RETURN-TYPE is non-"void" and RETURN-EXPR is non-NIL,
+          ;; the C emitter will append "return RETURN-EXPR;" at the end
+          ;; of the generated function.
+          (return-type "void")
+          (return-expr nil))
   (declare (optimize (debug 3)))
   (labels ((the-name (nm)
              (format nil "~a ~a" name nm)))
+    ;; 1. User body -> BASE-BLOCK
+    (format t "[KERNEL ~a] 1. user body provided -> BASE-BLOCK~%" name)
     (let* ((energy-var        'energy)
            (manual-deriv-spec (normalize-derivatives-spec derivatives))
-           ;; 1. Lower D! into assignments
-           (base-block*       (expand-derivative-requests base-block))
+           ;; 2. Lower D! into assignments (derivative expansion)
+           (base-block*       (progn
+                                (format t "[KERNEL ~a] 2. expand-derivative-requests: user base-block -> base-block*~%" name)
+                                (expand-derivative-requests base-block)))
            ;; 2. Counter reused by all optimization pipelines
            (pass-counter      (stmt-ir:make-pass-id-counter))
            ;; 3. Choose a post-EG/H pipeline (kernel can override or disable)
@@ -1272,12 +1390,15 @@ inside BLOCK into explicit derivative assignments."
            :compute-second-derivs t
            :reuse-assignments    t))
 
-        ;; 4. Build up energy + gradient + Hessian statements
+        ;; 3. Build up core E/G/H assignments from BASE-BLOCK*
+        (format t "[KERNEL ~a] 3. start building core E/G/H assignments (current-stmts from base-block*)~%" name)
         (let ((current-stmts
                 (copy-list (stmt-ir:block-statements base-block*))))
 
           ;; 4a. Gradient
           (when compute-grad
+            (format t "[KERNEL ~a] 4a. adding gradient assignments and running pipeline (if any)~%" name)
+            (stmt-ir:debug-block base-block* :label "base-block* at step 4a")
             (let ((grad-stmts
                     (make-gradient-assignments-from-block
                      base-block* energy-var coord-vars #'general-grad-name
@@ -1286,16 +1407,19 @@ inside BLOCK into explicit derivative assignments."
             (when pipeline
               (let ((grad-block (stmt-ir:make-block-stmt current-stmts)))
                 (multiple-value-bind (grad-opt results total-before total-after)
-                    (stmt-ir:run-optimization-pipeline
-                     pass-counter pipeline grad-block
-                     :name (the-name "e-grad")
-                     :log-stream *trace-output*)
+                    (progn
+                      (format t "[KERNEL ~a] 4a.1 run-optimization-pipeline on gradient block~%" name)
+                      (stmt-ir:run-optimization-pipeline
+                       pass-counter pipeline grad-block
+                       :name (the-name "e-grad")
+                       :log-stream *trace-output*))
                   (declare (ignore results total-before total-after))
                   (setf current-stmts
                         (copy-list (stmt-ir:block-statements grad-opt)))))))
 
           ;; 4b. Hessian
           (when compute-hess
+            (format t "[KERNEL ~a] 4b. adding Hessian assignments and running pipeline (if any)~%" name)
             (let ((hess-stmts
                     (make-hessian-assignments-from-block
                      base-block* energy-var coord-vars #'general-hess-name
@@ -1304,34 +1428,45 @@ inside BLOCK into explicit derivative assignments."
             (when pipeline
               (let ((hess-block (stmt-ir:make-block-stmt current-stmts)))
                 (multiple-value-bind (hess-opt results total-before total-after)
-                    (stmt-ir:run-optimization-pipeline
-                     pass-counter pipeline hess-block
-                     :name (the-name "e-g-hess")
-                     :log-stream *trace-output*)
+                    (progn
+                      (format t "[KERNEL ~a] 4b.1 run-optimization-pipeline on E/G/H block~%" name)
+                      (stmt-ir:run-optimization-pipeline
+                       pass-counter pipeline hess-block
+                       :name (the-name "e-g-hess")
+                       :log-stream *trace-output*))
                   (declare (ignore results total-before total-after))
                   (setf current-stmts
                         (copy-list (stmt-ir:block-statements hess-opt)))))))
 
           ;; 5. Coordinate loads + EG/H transform + optional post-EG/H clean-up
           (let* ((core-block
-                   (stmt-ir:make-block-stmt current-stmts))
+                   (progn
+                     (format t "[KERNEL ~a] 5. finalize CORE-BLOCK from optimized current-stmts~%" name)
+                     (stmt-ir:make-block-stmt current-stmts)))
                  (block-with-coords
                    (if coord-load-stmts
-                       (stmt-ir:make-block-stmt
-                        (append coord-load-stmts (list core-block)))
+                       (progn
+                         (format t "[KERNEL ~a] 6. wrap CORE-BLOCK with coordinate loads -> BLOCK-WITH-COORDS~%" name)
+                         (stmt-ir:debug-block core-block :label "core-block at step 6")
+                         (stmt-ir:make-block-stmt
+                          (append coord-load-stmts (list core-block))))
                        core-block))
                  ;; expands ACCUMULATE-HERE into *Energy/Force/Hessian acc macros
                  (eg-h-block
-                   (transform-eg-h-block
-                    block-with-coords layout coord-vars
-                    #'general-grad-name #'general-hess-name))
+                   (progn
+                     (format t "[KERNEL ~a] 7. transform BLOCK-WITH-COORDS -> EG-H-BLOCK via transform-eg-h-block~%" name)
+                     (transform-eg-h-block
+                      block-with-coords layout coord-vars
+                      #'general-grad-name #'general-hess-name)))
                  (eg-h-block*
                    (if post-eg-h-pipeline*
                        (multiple-value-bind (post-block results total-before total-after)
-                           (stmt-ir:run-optimization-pipeline
-                            pass-counter post-eg-h-pipeline* eg-h-block
-                            :name (the-name "post-eg-h")
-                            :log-stream *trace-output*)
+                           (progn
+                             (format t "[KERNEL ~a] 8. run post-EG/H pipeline on EG-H-BLOCK~%" name)
+                             (stmt-ir:run-optimization-pipeline
+                              pass-counter post-eg-h-pipeline* eg-h-block
+                              :name (the-name "post-eg-h")
+                              :log-stream *trace-output*))
                          (declare (ignore results total-before total-after))
                          post-block)
                        eg-h-block)))
@@ -1350,7 +1485,9 @@ inside BLOCK into explicit derivative assignments."
              :manual-deriv-spec manual-deriv-spec
              :pipeline pipeline
              :extra-equivalence-rules extra-equivalence-rules
-             :extra-optimization-rules extra-optimization-rules)))))))
+             :extra-optimization-rules extra-optimization-rules
+             :return-type return-type
+             :return-expr return-expr)))))))
 
 
 ;;; ------------------------------------------------------------
@@ -1381,8 +1518,11 @@ inside BLOCK into explicit derivative assignments."
            (axis->offset    (third layout-cl))
            (coord-names     (mapcar #'symbol-name coord-vars))
            (want-grad      (not (null (member compute-mode '(:gradient :hessian)))))
-           (want-hess      (eq compute-mode :hessian)))
-      `(push 
+           (want-hess      (eq compute-mode :hessian))
+           (return-type    (or (clause-value :return-type) "void"))
+           (return-expr    (clause-value :return-expr))
+           )
+      `(push
          (let* ((layout (make-kernel-layout
                          :atom->ibase ',atom->ibase
                          :axis->offset ',axis->offset))

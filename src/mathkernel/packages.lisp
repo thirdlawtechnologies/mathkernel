@@ -209,6 +209,7 @@
    #:make-accum-anchor-stmt
    #:accumulation-anchor-statement
    #:accumulate-here
+   #:raw-c
    #:alias-assigned-exprs-optimization))
 
 (defpackage :stmt-ir.tests
@@ -235,12 +236,15 @@
    #:define-multiple-kernels
    #:push-kernel
    #:build-multiple-kernels
-   #:with-kernels))
+   #:with-kernels
+   #:build-kernel))
 
 ;;;; Symbols go in this package
 (defpackage :mathkernel-user
-  (:use :cl :expr-ir :opt-exp :mathkernel)
+  (:use :cl :expr-ir :stmt-ir :opt-exp :mathkernel)
   (:export
+   #:D!
+   #:raw-c
    #:with-kernels
    #:coords-from-position
    #:stmt-block

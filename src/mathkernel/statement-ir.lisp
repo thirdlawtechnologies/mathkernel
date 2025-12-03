@@ -20,7 +20,7 @@
     Statements define sequencing and control flow and *contain* expression
     IR nodes from the :expr-ir layer where needed (RHS, conditions, indices)."))
 
-;;; ----------------------------------------------------------------------
+;; ----------------------------------------------------------------------
 ;;; Assignment statements
 ;;; ----------------------------------------------------------------------
 ;;; We keep the LHS as a simple descriptor:
@@ -95,6 +95,20 @@
 (defun make-raw-c-statement (text)
   "Convenience constructor for raw-c-statement."
   (make-instance 'raw-c-statement :text text))
+
+(defmacro raw-c (text)
+  "Insert a RAW-C-STATEMENT into a stmt-block.
+
+TEXT should be a string containing literal C code. It is stored
+verbatim in a RAW-C-STATEMENT node and emitted as-is by the C
+backend. Use this only for code that cannot (or should not) be
+expressed via the structured IR.
+
+Example:
+  (stmt-block
+    (raw-c \"int i; /* hand-written C */\"))
+"
+  `(make-raw-c-statement ,text))
 
 ;;; ----------------------------------------------------------------------
 ;;; Block statements (sequence of statements)
@@ -187,7 +201,16 @@
     :initarg :body
     :accessor c-function-body
     :documentation
-    "Function body as a block-statement."))
+    "Function body as a block-statement.")
+   (return-expr
+    :initarg :return-expr
+    :initform nil
+    :accessor c-function-return-expr
+    :documentation
+    "Optional C expression string to use as an implicit final return.
+If non-NIL and RETURN-TYPE is not \"void\", the emitter appends
+  return RETURN-EXPR;
+just before the closing brace."))
   (:documentation
    "Represents a complete C function ready for emission."))
 
@@ -195,14 +218,16 @@
                         &key
                           (return-type "void")
                           (parameters nil)
-                          (locals nil))
+                          (locals nil)
+                          (return-expr nil))
   "Convenience constructor for c-function."
   (make-instance 'c-function
                  :name name
                  :return-type return-type
                  :parameters parameters
                  :locals locals
-                 :body body))
+                 :body body
+                 :return-expr return-expr))
 
 
 
@@ -445,6 +470,125 @@ Each statement is numbered. For each assignment we show:
 ;;; Reorder assignments after cse
 ;;; ------------------------------------------------------------
 
+;;;; Helper: extract used variable symbols from an expression via sexprs
+
+(defun vars-used-in-expr-via-sexpr (expr)
+  "Return a list of symbols used in EXPR, based on its s-expression
+representation. We treat every symbol we see as a 'variable candidate';
+that is fine for dependency ordering, since we only care about those
+that are also assignment targets in the same run."
+  (let ((vars '()))
+    (labels ((walk (sx)
+               (cond
+                 ((symbolp sx)
+                  (pushnew sx vars :test #'eq))
+                 ((consp sx)
+                  (walk (car sx))
+                  (walk (cdr sx))))))
+      (walk (expr-ir:expr->sexpr expr)))
+    vars))
+
+;;;; Low-level: check a list of assignment statements
+
+(defun check-assignment-run-def-before-use (stmts &key (errorp t))
+  "Check that within the list of ASSIGNMENT-STATEMENTs STMTS, every
+statement only uses variables (that are also assigned in STMTS) after
+those variables' own assignments.
+
+Signals an ERROR if ERRORP is true and a violation is found.
+Returns T if everything is in order; returns NIL if not and ERRORP is NIL."
+  (labels ((collect-defs (sts)
+             (loop for st in sts
+                   if (typep st 'assignment-statement)
+                     collect (stmt-target-name st))))
+    (let* ((defs    (collect-defs stmts))
+           (defined '()))
+      (dolist (st stmts (values t))
+        (when (typep st 'assignment-statement)
+          (let* ((expr (stmt-expression st))
+                 (used (vars-used-in-expr-via-sexpr expr)))
+            ;; check each used var
+            (dolist (v used)
+              (when (and (member v defs :test #'eq)
+                         (not (member v defined :test #'eq)))
+                (if errorp
+                    (error "Assignment order violation: variable ~S used ~
+                          before its definition in statement ~S."
+                           v st)
+                    (return-from check-assignment-run-def-before-use nil))))
+            ;; after the check, this target is now defined
+            (pushnew (stmt-target-name st) defined :test #'eq)))))))
+
+;;;; Block-level: recursively check blocks and if-statements
+
+(defun check-def-before-use-in-block (block &key (errorp t))
+  "Check that within BLOCK (a BLOCK-STATEMENT), all assignment statements
+are ordered so that any variable whose value is assigned in a given
+'run' (between barriers) is never used in an assignment in that run
+before its own assignment.
+
+We treat IF-STATEMENT and BLOCK-STATEMENT as barriers (no cross-barrier
+checking), and recurse into them. RAW-C-STATEMENT and other non-assignment,
+non-barrier statements remain in place and are ignored for ordering.
+
+Signals ERROR on violation if ERRORP is true. Returns T if all is OK,
+or NIL if a violation is found and ERRORP is NIL."
+  (labels
+      ((assignment-p (st)
+         (typep st 'assignment-statement))
+
+       (barrier-p (st)
+         (typecase st
+           (if-statement   t)
+           (block-statement t)
+           (t nil)))
+
+       ;; recurse into nested statements
+       (check-stmt (st)
+         (typecase st
+           (block-statement
+            (check-stmt-list (block-statements st)))
+           (if-statement
+            (progn
+              (when (if-then-block st)
+                (check-stmt-list (block-statements (if-then-block st))))
+              (when (if-else-block st)
+                (check-stmt-list (block-statements (if-else-block st))))))
+           (t
+            (values t))))
+
+       (check-run (run)
+         "RUN is a list of statements in program order with no barriers.
+We extract the assignment statements from RUN and verify def-before-use
+among them only."
+         (let ((assignments (remove-if-not #'assignment-p run)))
+           (when assignments
+             (check-assignment-run-def-before-use assignments :errorp errorp))))
+
+       (check-stmt-list (stmts)
+         (labels ((flush-run (run)
+                    (when run
+                      ;; RUN was accumulated in reverse by PUSH, restore order
+                      (check-run (nreverse run)))))
+           (let ((run '()))
+             (dolist (st stmts (values t))
+               (if (barrier-p st)
+                   (progn
+                     ;; finish current run, then recurse into the barrier node
+                     (flush-run run)
+                     (setf run '())
+                     (check-stmt st))
+                   ;; non-barrier, part of the current run
+                   (push st run)))
+             ;; flush trailing run
+             (flush-run run)))))
+    (check-stmt-list (block-statements block))))
+
+
+
+
+
+
 (defun vars-used-in-expr (expr)
   "Return a list of symbol names used in EXPR (expression IR), based on its sexpr.
 We do not try to distinguish parameters vs locals here; later we intersect
@@ -511,14 +655,20 @@ We do a simple dependency-aware scheduling:
             (setf result (nreverse (nconc pending result)))
             (return (nreverse result))))))))
 
+
 (defun reorder-block-def-before-use (block)
   "Return a new BLOCK-STATEMENT where, within each contiguous run of
-ASSIGNMENT-STATEMENTs, assignments are reordered to ensure that any
-variable used in an assignment and also assigned in that run is defined
-earlier in the run.
+ASSIGNMENT-STATEMENTs (possibly interspersed with other, non-barrier
+statements like RAW-C-STATEMENT), assignments are reordered to ensure
+that any variable used in an assignment and also assigned in that run
+is defined earlier in the run.
 
-We do not move assignments across IF- or BLOCK-STATEMENT boundaries;
-those act as barriers. We recurse into nested blocks and if branches."
+We treat IF-STATEMENT and BLOCK-STATEMENT as barriers (no reordering
+across them). We recurse into nested blocks and if branches.
+
+RAW-C-STATEMENT and other non-assignment, non-barrier statements are
+*not* barriers: they remain in place inside the run, but assignments
+around them may be reordered as needed to satisfy def-before-use."
   (labels
       ;; recurse into a single statement
       ((reorder-stmt (st)
@@ -529,7 +679,7 @@ those act as barriers. We recurse into nested blocks and if branches."
             (make-block-stmt
              (reorder-stmt-list (block-statements st))))
            (if-statement
-            (let* ((cond (if-condition st))
+            (let* ((cond   (if-condition st))
                    (then-b (if-then-block st))
                    (else-b (if-else-block st))
                    (new-then (when then-b
@@ -544,34 +694,73 @@ those act as barriers. We recurse into nested blocks and if branches."
            (t
             st)))
 
-       ;; reorder list of statements, partitioning into assignment runs
+       ;; a barrier is something we must not reorder across
+       (barrier-p (st)
+         (typecase st
+           (if-statement t)
+           (block-statement t)
+           (t nil)))
+
+       ;; reorder a “run” that may contain both assignments and
+       ;; non-barrier statements (e.g. RAW-C-STATEMENT).
+       ;;
+       ;; We only permute the assignment statements; non-barrier
+       ;; non-assignments must stay in their original relative positions.
+       (reorder-run (run)
+         ;; Extract the assignments and their indices within RUN
+         run
+         (let ((assignments '())
+               (indices '()))
+           (loop for st in run
+                 for i from 0
+                 when (typep st 'assignment-statement)
+                   do (progn
+                        (push st assignments)
+                        (push i indices)))
+           (setf assignments (nreverse assignments)
+                 indices     (nreverse indices))
+           (if (null assignments)
+               ;; no assignments: nothing to do
+               run
+               (let* ((reordered-assignments
+                        (reorder-assignment-run-def-before-use assignments))
+                      (result (copy-list run)))
+                 ;; splice the reordered assignments back into the
+                 ;; original positions of the assignments
+                 (loop for st in reordered-assignments
+                       for idx in indices
+                       do (setf (nth idx result) st))
+                 #+(or)(break "Check result and run")
+                 result))))
+
+       ;; reorder list of statements, partitioning into runs between barriers
        (reorder-stmt-list (stmts)
          (labels ((flush-run (run acc)
                     (if run
-                        ;; reorder this run and cons onto acc
-                        (cons (reorder-assignment-run-def-before-use
-                               (nreverse run))
-                              acc)
+                        (nconc acc (reorder-run run))
                         acc)))
+           stmts
            (let ((acc '())
                  (run '()))
              (dolist (st stmts)
-               (if (typep st 'assignment-statement)
-                   ;; still in a run of assignments
-                   (push st run)
-                   ;; barrier: flush current run, emit barrier (recursed)
+               (if (barrier-p st)
                    (progn
+                     ;; flush the current run, then emit the barrier (recurred)
                      (setf acc (flush-run run acc)
                            run '())
-                     (push (list (reorder-stmt st)) acc)))
-               )
-             ;; flush final run
+                     (let ((reordered (reorder-stmt st)))
+                       (push reordered acc)))
+                   ;; st is not a barrier: include it in the current run
+                   (push st run)))
+             ;; flush final run if there is one
              (setf acc (flush-run run acc))
-             ;; acc is a list of lists; flatten in order
-             (apply #'nconc (nreverse acc))))))
-    (let ((sorted-block (make-block-stmt
-                         (reorder-stmt-list (block-statements block)))))
-      sorted-block)))
+             (check-assignment-run-def-before-use acc)
+             acc))))
+    (let ((reordered-stmt-list (reorder-stmt-list (block-statements block))))
+      (let ((*print-pretty* nil))
+        (format t "input block = ~{~s~%~}~%" (block-statements block))
+        (format t "output block = ~{~s~%~}~%" reordered-stmt-list))
+      (make-block-stmt (nreverse reordered-stmt-list)))))
 
 ;;; ------------------------------------------------------------
 ;;; Helpers
@@ -1227,11 +1416,15 @@ If no useful candidate is found, return BLOCK unchanged (EQ)."
 a pass makes no changes.
 
 Each pass uses a distinct temp namespace: CSE_P<pass>_T<n>."
+  (declare (optimize (debug 3)))
+  (format t "DEBUG_DEBUG Entered cse-block-multi-optimization-------------~%")
   (unless (typep block 'block-statement)
     (error "cse-block-multi: expected BLOCK-STATEMENT, got ~S" block))
   (let ((current-block block))
+    (stmt-ir:debug-block current-block :label "current block in CSE-MULTI")
     (loop for ii from 1 upto max-passes do
       (let* ((pass-id (next-pass-id counter))
+             (pass pass-id)
              (before-symbol-list
                (collect-scalar-targets-in-block current-block))
              ;; 1. Standard subtree CSE
@@ -1275,6 +1468,7 @@ Each pass uses a distinct temp namespace: CSE_P<pass>_T<n>."
         (setf current-block next-block)))
     ;; Reorder assignments so expressions aren't used before their variables are defined
     (let ((block-fixed (reorder-block-def-before-use current-block)))
+      (stmt-ir:debug-block block-fixed :label "fixed block in CSE-MULTI")
       block-fixed)))
 
 
@@ -1969,6 +2163,7 @@ Returns (values new-factors matched-p)."
 (defun normalize-signs-optimization (pass-counter block)
   "Return a new BLOCK-STATEMENT where each assignment RHS expression
 has had EXPR-IR:NORMALIZE-SIGNS-EXPR applied."
+  (declare (ignore pass-counter))
   (labels ((rewrite-expr (expr)
              (expr-ir:normalize-signs-expr expr))
            (rewrite-stmt (cycle)
@@ -2225,6 +2420,7 @@ Only linear subexpressions are changed; non-linear ones are left as-is."
 
 If MIN-IMPROVEMENT on OPT is > 0, we only accept the new block if
 (before - after) >= MIN-IMPROVEMENT. Otherwise we keep BLOCK."
+  (format t "DEBUG_DEBUG About to run-optimization ~s~%" (optimization-name opt))
   (unless (typep opt 'optimization)
     (error "RUN-OPTIMIZATION: expected OPTIMIZATION, got ~S" opt))
   (unless (typep block 'block-statement)
@@ -2233,7 +2429,9 @@ If MIN-IMPROVEMENT on OPT is > 0, we only accept the new block if
          (pos-args  (optimization-positional-args opt))
          (kw-args   (optimization-keyword-args opt))
          (before    (funcall measure block))
-         (new-block (apply fn pass-counter block (append pos-args kw-args)))
+         (new-block (progn
+                      (format t "DEBUG_DEBUG run-optimization fn = ~s~%" fn)
+                      (apply fn pass-counter block (append pos-args kw-args))))
          (after     (funcall measure new-block))
          (impr      (- before after))
          (threshold (optimization-min-improvement opt))
@@ -2247,6 +2445,7 @@ If MIN-IMPROVEMENT on OPT is > 0, we only accept the new block if
                       "useless"
                       "ACCEPT")
                   "REJECT")))
+    (format t "DEBUG_DEBUG About to leave run-optimization ~s~%" (optimization-name opt))
     (values (if accepted new-block block)
             before
             (if accepted after before)
@@ -2278,6 +2477,7 @@ RESULTS-LIST is a list of plists:
                      (run-optimization pass-counter opt current
                                        :name cur-name
                                        :measure measure :log-stream log-stream)
+                   (debug-block new-block :label (format nil "new-block after ~s" (optimization-name opt)))
                    (push (list :opt-name (format nil "~a ~a" cur-name (optimization-name opt))
                                :before   before
                                :after    after
