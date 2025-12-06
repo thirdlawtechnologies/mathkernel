@@ -133,18 +133,13 @@ expressions."
        (eql value -1)))
 
 (defun expression-sort-key (expression)
-  "Return a key used to canonically sort arguments in n-ary expressions.
-Order:
-  1. constants
-  2. variables
-  3. everything else
-
-Within each class, order by a printable name where possible."
+  "Return a simple key used to sort arguments in n-ary expressions.
+Order: constants < variables < everything else; ties break by a printable name."
   (labels ((class-rank (expr)
              (cond
                ((typep expr 'constant-expression) 0)
                ((typep expr 'variable-expression) 1)
-               (t 2)))
+               (t                                 2)))
            (expr-name (expr)
              (typecase expr
                (constant-expression

@@ -121,10 +121,7 @@ Simplifications:
        (first flat-args))
       (t
        ;; Sort canonically
-       (let ((sorted (sort flat-args #'string<
-                           :key (lambda (expr)
-                                  (format nil "~S"
-                                          (expression-sort-key expr))))))
+       (let ((sorted (stable-sort flat-args #'expression<)))
          (make-instance 'add-expression
                         :arguments sorted))))))
 (defun make-expr-mul (arguments)
@@ -195,10 +192,7 @@ Simplifications:
                       (setf (nth minus-one-idx copy) nil)
                       (remove nil copy))
                     flat-args)))
-         (let ((sorted (sort args-without-minus #'string<
-                             :key (lambda (expr)
-                                    (format nil "~S"
-                                            (expression-sort-key expr))))))
+         (let ((sorted (stable-sort args-without-minus #'expression<)))
            (if minus-one-idx
                ;; Represent as -(product of remaining args)
                (make-expr-neg

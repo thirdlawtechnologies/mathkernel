@@ -1442,7 +1442,10 @@ inside BLOCK into explicit derivative assignments."
           (let* ((core-block
                    (progn
                      (format t "[KERNEL ~a] 5. finalize CORE-BLOCK from optimized current-stmts~%" name)
-                     (stmt-ir:make-block-stmt current-stmts)))
+                     (let ((blk (stmt-ir:make-block-stmt current-stmts)))
+                       ;; Catch any use-before-def issues even when no pipeline runs.
+                       (stmt-ir:check-def-before-use-in-block blk :errorp t)
+                       blk)))
                  (block-with-coords
                    (if coord-load-stmts
                        (progn

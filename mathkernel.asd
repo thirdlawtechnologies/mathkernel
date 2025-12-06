@@ -17,7 +17,6 @@
                                            (:file "statement-ir")
                                            (:file "expression-diff")
                                            (:file "statement-diff")
-                                           (:file "statement-tests")
+                                           (:file "energy-blocks")
                                            (:file "kernel-dsl")
-                                           ))))))
-
+                                           (:file "statement-tests")))))))

@@ -210,11 +210,14 @@
    #:accumulation-anchor-statement
    #:accumulate-here
    #:raw-c
-   #:alias-assigned-exprs-optimization))
+   #:alias-assigned-exprs-optimization
+   #:make-block-stmt-unsafe
+   #:check-def-before-use-in-block))
 
 (defpackage :stmt-ir.tests
   (:use :cl :expr-ir :stmt-ir)
-  (:export #:run-statement-tests))
+  (:export #:run-statement-tests
+           #:run-all))
 
 (defpackage :expr-var
   (:use :cl))
@@ -250,4 +253,3 @@
    #:stmt-block
    #:=.
    ))
-

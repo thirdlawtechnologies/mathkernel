@@ -126,7 +126,6 @@ Example:
    "A sequence of statements. Emitted as a C compound statement {...}."))
 
 (defun make-block-stmt (&optional (statements nil))
-  "Convenience constructor for block-statement."
   (make-instance 'block-statement :statements statements))
 
 ;;; ----------------------------------------------------------------------
@@ -490,20 +489,25 @@ that are also assignment targets in the same run."
 
 ;;;; Low-level: check a list of assignment statements
 
-(defun check-assignment-run-def-before-use (stmts &key (errorp t))
+(defun check-assignment-run-def-before-use (stmts &key (errorp t) (already-defined nil))
   "Check that within the list of ASSIGNMENT-STATEMENTs STMTS, every
 statement only uses variables (that are also assigned in STMTS) after
 those variables' own assignments.
 
+ALREADY-DEFINED is a list of symbols that are considered defined before
+this run begins.
+
 Signals an ERROR if ERRORP is true and a violation is found.
-Returns T if everything is in order; returns NIL if not and ERRORP is NIL."
+Returns two values: T (or NIL if ERRORP is NIL and a violation is found)
+and the list of symbols defined after processing the run (including
+ALREADY-DEFINED and all targets in STMTS)."
   (labels ((collect-defs (sts)
              (loop for st in sts
                    if (typep st 'assignment-statement)
                      collect (stmt-target-name st))))
     (let* ((defs    (collect-defs stmts))
-           (defined '()))
-      (dolist (st stmts (values t))
+           (defined (copy-list already-defined)))
+      (dolist (st stmts (values t defined))
         (when (typep st 'assignment-statement)
           (let* ((expr (stmt-expression st))
                  (used (vars-used-in-expr-via-sexpr expr)))
@@ -512,10 +516,10 @@ Returns T if everything is in order; returns NIL if not and ERRORP is NIL."
               (when (and (member v defs :test #'eq)
                          (not (member v defined :test #'eq)))
                 (if errorp
-                    (error "Assignment order violation: variable ~S used ~
-                          before its definition in statement ~S."
+                    (error "Assignment order violation: variable ~S~% used before its definition in statement ~S."
                            v st)
-                    (return-from check-assignment-run-def-before-use nil))))
+                    (return-from check-assignment-run-def-before-use
+                      (values nil defined)))))
             ;; after the check, this target is now defined
             (pushnew (stmt-target-name st) defined :test #'eq)))))))
 
@@ -533,6 +537,7 @@ non-barrier statements remain in place and are ignored for ordering.
 
 Signals ERROR on violation if ERRORP is true. Returns T if all is OK,
 or NIL if a violation is found and ERRORP is NIL."
+  (declare (optimize (debug 3)))
   (labels
       ((assignment-p (st)
          (typep st 'assignment-statement))
@@ -544,45 +549,56 @@ or NIL if a violation is found and ERRORP is NIL."
            (t nil)))
 
        ;; recurse into nested statements
-       (check-stmt (st)
+       (check-stmt (st defined)
          (typecase st
            (block-statement
-            (check-stmt-list (block-statements st)))
+            (check-stmt-list (block-statements st) defined))
            (if-statement
             (progn
               (when (if-then-block st)
-                (check-stmt-list (block-statements (if-then-block st))))
+                (check-stmt-list (block-statements (if-then-block st)) defined))
               (when (if-else-block st)
-                (check-stmt-list (block-statements (if-else-block st))))))
+                (check-stmt-list (block-statements (if-else-block st)) defined))))
+           ;; non-barriers do not change what is considered defined
            (t
-            (values t))))
+            defined)))
 
-       (check-run (run)
+       (check-run (run defined)
          "RUN is a list of statements in program order with no barriers.
 We extract the assignment statements from RUN and verify def-before-use
 among them only."
          (let ((assignments (remove-if-not #'assignment-p run)))
-           (when assignments
-             (check-assignment-run-def-before-use assignments :errorp errorp))))
+           (if assignments
+               (multiple-value-bind (_ok new-defined)
+                   (check-assignment-run-def-before-use assignments
+                                                        :errorp errorp
+                                                        :already-defined defined)
+                 (declare (ignore _ok))
+                 new-defined)
+               defined)))
 
-       (check-stmt-list (stmts)
-         (labels ((flush-run (run)
-                    (when run
-                      ;; RUN was accumulated in reverse by PUSH, restore order
-                      (check-run (nreverse run)))))
-           (let ((run '()))
-             (dolist (st stmts (values t))
+       (check-stmt-list (stmts defined)
+         (labels ((flush-run (run defined)
+                    (if run
+                        (check-run (nreverse run) defined)
+                        defined)))
+           (let ((run '())
+                 (cur-defined defined))
+             (dolist (st stmts cur-defined)
                (if (barrier-p st)
                    (progn
                      ;; finish current run, then recurse into the barrier node
-                     (flush-run run)
+                     (setf cur-defined (flush-run run cur-defined))
                      (setf run '())
-                     (check-stmt st))
+                     (setf cur-defined (check-stmt st cur-defined)))
                    ;; non-barrier, part of the current run
                    (push st run)))
              ;; flush trailing run
-             (flush-run run)))))
-    (check-stmt-list (block-statements block))))
+             (setf cur-defined (flush-run run cur-defined))
+             cur-defined))))
+    ;; Only intended for top-level blocks; initial defined set is empty.
+    (check-stmt-list (block-statements block) nil)
+    t))
 
 
 
@@ -927,6 +943,7 @@ Return a hash-table mapping NAME -> CTYPE."
 Temps created in this pass are named CSE_P<pass-id>_T<n>. We ensure
 each temp is defined AFTER all CSE temps it uses and BEFORE its first use
 in this block."
+  (declare (optimize (debug 3)))
   (unless (typep block 'block-statement)
     (error "cse-block: expected BLOCK-STATEMENT, got ~S" block))
 
@@ -985,6 +1002,12 @@ in this block."
           (when (null candidates)
             ;; no CSE change
             (return-from cse-block block))
+          ;; Establish deterministic ordering of candidates so temp naming
+          ;; is stable across runs.
+          (setf candidates
+                (sort candidates #'string<
+                      :key (lambda (sexpr)
+                             (format nil "~S" sexpr))))
 
           ;; ------------------------------------------------------------
           ;; Phase 4: build temps, compute insertion indices
@@ -995,29 +1018,31 @@ in this block."
             (labels
                 ((temp-name ()
                    (incf temp-counter)
-                   (expr-ir:ev (format nil "CSE_P~D_T~D" pass-id temp-counter)))
-                 (temps-used-in-sexpr (sexpr)
-                   (remove-if-not #'cse-temp-symbol-p
-                                  (expr-ir:expr-free-vars
-                                   (expr-ir:sexpr->expr-ir sexpr)))))
+                   (expr-ir:ev (format nil "CSE_P~D_T~D" pass-id temp-counter))))
 
               ;; For each candidate sexpr, decide temp symbol & insertion index.
               (dolist (sexpr candidates)
                 (let* ((temp (temp-name))
-                       (uses    (temps-used-in-sexpr sexpr))
+                       (uses    (expr-ir:expr-free-vars
+                                 (expr-ir:sexpr->expr-ir sexpr)))
                        (first   (gethash sexpr first-use)) ; earliest use index of this sexpr
                        (dep-max (if uses
-                                    (loop for u in uses
+                                    (loop with max-di = nil
+                                          for u in uses
                                           for di = (gethash u def-index nil)
-                                          when di maximize di)
+                                          when di do (setf max-di
+                                                           (if max-di
+                                                               (max max-di di)
+                                                               di))
+                                          finally (return (or max-di -1)))
                                     -1))
-                       ;; start by putting it after all CSE temps it depends on
-                       (insert-idx (max (1+ dep-max) 0)))
-                  ;; defensively clamp to be no later than first use, if we know it
-                  (when (and first (> insert-idx first))
-                    (setf insert-idx first))
-                  (setf (gethash sexpr sexpr->temp) temp)
-                  (setf (gethash temp  temp-insert) insert-idx)))
+                       (min-insert (max (1+ dep-max) 0))
+                       (max-allowed (or first n)))
+                  ;; Skip impossible placement (deps defined after first use).
+                  (when (<= min-insert max-allowed)
+                    (let ((insert-idx (min min-insert max-allowed)))
+                      (setf (gethash sexpr sexpr->temp) temp)
+                      (setf (gethash temp  temp-insert) insert-idx)))))
 
               ;; --------------------------------------------------------
               ;; Phase 5: rewrite original statements to use temps
@@ -1248,10 +1273,10 @@ If no useful candidate is found, return BLOCK unchanged (EQ)."
                        (incf (gethash f ht 0))))))
 
             ;; Build candidate factor multisets from all pairs of products.
-            (let ((candidate-lists '()))
-              (let ((plist (coerce products 'vector))
-                    (m     (length products)))
-                (loop for i from 0 below (1- m) do
+              (let ((candidate-lists '()))
+                (let ((plist (coerce products 'vector))
+                      (m     (length products)))
+                  (loop for i from 0 below (1- m) do
                   (let* ((ppi (aref plist i))
                          (ci (getf ppi :counts)))
                     (loop for j from (1+ i) below m do
@@ -1264,6 +1289,11 @@ If no useful candidate is found, return BLOCK unchanged (EQ)."
                           (push common candidate-lists)))))))
               (setf candidate-lists
                     (remove-duplicates candidate-lists :test #'equal))
+              ;; Deterministic iteration order to stabilize temp naming.
+              (setf candidate-lists
+                    (sort candidate-lists #'string<
+                          :key (lambda (cand)
+                                 (format nil "~S" cand))))
 
               (when (null candidate-lists)
                 (return-from cse-factor-products-in-block block))
@@ -1292,9 +1322,17 @@ If no useful candidate is found, return BLOCK unchanged (EQ)."
                                         idx))))))
                       (when (>= uses min-uses)
                         (let ((score (* (- uses 1) size)))
-                          (when (> score best-score)
+                          (when (and (> score best-score)
+                                     t)
                             (setf best-score     score
                                   best-cand      cand
+                                  best-uses      uses
+                                  best-first-use first-use))
+                          (when (and (= score best-score)
+                                     (not (null best-cand))
+                                     (string< (format nil "~S" cand)
+                                              (format nil "~S" best-cand)))
+                            (setf best-cand      cand
                                   best-uses      uses
                                   best-first-use first-use)))))))
 
@@ -1313,23 +1351,25 @@ If no useful candidate is found, return BLOCK unchanged (EQ)."
                        (cand-counts (counts-from-factors best-cand))
                        (temp-expr   (expr-ir:sexpr->expr-ir
                                      (cons '* best-cand)))
-                       (temps-used  (remove-if-not #'cse-temp-symbol-p
-                                                   (expr-ir:expr-free-vars temp-expr)))
+                       (vars-used   (expr-ir:expr-free-vars temp-expr))
                        (dep-max
-                         (if temps-used
-                             (loop for u in temps-used
+                         (if vars-used
+                             (loop with max-di = nil
+                                   for u in vars-used
                                    for di = (gethash u def-index nil)
-                                   when di maximize di)
+                                   when di do (setf max-di
+                                                    (if max-di
+                                                        (max max-di di)
+                                                        di))
+                                   finally (return (or max-di -1)))
                              -1))
-                       ;; Start by placing temp after all temps it depends on.
-                       (insert-idx (max (1+ dep-max) 0)))
-                  ;; Clamp insertion to be no later than the first use.
-                  (when (and best-first-use (> insert-idx best-first-use))
-                    (setf insert-idx best-first-use))
-                  (when (> insert-idx n)
-                    (setf insert-idx n))
-                  ;; Build temp assignment.
-                  (let ((temp-assign (make-assignment-stmt temp temp-expr)))
+                       (min-insert (max (1+ dep-max) 0))
+                       (max-allowed (or best-first-use n)))
+                  ;; If dependencies are defined after first use, skip factoring.
+                  (when (> min-insert max-allowed)
+                    (return-from cse-factor-products-in-block block))
+                  (let* ((insert-idx (min min-insert max-allowed))
+                         (temp-assign (make-assignment-stmt temp temp-expr)))
                     ;; Rewrite expressions to use TEMP for BEST-CAND.
                     (labels
                         ((rewrite-sexpr (sexpr)
@@ -1434,13 +1474,12 @@ Each pass uses a distinct temp namespace: CSE_P<pass>_T<n>."
                           :min-size min-size
                           :pass-id  pass-id))
              ;; 2. Generic product factoring
-             (after-prod
-               (cse-factor-products-in-block
-                after-cse
-                :min-uses   min-uses
-                :min-factors 2
-                :min-size   min-size
-                :pass-id    pass-id))
+             (after-prod (cse-factor-products-in-block
+                         after-cse
+                         :min-uses   min-uses
+                         :min-factors 2
+                         :min-size   min-size
+                         :pass-id    pass-id))
              ;; 3. Extra pass: only factor products made entirely of CSE temps,
              ;;    and allow small products like CSE_P*_T* * CSE_P*_T* * CSE_P*_T*.
              (next-block
@@ -1466,10 +1505,8 @@ Each pass uses a distinct temp namespace: CSE_P<pass>_T<n>."
                    (equal before-symbol-list after-symbol-list))
           (return current-block))
         (setf current-block next-block)))
-    ;; Reorder assignments so expressions aren't used before their variables are defined
-    (let ((block-fixed (reorder-block-def-before-use current-block)))
-      (stmt-ir:debug-block block-fixed :label "fixed block in CSE-MULTI")
-      block-fixed)))
+    ;; Leave ordering as produced; def-before-use is now enforced per pass.
+    current-block))
 
 
 (defun cse-block-multi (block &key (max-passes 5) (min-uses 2) (min-size 5))
@@ -1976,14 +2013,20 @@ Returns (values new-factors matched-p)."
 
 
 (defun factor-temp-param-products-optimization (pass-counter block &key (min-uses 2)
-                                                  (min-factors 2)
-                                                  (max-factors 3))
+                                                                     (min-factors 2)
+                                                                     (max-factors 3))
   (unless (typep block 'block-statement)
     (error "factor-temp-param-products-optimization: expected BLOCK-STATEMENT, got ~S"
            block))
   (let* ((stmts      (block-statements block))
          (n          (length stmts))
-         (candidates (make-hash-table :test #'equal)))
+         (candidates (make-hash-table :test #'equal))
+         (def-index  (make-hash-table :test #'eq)))
+    ;; record where each symbol is defined in this block
+    (loop for cycle in stmts
+          for idx from 0 do
+            (when (typep cycle 'assignment-statement)
+              (setf (gethash (stmt-target-name cycle) def-index) idx)))
     ;; 1. Collect candidates
     (labels
         ;; This does the recursive walk and calls COLLECT-PRODUCT on every (* ...) node.
@@ -2063,22 +2106,35 @@ Returns (values new-factors matched-p)."
     (let ((best-combo      nil)
           (best-score      0)
           (best-count      0)
-          (best-first-idx  nil))
-      (maphash
-       (lambda (combo info)
-         (let ((count      (getf info :count))
-               (first-idx  (getf info :first-index)))
-           (when (>= count min-uses)
-             (let* ((len   (length combo))
-                    ;; simple score: (uses-1) * length
-                    (score (* (- count 1) len)))
-               (when (and (>= len min-factors)
-                          (> score best-score))
-                 (setf best-score     score
-                       best-combo     combo
-                       best-count     count
-                       best-first-idx first-idx))))))
-       candidates)
+          (best-first-idx  nil)
+          (candidate-list  '()))
+      ;; Sort candidates deterministically before picking best.
+      (maphash (lambda (combo info)
+                 (push (cons combo info) candidate-list))
+               candidates)
+      (setf candidate-list
+            (sort candidate-list #'string<
+                  :key (lambda (entry)
+                         (format nil "~S" (car entry)))))
+      (dolist (entry candidate-list)
+        (let* ((combo     (car entry))
+               (info      (cdr entry))
+               (count     (getf info :count))
+               (first-idx (getf info :first-index)))
+          (when (>= count min-uses)
+            (let* ((len   (length combo))
+                   ;; simple score: (uses-1) * length
+                   (score (* (- count 1) len)))
+              (when (and (>= len min-factors)
+                         (or (> score best-score)
+                             (and (= score best-score)
+                                  (or (null best-combo)
+                                      (string< (format nil "~S" combo)
+                                               (format nil "~S" best-combo))))))
+                (setf best-score     score
+                      best-combo     combo
+                      best-count     count
+                      best-first-idx first-idx))))))
       (when *factor-temp-param-debug*
         (format *trace-output* "~&[FTPP] best-combo=~S count=~D score=~D~%"
                 best-combo best-count best-score))
@@ -2093,71 +2149,88 @@ Returns (values new-factors matched-p)."
              (temp-name   (intern (format nil "CSE_P~D_T~D"
                                           pass-id (1+ start-index))
                                   (symbol-package 'stmt-ir::make-assignment-stmt)))
-             (temp-sexpr  (if (= (length best-combo) 1)
-                              (car best-combo)
-                              (cons '* best-combo)))
-             (temp-expr   (expr-ir:sexpr->expr-ir temp-sexpr))
-             (temp-assign (make-assignment-stmt temp-name temp-expr))
-             (insert-idx  (or best-first-idx 0)))
-        (when *factor-temp-param-debug*
-          (format *trace-output* "~&[FTPP] introducing temp ~S = ~S at index ~D~%"
-                  temp-name temp-sexpr insert-idx))
-        ;; 4. Rewrite block: factor BEST-COMBO out of any product that contains it.
-        (labels ((rewrite-sexpr (sexpr)
-                   (cond
-                     ((and (consp sexpr)
-                           (eq (car sexpr) '*))
-                      (let ((factors (cdr sexpr)))
-                        (multiple-value-bind (rest-factors matched)
-                            (remove-combo-from-factors best-combo factors)
-                          (if matched
-                              (let ((rest-rewritten
-                                      (mapcar #'rewrite-sexpr rest-factors)))
-                                (cond
-                                  ((null rest-rewritten)
-                                   temp-name)
-                                  (t
-                                   (cons '* (cons temp-name rest-rewritten)))))
-                              ;; no match here; just rewrite children
-                              (cons '* (mapcar #'rewrite-sexpr factors))))))
-                     ((consp sexpr)
-                      (cons (car sexpr)
-                            (mapcar #'rewrite-sexpr (cdr sexpr))))
-                     (t
-                      sexpr)))
-                 (rewrite-expr (expr)
-                   (expr-ir:sexpr->expr-ir
-                    (rewrite-sexpr (expr-ir:expr->sexpr expr))))
-                 (rewrite-stmt (stmt)
-                   (typecase stmt
-                     (assignment-statement
-                      (make-assignment-stmt
-                       (stmt-target-name stmt)
-                       (rewrite-expr (stmt-expression stmt))
-                       (stmt-target-indices stmt)))
-                     (block-statement
-                      (make-block-stmt
-                       (mapcar #'rewrite-stmt (block-statements stmt))))
-                     (if-statement
-                      (let* ((new-cond (rewrite-expr (if-condition stmt)))
-                             (then-b  (if-then-block stmt))
-                             (else-b  (if-else-block stmt))
-                             (new-then (when then-b
-                                         (make-block-stmt
-                                          (mapcar #'rewrite-stmt
-                                                  (block-statements then-b)))))
-                             (new-else (when else-b
-                                         (make-block-stmt
-                                          (mapcar #'rewrite-stmt
-                                                  (block-statements else-b))))))
-                        (make-if-stmt new-cond new-then new-else)))
-                     (t stmt))))
-          (let ((new-stmts '()))
-            (loop for idx from 0 below n do
-              (when (= idx insert-idx)
-                (push temp-assign new-stmts))
-              (push (rewrite-stmt (nth idx stmts)) new-stmts))
-            (make-block-stmt (nreverse new-stmts))))))))
+	     (temp-sexpr  (if (= (length best-combo) 1)
+	                      (car best-combo)
+	                      (cons '* best-combo)))
+	     (temp-expr   (expr-ir:sexpr->expr-ir temp-sexpr))
+	     (vars-used   (expr-ir:expr-free-vars temp-expr))
+	     (dep-max
+	       (if vars-used
+	           (loop with max-di = nil
+	                 for u in vars-used
+	                 for di = (gethash u def-index nil)
+	                 when di do (setf max-di
+                                      (if max-di
+                                          (max max-di di)
+                                          di))
+                         finally (return (or max-di -1)))
+	           -1))
+	     (min-insert (max (1+ dep-max) 0))
+	     (max-allowed (or best-first-idx n)))
+        (when (> min-insert max-allowed)
+          ;; Cannot place temp before its first use; skip factoring.
+          (return-from factor-temp-param-products-optimization block))
+        (let* ((insert-idx  (min min-insert max-allowed))
+               (temp-assign (make-assignment-stmt temp-name temp-expr)))
+          (when *factor-temp-param-debug*
+            (format *trace-output* "~&[FTPP] introducing temp ~S = ~S at index ~D~%"
+                    temp-name temp-sexpr insert-idx))
+          ;; 4. Rewrite block: factor BEST-COMBO out of any product that contains it.
+          (labels ((rewrite-sexpr (sexpr)
+                     (cond
+                       ((and (consp sexpr)
+                             (eq (car sexpr) '*))
+                        (let ((factors (cdr sexpr)))
+                          (multiple-value-bind (rest-factors matched)
+                              (remove-combo-from-factors best-combo factors)
+                            (if matched
+                                (let ((rest-rewritten
+                                        (mapcar #'rewrite-sexpr rest-factors)))
+                                  (cond
+                                    ((null rest-rewritten)
+                                     temp-name)
+                                    (t
+                                     (cons '* (cons temp-name rest-rewritten)))))
+                                ;; no match here; just rewrite children
+                                (cons '* (mapcar #'rewrite-sexpr factors))))))
+                       ((consp sexpr)
+                        (cons (car sexpr)
+                              (mapcar #'rewrite-sexpr (cdr sexpr))))
+                       (t
+                        sexpr)))
+                   (rewrite-expr (expr)
+                     (expr-ir:sexpr->expr-ir
+                      (rewrite-sexpr (expr-ir:expr->sexpr expr))))
+                   (rewrite-stmt (stmt)
+                     (typecase stmt
+                       (assignment-statement
+                        (make-assignment-stmt
+                         (stmt-target-name stmt)
+                         (rewrite-expr (stmt-expression stmt))
+                         (stmt-target-indices stmt)))
+                       (block-statement
+                        (make-block-stmt
+                         (mapcar #'rewrite-stmt (block-statements stmt))))
+                       (if-statement
+                        (let* ((new-cond (rewrite-expr (if-condition stmt)))
+                               (then-b  (if-then-block stmt))
+                               (else-b  (if-else-block stmt))
+                               (new-then (when then-b
+                                           (make-block-stmt
+                                            (mapcar #'rewrite-stmt
+                                                    (block-statements then-b)))))
+                               (new-else (when else-b
+                                           (make-block-stmt
+                                            (mapcar #'rewrite-stmt
+                                                    (block-statements else-b))))))
+                          (make-if-stmt new-cond new-then new-else)))
+                       (t stmt))))
+            (let ((new-stmts '()))
+              (loop for idx from 0 below n do
+                (when (= idx insert-idx)
+                  (push temp-assign new-stmts))
+                (push (rewrite-stmt (nth idx stmts)) new-stmts))
+              (make-block-stmt (nreverse new-stmts)))))))))
 
 
 (defun normalize-signs-optimization (pass-counter block)
@@ -2373,6 +2446,10 @@ Only linear subexpressions are changed; non-linear ones are left as-is."
                  :enabled-p enabled-p
                  :min-improvement min-improvement))
 
+(defmethod print-object ((obj optimization) stream)
+  (print-unreadable-object (obj stream :type t)
+    (format stream ":name ~s" (optimization-name obj))))
+
 (defclass optimization-pipeline ()
   ((name
     :initarg :name
@@ -2420,6 +2497,7 @@ Only linear subexpressions are changed; non-linear ones are left as-is."
 
 If MIN-IMPROVEMENT on OPT is > 0, we only accept the new block if
 (before - after) >= MIN-IMPROVEMENT. Otherwise we keep BLOCK."
+  (declare (optimize (debug 3)))
   (format t "DEBUG_DEBUG About to run-optimization ~s~%" (optimization-name opt))
   (unless (typep opt 'optimization)
     (error "RUN-OPTIMIZATION: expected OPTIMIZATION, got ~S" opt))
@@ -2435,7 +2513,10 @@ If MIN-IMPROVEMENT on OPT is > 0, we only accept the new block if
          (after     (funcall measure new-block))
          (impr      (- before after))
          (threshold (optimization-min-improvement opt))
-         (accepted  (>= impr threshold)))
+         (accepted  (>= impr threshold))
+         (result-block (if accepted new-block block)))
+    ;; Fail fast if an optimization produced a use-before-def ordering bug.
+    (check-def-before-use-in-block result-block :errorp t)
     (when log-stream
       (format log-stream "~&~60a complexity: ~6D -> ~6D (Δ=~5D) ~A~%"
               (format nil "[OPT ~a ~A]" name (optimization-name opt))
@@ -2446,7 +2527,7 @@ If MIN-IMPROVEMENT on OPT is > 0, we only accept the new block if
                       "ACCEPT")
                   "REJECT")))
     (format t "DEBUG_DEBUG About to leave run-optimization ~s~%" (optimization-name opt))
-    (values (if accepted new-block block)
+    (values result-block
             before
             (if accepted after before)
             accepted)))
