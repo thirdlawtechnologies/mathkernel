@@ -326,12 +326,9 @@ to *TRACE-OUTPUT* so it plays nicely with your existing tracing."
                (expr-ir:expr->sexpr (if-condition stmt)))
        (indent!) (format stream "then~%")
        (debug-stmt (if-then-block stmt) stream (+ indent 2))
-       (when (if-else-block stmt)
-         (indent!) (format stream "else~%")
-         (debug-stmt (if-else-block stmt) stream (+ indent 2))))
-
-      (accumulation-anchor-statement
-       (format stream "ACCUMULATE-HERE;~%"))
+      (when (if-else-block stmt)
+        (indent!) (format stream "else~%")
+        (debug-stmt (if-else-block stmt) stream (+ indent 2))))
 
       (assignment-statement
        (let ((target  (stmt-target-name stmt))
@@ -860,9 +857,6 @@ around them may be reordered as needed to satisfy def-before-use."
      ;; Generic block outside of if/function: just emit its contents
      (emit-block-c stmt indent stream))
 
-    (accumulation-anchor-statement
-     ;; Do nothing
-     nil)
 
     (t
      (error "emit-statement-c: unknown statement type ~S" stmt))))
@@ -1457,11 +1451,9 @@ a pass makes no changes.
 
 Each pass uses a distinct temp namespace: CSE_P<pass>_T<n>."
   (declare (optimize (debug 3)))
-  (format t "DEBUG_DEBUG Entered cse-block-multi-optimization-------------~%")
   (unless (typep block 'block-statement)
     (error "cse-block-multi: expected BLOCK-STATEMENT, got ~S" block))
   (let ((current-block block))
-    (stmt-ir:debug-block current-block :label "current block in CSE-MULTI")
     (loop for ii from 1 upto max-passes do
       (let* ((pass-id (next-pass-id counter))
              (pass pass-id)
@@ -2498,7 +2490,6 @@ Only linear subexpressions are changed; non-linear ones are left as-is."
 If MIN-IMPROVEMENT on OPT is > 0, we only accept the new block if
 (before - after) >= MIN-IMPROVEMENT. Otherwise we keep BLOCK."
   (declare (optimize (debug 3)))
-  (format t "DEBUG_DEBUG About to run-optimization ~s~%" (optimization-name opt))
   (unless (typep opt 'optimization)
     (error "RUN-OPTIMIZATION: expected OPTIMIZATION, got ~S" opt))
   (unless (typep block 'block-statement)
@@ -2507,9 +2498,7 @@ If MIN-IMPROVEMENT on OPT is > 0, we only accept the new block if
          (pos-args  (optimization-positional-args opt))
          (kw-args   (optimization-keyword-args opt))
          (before    (funcall measure block))
-         (new-block (progn
-                      (format t "DEBUG_DEBUG run-optimization fn = ~s~%" fn)
-                      (apply fn pass-counter block (append pos-args kw-args))))
+         (new-block (apply fn pass-counter block (append pos-args kw-args)))
          (after     (funcall measure new-block))
          (impr      (- before after))
          (threshold (optimization-min-improvement opt))
@@ -2525,8 +2514,29 @@ If MIN-IMPROVEMENT on OPT is > 0, we only accept the new block if
                   (if (= impr 0)
                       "useless"
                       "ACCEPT")
-                  "REJECT")))
-    (format t "DEBUG_DEBUG About to leave run-optimization ~s~%" (optimization-name opt))
+                  "REJECT"))
+       ;; Extra debug: track Hessian targets during e-g-hess pipelines.
+       (when (and name (search "e-g-hess" (string name)))
+         (labels ((h-targets (blk)
+                    (loop for st in (block-statements blk)
+                          when (typep st 'assignment-statement)
+                            for tgt = (stmt-target-name st)
+                            when (and (symbolp tgt)
+                                      (let ((s (symbol-name tgt)))
+                                        (and (>= (length s) 2)
+                                             (string= (subseq s 0 2) "H_"))))
+                              collect tgt)))
+           (let* ((before-h (h-targets block))
+                  (after-h  (h-targets result-block))
+                  (dropped  (set-difference before-h after-h :test #'eq))
+                  (added    (set-difference after-h before-h :test #'eq)))
+             (when (or dropped added)
+               (format log-stream "~&   [HESS] before ~d: ~s~%"
+                       (length before-h) before-h)
+               (format log-stream "~&   [HESS] after  ~d: ~s~%"
+                       (length after-h) after-h)
+               (format log-stream "~&   [HESS] delta  -~d +~d dropped: ~s added: ~s~%"
+                       (length dropped) (length added) dropped added))))))
     (values result-block
             before
             (if accepted after before)
@@ -2558,7 +2568,6 @@ RESULTS-LIST is a list of plists:
                      (run-optimization pass-counter opt current
                                        :name cur-name
                                        :measure measure :log-stream log-stream)
-                   (debug-block new-block :label (format nil "new-block after ~s" (optimization-name opt)))
                    (push (list :opt-name (format nil "~a ~a" cur-name (optimization-name opt))
                                :before   before
                                :after    after
@@ -2567,110 +2576,6 @@ RESULTS-LIST is a list of plists:
                    (setf current new-block)))))
     (let ((total-after (funcall measure current)))
       (values current (nreverse results) total-before total-after))))
-
-;;; ----------------------------------------------------------------------
-;;; accumulation control
-;;; ----------------------------------------------------------------------
-
-
-(defclass accumulation-anchor-statement ()
-  ()
-  (:documentation
-   "Marker statement indicating where gradient/Hessian scalar
-assignments (G_*/H_*_*) should be inserted before transform-eg-h-block.
-Has no runtime effect by itself."))
-
-(defun make-accum-anchor-stmt ()
-  (make-instance 'accumulation-anchor-statement))
-
-
-(defmacro accumulate-here ()
-  "Place this in a stmt-block inside the kernel body where you want
-gradient/Hessian accumulation code to be spliced.
-
-Example:
-
-  (stmt-block
-    ...
-    (stmt-ir:make-if-stmt
-      (expr-ir:parse-expr \"r < r_cut\")
-      (stmt-block
-        ... ; compute energy, dE/dr, d2E/dr2
-        (accumulate-here))     ; <--- here
-      (stmt-block))
-    ...)"
-  `(stmt-ir:make-accum-anchor-stmt))
-
-#+(or)
-(defun block-has-accum-anchor-p (block)
-  "Return T if BLOCK (a stmt-ir:block-statement) contains at least
-one accumulation-anchor-statement anywhere inside."
-  (labels ((scan-stmt (st)
-             (typecase st
-               (stmt-ir:accumulation-anchor-statement
-                t)
-               (stmt-ir:block-statement
-                (some #'scan-stmt (stmt-ir:block-statements st)))
-               (stmt-ir:if-statement
-                (or (scan-stmt (stmt-ir:if-then-block st))
-                    (and (stmt-ir:if-else-block st)
-                         (scan-stmt (stmt-ir:if-else-block st)))))
-               (t
-                nil))))
-    (scan-stmt block)))
-
-#+(or)
-(defun splice-derivatives-at-accum-anchor
-    (block grad-stmts hess-stmts
-           &key compute-grad compute-hess)
-  "Return a new BLOCK where any accumulation-anchor-statement has been
-replaced by the given gradient/Hessian assignment statements.
-
-GRAD-STMTS and HESS-STMTS are lists of stmt-ir:assignment-statement
-(or similar). If COMPUTE-GRAD or COMPUTE-HESS is NIL, the corresponding
-statements are not inserted. If both are NIL, anchors are simply removed."
-  (labels
-      ((rewrite-stmt-list (stmts)
-         (loop for st in stmts
-               nconc (rewrite-stmt st)))
-
-       (rewrite-stmt (st)
-         (typecase st
-           (stmt-ir:accumulation-anchor-statement
-            ;; Replace anchor by grad/hess, or drop it entirely.
-            (let ((inserted '()))
-              (when compute-grad
-                (setf inserted (nconc inserted (copy-list grad-stmts))))
-              (when compute-hess
-                (setf inserted (nconc inserted (copy-list hess-stmts))))
-              inserted))
-
-           (stmt-ir:block-statement
-            (list (stmt-ir:make-block-stmt
-                   (rewrite-stmt-list (stmt-ir:block-statements st)))))
-
-           (stmt-ir:if-statement
-            (let* ((then-blk (stmt-ir:if-then-block st))
-                   (else-blk (stmt-ir:if-else-block st))
-                   (new-then (stmt-ir:make-block-stmt
-                              (rewrite-stmt-list
-                               (stmt-ir:block-statements then-blk))))
-                   (new-else (when else-blk
-                               (stmt-ir:make-block-stmt
-                                (rewrite-stmt-list
-                                 (stmt-ir:block-statements else-blk))))))
-              (list (stmt-ir:make-if-stmt
-                     (stmt-ir:if-condition st)
-                     new-then
-                     new-else))))
-
-           (t
-            (list st)))))
-    (stmt-ir:make-block-stmt
-     (rewrite-stmt-list (stmt-ir:block-statements block)))))
-
-
-
 
 ;;; ----------------------------------------------------------------------
 ;;; copy alias optimizations

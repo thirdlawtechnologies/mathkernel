@@ -204,15 +204,19 @@
    #:dr-base-var
    #:make-derivative-name
    #:sexpr-size
-   #:linear-canonicalization-optimization
-   #:debug-block
-   #:make-accum-anchor-stmt
-   #:accumulation-anchor-statement
-   #:accumulate-here
-   #:raw-c
+  #:linear-canonicalization-optimization
+  #:debug-block
+  #:raw-c
    #:alias-assigned-exprs-optimization
-   #:make-block-stmt-unsafe
-   #:check-def-before-use-in-block))
+  #:make-block-stmt-unsafe
+  #:check-def-before-use-in-block
+  ;; comparison harness generator
+  #:write-kernel-compare-c
+  #:write-kernel-compare-from-kernels
+  #:emit-compare-preamble
+  #:emit-kernel-test-c
+  #:emit-main-for-tests
+  #:write-kernel-compare-harness))
 
 (defpackage :stmt-ir.tests
   (:use :cl :expr-ir :stmt-ir)
@@ -240,7 +244,8 @@
    #:push-kernel
    #:build-multiple-kernels
    #:with-kernels
-   #:build-kernel))
+   #:build-kernel
+   #:emit-c-tests))
 
 ;;;; Symbols go in this package
 (defpackage :mathkernel-user

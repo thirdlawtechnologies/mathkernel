@@ -223,6 +223,102 @@ RAW-SPEC is a property list with keys:
    (stmt-ir:block-statements block)
    base-var))
 
+(defun distribute-products-over-sums (sexpr)
+  "Recursively expand products over sums in SEXPR (infix-style sexpr).
+E.g. (* (+ a b) c) -> (+ (* a c) (* b c))."
+  (labels ((make-prod (xs)
+             (cond
+               ((null xs) 1)
+               ((null (cdr xs)) (car xs))
+               (t (cons '* xs)))))
+    (cond
+      ((atom sexpr) sexpr)
+      ((and (consp sexpr) (eq (car sexpr) '+))
+       (cons '+ (mapcar #'distribute-products-over-sums (cdr sexpr))))
+      ((and (consp sexpr) (eq (car sexpr) '*))
+       (let* ((args (mapcar #'distribute-products-over-sums (cdr sexpr)))
+              (terms (list 1)))
+         (dolist (arg args)
+           (if (and (consp arg) (eq (car arg) '+))
+               (setf terms
+                     (loop for term in terms append
+                           (loop for summand in (cdr arg)
+                                 collect (make-prod (list term summand)))))
+               (setf terms
+                     (loop for term in terms
+                           collect (make-prod (list term arg))))))
+         (if (= (length terms) 1)
+             (first terms)
+             (cons '+ terms))))
+      (t
+             (cons (distribute-products-over-sums (car sexpr))
+                   (mapcar #'distribute-products-over-sums (cdr sexpr)))))))
+
+(defun commutative-canonicalize-sexpr (sexpr)
+  "Canonicalize SEXPR for commutative ops + and * by flattening and sorting args."
+  (labels ((flatten-op (op args)
+             (loop for a in args append
+                   (if (and (consp a) (eq (car a) op))
+                       (cdr a)
+                       (list a)))))
+    (cond
+      ((atom sexpr) sexpr)
+      ((and (consp sexpr) (member (car sexpr) '(+ *)))
+       (let* ((op   (car sexpr))
+              (raw  (mapcar #'commutative-canonicalize-sexpr (cdr sexpr)))
+              (flat (flatten-op op raw))
+              (sorted (sort (copy-list flat)
+                            (lambda (a b)
+                              (string< (prin1-to-string a)
+                                       (prin1-to-string b))))))
+         (cons op sorted)))
+      (t
+       (cons (commutative-canonicalize-sexpr (car sexpr))
+             (mapcar #'commutative-canonicalize-sexpr (cdr sexpr)))))))
+
+(defun normalize-commutative-sexpr (sexpr)
+  "Flatten +/*, drop identities (0 for +, 1 for *), and sort commutative args."
+  (labels ((norm (sx)
+             (cond
+               ((atom sx) sx)
+               ((and (consp sx) (member (car sx) '(+ *)))
+                (let* ((op (car sx))
+                       (args (mapcar #'norm (cdr sx)))
+                       ;; flatten nested ops
+                       (flat (loop for a in args append
+                                   (if (and (consp a) (eq (car a) op))
+                                       (cdr a)
+                                       (list a))))
+                       ;; drop identities
+                       (filtered
+                         (remove-if (lambda (x)
+                                      (and (atom x)
+                                           (or (and (eq op '+) (eql x 0))
+                                               (and (eq op '*) (eql x 1)))))
+                                    flat)))
+                  (cond
+                    ((null filtered)
+                     (if (eq op '+) 0 1))
+                    ((null (cdr filtered))
+                     (car filtered))
+                    (t
+                     (cons op
+                           (sort (copy-list filtered)
+                                 (lambda (a b)
+                                   (string< (prin1-to-string a)
+                                            (prin1-to-string b)))))))))
+               (t
+                (cons (norm (car sx)) (mapcar #'norm (cdr sx)))))))
+    (norm sexpr)))
+
+(defun fully-normalize-sexpr (sexpr)
+  "Distribute, canonicalize commutative ops, drop identities, and simplify."
+  (let* ((dist (distribute-products-over-sums sexpr))
+         (comm (commutative-canonicalize-sexpr dist))
+         (norm (normalize-commutative-sexpr comm))
+         (simp (expr-ir:simplify-expr (expr-ir:sexpr->expr-ir norm))))
+    (expr-ir:expr->sexpr simp)))
+
 
 
 
@@ -243,25 +339,42 @@ Uses:
   - and a final diff == 0 check with FACTOR-SUM-OF-PRODUCTS."
   (let* ((radial-map (and base-block
                           (build-radial-map-from-block base-block)))
-         (e1 (canonicalize-expr-for-equivalence expr1 base-block radial-map verbose))
-         (e2 (canonicalize-expr-for-equivalence expr2 base-block radial-map verbose))
+         ;; Try inlining assignments first so R2 substitutions are visible
+         (e1-raw (if base-block
+                     (rewrite-expr-using-assignments expr1 base-block)
+                     expr1))
+         (e2-raw (if base-block
+                     (rewrite-expr-using-assignments expr2 base-block)
+                     expr2))
+         (e1 (canonicalize-expr-for-equivalence e1-raw base-block radial-map verbose))
+         (e2 (canonicalize-expr-for-equivalence e2-raw base-block radial-map verbose))
          (sx1 (expr-ir:expr->sexpr e1))
-         (sx2 (expr-ir:expr->sexpr e2)))
+         (sx2 (expr-ir:expr->sexpr e2))
+         (sx1-full (fully-normalize-sexpr sx1))
+         (sx2-full (fully-normalize-sexpr sx2)))
     (cond
       ;; 1. Structural equality after canonicalization
       ((equal sx1 sx2)
        (values t sx1 sx2))
-
+      ;; 1b. Equality after aggressive normalization/simplify
+      ((equal sx1-full sx2-full)
+       (values t sx1-full sx2-full))
       (t
        ;; 2. Fallback: diff = e1 - e2, factor and simplify, check for constant 0
-       (let* ((neg-e2   (expr-ir:make-expr-neg e2))
-              (diff     (expr-ir:make-expr-add (list e1 neg-e2)))
-              (diff-f   (expr-ir:factor-sum-of-products diff))
-              (diff-sim (expr-ir:simplify-expr diff-f)))
-         (if (and (typep diff-sim 'expr-ir:constant-expression)
-                  (zerop (expr-ir:expression-value diff-sim)))
-             (values t sx1 sx2)
-             (values nil sx1 sx2)))))))
+        (let* ((neg-e2   (expr-ir:make-expr-neg e2))
+               (diff     (expr-ir:make-expr-add (list e1 neg-e2)))
+               (diff-simple (expr-ir:simplify-expr
+                             (expr-ir:make-expr-add (list e1-raw (expr-ir:make-expr-neg e2-raw)))))
+               (diff-f   (expr-ir:factor-sum-of-products diff))
+               (diff-sim (expr-ir:simplify-expr diff-f)))
+          (when (and (typep diff-simple 'expr-ir:constant-expression)
+                     (zerop (expr-ir:expression-value diff-simple)))
+            (return-from expressions-equivalent-p
+              (values t (expr-ir:expr->sexpr diff-simple) (expr-ir:expr->sexpr diff-simple))))
+          (if (and (typep diff-sim 'expr-ir:constant-expression)
+                   (zerop (expr-ir:expression-value diff-sim)))
+              (values t sx1 sx2)
+              (values nil sx1 sx2)))))))
 
 
 
@@ -276,6 +389,7 @@ compare them against AD-generated derivatives from BASE-BLOCK.
 - COORD-VARS: list of expr-ir vars (x1 y1 z1 ...)
 
 Signals warnings or errors if mismatches are found, depending on mode."
+  (declare (optimize (debug 3)))
   (let ((mode (manual-deriv-spec-geometry-check-mode manual-deriv-spec)))
     (unless (member mode '(:warn :error))
       (return-from check-intermediate-geometry! manual-deriv-spec))
@@ -422,6 +536,56 @@ If SYM is not a Hessian target, return NIL."
         (values (second parts) (third parts))
         (values nil nil))))
 
+(defun inject-gradients-after-energy (block coord-vars energy-var grad-target-fn)
+  "Return a new BLOCK with per-branch gradient assignments inserted
+immediately after any assignment to ENERGY-VAR. Gradients are computed
+using the assignments visible along that control-flow path."
+  (labels
+      ((walk-stmts (stmts seen)
+         (let ((out '()))
+           (dolist (st stmts)
+             (typecase st
+               (stmt-ir:assignment-statement
+                (push st out)
+                (let ((new-seen (append seen (list st))))
+                  (when (eq (stmt-ir:stmt-target-name st) energy-var)
+                    (dolist (q coord-vars)
+                      (let ((dexpr (stmt-ir:differentiate-target-in-block
+                                    new-seen q energy-var)))
+                        (when dexpr
+                          (let ((g-sym (funcall grad-target-fn q)))
+                            (push (stmt-ir:make-assignment-stmt g-sym dexpr) out))))))
+                  (setf seen new-seen)))
+               (stmt-ir:block-statement
+                (multiple-value-bind (sub-stmts new-seen)
+                    (walk-stmts (stmt-ir:block-statements st) seen)
+                  (declare (ignore new-seen))
+                  (push (stmt-ir:make-block-stmt sub-stmts) out)))
+               (stmt-ir:if-statement
+                (multiple-value-bind (then-stmts seen-then)
+                    (walk-stmts (stmt-ir:block-statements (stmt-ir:if-then-block st))
+                                (copy-list seen))
+                    (declare (ignore seen-then))
+                  (multiple-value-bind (else-stmts seen-else)
+                      (if (stmt-ir:if-else-block st)
+                          (walk-stmts (stmt-ir:block-statements (stmt-ir:if-else-block st))
+                                      (copy-list seen))
+                          (values nil seen))
+                    (declare (ignore seen-else))
+                    (push (stmt-ir:make-if-stmt
+                           (stmt-ir:if-condition st)
+                           (stmt-ir:make-block-stmt then-stmts)
+                           (when else-stmts
+                             (stmt-ir:make-block-stmt else-stmts)))
+                          out))))
+               (t
+                (push st out))))
+           (values (nreverse out) seen))))
+    (multiple-value-bind (stmts _)
+        (walk-stmts (stmt-ir:block-statements block) '())
+      (declare (ignore _))
+      (stmt-ir:make-block-stmt stmts))))
+
 
 (defun build-assignment-map (block)
   "Return a hash table mapping VAR-SYM -> EXPR for all top-level
@@ -470,17 +634,78 @@ avoid infinite recursion if there ever were cycles."
 ;;; Basic building macros: =. and stmt-block
 ;;; ------------------------------------------------------------
 
-(defmacro =. (var expr-string)
-  "Create an assignment statement VAR := parse(EXPR-STRING)."
-  `(stmt-ir:make-assignment-stmt
-    ',(expr-ir:ev var)
-    (expr-ir:parse-expr ,expr-string)))
+(defstruct annotated-stmt
+  stmt
+  modes)
+
+(defun normalize-modes (modes)
+  (cond
+    ((null modes) '(:energy))
+    ((symbolp modes) (list modes))
+    (t modes)))
+
+(defmacro =. (var expr-string &key modes)
+  "Create an assignment statement VAR := parse(EXPR-STRING).
+Optional :MODES restricts when the statement is kept:
+  :energy (default), :gradient, :hessian. Higher modes include lower ones."
+  `(make-annotated-stmt
+    :stmt (stmt-ir:make-assignment-stmt
+           ',(expr-ir:ev var)
+           (expr-ir:parse-expr ,expr-string))
+    :modes (normalize-modes ',modes)))
 
 (defmacro stmt-block (&body forms)
   "Construct a STMT-IR block-statement from FORMS.
 Each FORM should evaluate to a statement object (e.g. from =.)."
   `(stmt-ir:make-block-stmt
     (list ,@forms)))
+
+(defun mode-level (mode)
+  (ecase mode
+    (:energy 1)
+    (:gradient 2)
+    (:hessian 3)))
+
+(defun keep-for-mode-p (stmt-modes compute-mode)
+  "Return T if a statement tagged with STMT-MODES should be kept for COMPUTE-MODE."
+  (let* ((modes (normalize-modes stmt-modes))
+         (min-level (reduce #'min modes :key #'mode-level)))
+  (<= min-level (mode-level compute-mode))))
+
+(defun filter-block-for-mode (block compute-mode)
+  "Strip annotated statements whose modes do not include COMPUTE-MODE.
+Bare statements (not annotated-stmt) are treated as :energy."
+  (labels ((keep (form)
+             (cond
+               ((annotated-stmt-p form)
+                (if (keep-for-mode-p (annotated-stmt-modes form) compute-mode)
+                    (annotated-stmt-stmt form)
+                    nil))
+               (t
+                (if (keep-for-mode-p '(:energy) compute-mode)
+                    form
+                    nil))))
+           (walk (blk)
+             (let ((new '()))
+               (dolist (st (stmt-ir:block-statements blk))
+                 (let ((kept (keep st)))
+                   (when kept
+                     (typecase kept
+                       (stmt-ir:block-statement
+                        (push (walk kept) new))
+                       (stmt-ir:if-statement
+                        (let* ((then-b (stmt-ir:if-then-block kept))
+                               (else-b (stmt-ir:if-else-block kept))
+                               (new-then (and then-b (walk then-b)))
+                               (new-else (and else-b (walk else-b))))
+                          (push (stmt-ir:make-if-stmt
+                                 (stmt-ir:if-condition kept)
+                                 new-then new-else)
+                                new)))
+                       (t
+                        (push kept new))))))
+               (stmt-ir:make-block-stmt (nreverse new)))))
+    (walk block)))
 
 ;;; ------------------------------------------------------------
 ;;; Coordinate load helper: coords-from-position
@@ -567,7 +792,7 @@ If MANUAL-DERIV-SPEC is NIL, fall back to the existing pure AD path."
                                base-block (nth k coord-vars))))
                       a)))
             (hess-assignments '()))
-       (dotimes (i n (nreverse hess-assignments))
+       (dotimes (i n)
          (let* ((qi    (nth i coord-vars))
                 (env-i (and envs (aref envs i))))
            (dotimes (j n)
@@ -622,7 +847,12 @@ If MANUAL-DERIV-SPEC is NIL, fall back to the existing pure AD path."
                                   (zerop (expr-ir:expression-value sum-simplified)))
                        (let* ((h-sym (funcall hess-target-fn qi qj))
                               (stmt  (stmt-ir:make-assignment-stmt h-sym sum-simplified)))
-                         (push stmt hess-assignments))))))))))))
+                         (push stmt hess-assignments))))))))))
+       (let* ((out (reverse hess-assignments))
+              (targets (mapcar #'stmt-ir:stmt-target-name out)))
+         (format t "[make-hessian-assignments-from-block/~a] manual/hibrid emitted ~d targets: ~s~%"
+                 mode (length out) targets)
+         out)))
     ;; Default / AD path (existing behavior)
     (t
      (let* ((n    (length coord-vars))
@@ -631,7 +861,7 @@ If MANUAL-DERIV-SPEC is NIL, fall back to the existing pure AD path."
          (setf (aref envs k)
                (build-deriv-env-for-block base-block (nth k coord-vars))))
        (let ((hess-assignments '()))
-         (dotimes (i n (nreverse hess-assignments))
+         (dotimes (i n)
            (let* ((qi    (nth i coord-vars))
                   (env-i (aref envs i))
                   (dE-dqi (expr-ir:lookup-var-derivative energy-var qi env-i)))
@@ -645,7 +875,12 @@ If MANUAL-DERIV-SPEC is NIL, fall back to the existing pure AD path."
                                 (zerop (expr-ir:expression-value d2E)))
                      (let* ((h-sym (funcall hess-target-fn qi qj))
                             (stmt  (stmt-ir:make-assignment-stmt h-sym d2E)))
-                       (push stmt hess-assignments)))))))))))))
+                       (push stmt hess-assignments))))))))
+         (let* ((out (reverse hess-assignments))
+                (targets (mapcar #'stmt-ir:stmt-target-name out)))
+           (format t "[make-hessian-assignments-from-block/ad] auto emitted ~d targets: ~s~%"
+                   (length out) targets)
+           out))))))
 
 
 
@@ -688,6 +923,7 @@ emit a RAW-C-STMT that accumulates it into *energy_accumulate."
   "If TARGET-SYM is a gradient scalar like G_X1, return a RAW-C-STATEMENT
 calling KernelGradientAcc(i_base, offset, g_x1); otherwise return NIL."
   (let ((coord (grad-target-name->coord target-sym)))
+    (warn "make-force-macro-call-from-grad-target target-sym: ~s coord = ~s" target-sym coord)
     (when coord
       (multiple-value-bind (ibase off) (coord-name->ibase+offset coord layout)
         (let* ((ibase-str (string-downcase (symbol-name ibase)))
@@ -702,6 +938,7 @@ calling KernelGradientAcc(i_base, offset, g_x1); otherwise return NIL."
   Otherwise return NIL."
   (multiple-value-bind (c1 c2)
       (hess-target-name->coords target-sym)
+    (warn "make-force-macro-call-from-grad-target target-sym: ~s c1,c2 = ~s,~s" target-sym c1 c2)
     (when (and c1 c2)
       (multiple-value-bind (ibase1 off1) (coord-name->ibase+offset c1 layout)
         (multiple-value-bind (ibase2 off2) (coord-name->ibase+offset c2 layout)
@@ -717,6 +954,7 @@ calling KernelGradientAcc(i_base, offset, g_x1); otherwise return NIL."
                                ibase1-str off1
                                ibase2-str off2
                                v-name)))
+            (warn "make-hess-macro-call-from-target")
             (stmt-ir:make-raw-c-statement code)))))))
 
 
@@ -746,7 +984,7 @@ calling KernelGradientAcc(i_base, offset, g_x1); otherwise return NIL."
                                                      layout
                                                      coord-vars grad-target-fn hess-target-fn))))
            (push (stmt-ir:make-if-stmt cond then-blk else-blk) new-stmts)))
-
+        
         (stmt-ir:assignment-statement
          ;; Always keep the assignment itself
          (push st new-stmts)
@@ -766,7 +1004,7 @@ calling KernelGradientAcc(i_base, offset, g_x1); otherwise return NIL."
 
         (t
          (push st new-stmts))))
-    (stmt-ir:make-block-stmt (nreverse new-stmts))))
+    (stmt-ir:make-block-stmt (reverse new-stmts))))
 
 
 
@@ -806,56 +1044,59 @@ If MANUAL-DERIV-SPEC is non-NIL:
 
 Otherwise, fall back to pure AD on ENERGY-VAR wrt each coordinate."
   (declare (optimize (debug 3)))
-  (cond
-    ;; Manual / hybrid chain rule: dE/dq = Σ_u dE/du * du/dq
-    ((and manual-deriv-spec
-          (member (manual-deriv-spec-mode manual-deriv-spec) '(:manual :hybrid)))
-     (let* ((mode          (manual-deriv-spec-mode manual-deriv-spec))
-            (intermediates (manual-deriv-spec-intermediates manual-deriv-spec))
-            (du-dq         (manual-deriv-spec-du-dq manual-deriv-spec))
-            (dE-du         (manual-deriv-spec-dE-du manual-deriv-spec))
-            ;; For :hybrid, precompute derivative environments per coord.
-            (envs (when (eq mode :hybrid)
-                    (let ((ht (make-hash-table :test #'eq)))
-                      (dolist (q coord-vars)
-                        (setf (gethash q ht)
-                              (build-deriv-env-for-block-propagate base-block q)))
-                      ht)))
-            (grad-assignments '()))
-       (dolist (q coord-vars (nreverse grad-assignments))
-         (let* ((terms '())
-                (env-q (and envs (gethash q envs nil))))
-           (dolist (u intermediates)
-             (let* ((dE/du (gethash u dE-du nil))
-                    (du/dq (or (gethash (list u q) du-dq nil)
-                               (and env-q
-                                    (expr-ir:lookup-var-derivative u q env-q)))))
-               (when (and dE/du du/dq)
-                 (push (expr-ir:make-expr-mul (list dE/du du/dq))
-                       terms))))
-           (when terms
-             (let* ((sum (if (cdr terms)
-                             (expr-ir:make-expr-add terms)
-                             (car terms)))
-                    (sum-simplified (expr-ir:simplify-expr sum)))
-               (unless (and (typep sum-simplified 'expr-ir:constant-expression)
-                            (zerop (expr-ir:expression-value sum-simplified)))
-                 (let* ((grad-sym (funcall grad-target-fn q))
-                        (stmt    (stmt-ir:make-assignment-stmt grad-sym sum-simplified)))
-                   (push stmt grad-assignments)))))))))
-    ;; Default / AD path (existing behavior)
-    (t
-     (let ((grad-assignments '()))
-       (dolist (q coord-vars (nreverse grad-assignments))
-         (let* ((deriv-env (build-deriv-env-for-block-propagate base-block q))
-                (dE-dq     (expr-ir:lookup-var-derivative energy-var q deriv-env))
-                (dE-dq-s   (expr-ir:simplify-expr dE-dq)))
-           (unless (and (typep dE-dq-s 'expr-ir:constant-expression)
-                        (zerop (expr-ir:expression-value dE-dq-s)))
-             (let* ((grad-sym  (funcall grad-target-fn q))
-                    (grad-expr dE-dq-s)
-                    (stmt      (stmt-ir:make-assignment-stmt grad-sym grad-expr)))
-               (push stmt grad-assignments)))))))))
+  (let ((result
+          (cond
+            ;; Manual / hybrid chain rule: dE/dq = Σ_u dE/du * du/dq
+            ((and manual-deriv-spec
+                  (member (manual-deriv-spec-mode manual-deriv-spec) '(:manual :hybrid)))
+             (let* ((mode          (manual-deriv-spec-mode manual-deriv-spec))
+                    (intermediates (manual-deriv-spec-intermediates manual-deriv-spec))
+                    (du-dq         (manual-deriv-spec-du-dq manual-deriv-spec))
+                    (dE-du         (manual-deriv-spec-dE-du manual-deriv-spec))
+                    ;; For :hybrid, precompute derivative environments per coord.
+                    (envs (when (eq mode :hybrid)
+                            (let ((ht (make-hash-table :test #'eq)))
+                              (dolist (q coord-vars)
+                                (setf (gethash q ht)
+                                      (build-deriv-env-for-block-propagate base-block q)))
+                              ht)))
+                    (grad-assignments '()))
+               (dolist (q coord-vars (nreverse grad-assignments))
+                 (let* ((terms '())
+                        (env-q (and envs (gethash q envs nil))))
+                   (dolist (u intermediates)
+                     (let* ((dE/du (gethash u dE-du nil))
+                            (du/dq (or (gethash (list u q) du-dq nil)
+                                       (and env-q
+                                            (expr-ir:lookup-var-derivative u q env-q)))))
+                       (when (and dE/du du/dq)
+                         (push (expr-ir:make-expr-mul (list dE/du du/dq))
+                               terms))))
+                   (when terms
+                     (let* ((sum (if (cdr terms)
+                                     (expr-ir:make-expr-add terms)
+                                     (car terms)))
+                            (sum-simplified (expr-ir:simplify-expr sum)))
+                       (unless (and (typep sum-simplified 'expr-ir:constant-expression)
+                                    (zerop (expr-ir:expression-value sum-simplified)))
+                         (let* ((grad-sym (funcall grad-target-fn q))
+                                (stmt    (stmt-ir:make-assignment-stmt grad-sym sum-simplified)))
+                           (push stmt grad-assignments)))))))))
+            ;; Default / AD path (existing behavior)
+            (t
+             (let ((grad-assignments '()))
+               (dolist (q coord-vars (nreverse grad-assignments))
+                 (let* ((deriv-env (build-deriv-env-for-block-propagate base-block q))
+                        (dE-dq     (expr-ir:lookup-var-derivative energy-var q deriv-env))
+                        (dE-dq-s   (expr-ir:simplify-expr dE-dq)))
+                   (unless (and (typep dE-dq-s 'expr-ir:constant-expression)
+                                (zerop (expr-ir:expression-value dE-dq-s)))
+                     (let* ((grad-sym  (funcall grad-target-fn q))
+                            (grad-expr dE-dq-s)
+                            (stmt      (stmt-ir:make-assignment-stmt grad-sym grad-expr)))
+                       (push stmt grad-assignments))))))))))
+    result
+    ))
 
 
 ;;; ---------------------------------------------
@@ -1150,7 +1391,7 @@ Existing manual entries in DU-DQ / D2U-DQ2 are preserved (never overwritten)."
 ;;; ----------------------------------------------------------------------
 
 
-(defmacro D! (target base)
+(defmacro D! (target base &key modes)
   "Insert a derivative request for d(TARGET)/d(BASE) at this point in the kernel body.
 TARGET and BASE are symbols naming existing variables in the kernel body.
 
@@ -1160,9 +1401,11 @@ Example inside a stmt-block:
 
 This will later be expanded to an assignment computing d(e_base)/d(r)
 using the statement-level AD machinery."
-  `(stmt-ir:make-derivative-request-stmt
-     ',(expr-ir:ev target)
-     ',(expr-ir:ev base)))
+  `(make-annotated-stmt
+    :stmt (stmt-ir:make-derivative-request-stmt
+           ',(expr-ir:ev target)
+           ',(expr-ir:ev base))
+    :modes (normalize-modes (or ',modes '(:gradient :hessian)))))
 
 (defun %expand-derivative-requests-in-block (block seen-assignments)
   "Walk BLOCK and replace derivative-request-statements with explicit
@@ -1226,6 +1469,61 @@ inside BLOCK into explicit derivative assignments."
   (let ((new-block (%expand-derivative-requests-in-block block '())))
     new-block))
 
+(defun remove-derivative-requests (block)
+  "Return a copy of BLOCK with derivative-request statements removed, and
+assignments whose targets are the derivatives requested. Used for
+energy-only kernels where D! requests are unnecessary."
+  (unless (typep block 'stmt-ir:block-statement)
+    (error "remove-derivative-requests: expected BLOCK-STATEMENT, got ~S" block))
+  ;; First collect derivative variable names introduced by D! requests (as strings).
+  (labels ((collect (blk)
+             (let ((names '()))
+               (dolist (st (stmt-ir:block-statements blk))
+                 (typecase st
+                   (stmt-ir:block-statement
+                    (setf names (nconc names (collect st))))
+                   (stmt-ir:if-statement
+                    (when (stmt-ir:if-then-block st)
+                      (setf names (nconc names (collect (stmt-ir:if-then-block st)))))
+                    (when (stmt-ir:if-else-block st)
+                      (setf names (nconc names (collect (stmt-ir:if-else-block st))))))
+                   (stmt-ir:derivative-request-statement
+                    (let* ((target (stmt-ir:dr-target-var st))
+                           (base   (stmt-ir:dr-base-var st))
+                           (dname  (stmt-ir:make-derivative-name target base)))
+                      (push (symbol-name dname) names)))))
+               names))
+           (strip (blk drop-names)
+             (let ((new-stmts '()))
+               (dolist (st (stmt-ir:block-statements blk))
+                 (typecase st
+                   (stmt-ir:block-statement
+                    (push (strip st drop-names) new-stmts))
+                   (stmt-ir:if-statement
+                    (let ((new-then (and (stmt-ir:if-then-block st)
+                                         (strip (stmt-ir:if-then-block st) drop-names)))
+                          (new-else (and (stmt-ir:if-else-block st)
+                                         (strip (stmt-ir:if-else-block st) drop-names))))
+                      (push (stmt-ir:make-if-stmt (stmt-ir:if-condition st) new-then new-else)
+                            new-stmts)))
+                   (stmt-ir:derivative-request-statement
+                    ;; drop in energy-only mode
+                    nil)
+                   (stmt-ir:assignment-statement
+                    (let* ((target (stmt-ir:stmt-target-name st))
+                           (rhs    (stmt-ir:stmt-expression st))
+                           (uses   (expr-ir:expr-free-vars rhs)))
+                      (unless (or (member (symbol-name target) drop-names :test #'string=)
+                                  (intersection (mapcar #'symbol-name uses)
+                                                drop-names :test #'string=))
+                        (push st new-stmts))))
+                   (t
+                    (push st new-stmts))))
+               (stmt-ir:make-block-stmt (nreverse new-stmts)))))
+    (let ((drop-names (collect block)))
+      (strip block drop-names))))
+
+
 
 ;;; ----------------------------------------------------------------------
 ;;; *post-eg-h-pipeline*
@@ -1261,20 +1559,12 @@ inside BLOCK into explicit derivative assignments."
          ;; inject coord loads
          (block-with-coords
            (if coord-load
-               (progn
-                 (format t "[KERNEL ~a] 6'. codegen: wrap CORE-BLOCK with coordinate loads -> BLOCK-WITH-COORDS~%"
-                         (kernel-name kernel))
-                 (format t "------- About to dump block~%")
-                 (stmt-ir:debug-block core-block :stream *standard-output*)
-                 (format t "------- Done dump block~%")
-                 (stmt-ir:make-block-stmt
-                  (append coord-load (list core-block))))
+               (stmt-ir:make-block-stmt
+                (append coord-load (list core-block)))
                core-block))
          ;; turn energy/grad/hess assignments into KernelGradientAcc/KernelDiagHessAcc/... macros
          (transformed
            (progn
-             (format t "[KERNEL ~a] 7'. codegen: transform BLOCK-WITH-COORDS -> TRANSFORMED via transform-eg-h-block~%"
-                     (kernel-name kernel))
              (transform-eg-h-block
               block-with-coords
               layout
@@ -1304,7 +1594,8 @@ inside BLOCK into explicit derivative assignments."
 
 
 (defclass kernel-ir ()
-  ((name :accessor kernel-name :initarg :name)
+  ((group :accessor kernel-group :initarg :group)
+   (name :accessor kernel-name :initarg :name)
    (layout :accessor kernel-layout :initarg :layout)
    (coord-vars :accessor kernel-coord-vars :initarg :coord-vars)
    (coord-load-stmts :accessor kernel-coord-load-stmts :initarg :coord-load-stmts)
@@ -1351,146 +1642,140 @@ inside BLOCK into explicit derivative assignments."
 
 
 (defun make-kernel-from-block
-    (&key name pipeline layout coord-vars coord-load-stmts base-block params
-          compute-energy compute-grad compute-hess derivatives
-          extra-equivalence-rules extra-optimization-rules
-          post-eg-h-pipeline
-          ;; C return type and optional auto-return expression.
-          ;; If RETURN-TYPE is non-"void" and RETURN-EXPR is non-NIL,
-          ;; the C emitter will append "return RETURN-EXPR;" at the end
-          ;; of the generated function.
-          (return-type "void")
-          (return-expr nil))
+    (&key group name pipeline layout coord-vars coord-load-stmts base-block params
+       compute-mode compute-energy compute-grad compute-hess derivatives
+       extra-equivalence-rules extra-optimization-rules
+       post-eg-h-pipeline
+       (return-type "void")
+       (return-expr nil))
   (declare (optimize (debug 3)))
   (labels ((the-name (nm)
              (format nil "~a ~a" name nm)))
-    ;; 1. User body -> BASE-BLOCK
     (format t "[KERNEL ~a] 1. user body provided -> BASE-BLOCK~%" name)
-    (let* ((energy-var        'energy)
+    (let* ((energy-var        (expr-ir:ev 'energy))
            (manual-deriv-spec (normalize-derivatives-spec derivatives))
-           ;; 2. Lower D! into assignments (derivative expansion)
+           (compute-mode      (or compute-mode :energy))
+           (base-block-filtered (filter-block-for-mode base-block compute-mode))
            (base-block*       (progn
                                 (format t "[KERNEL ~a] 2. expand-derivative-requests: user base-block -> base-block*~%" name)
-                                (expand-derivative-requests base-block)))
-           ;; 2. Counter reused by all optimization pipelines
+                                (if (or compute-grad compute-hess)
+                                    (expand-derivative-requests base-block-filtered)
+                                    (remove-derivative-requests base-block-filtered))))
            (pass-counter      (stmt-ir:make-pass-id-counter))
-           ;; 3. Choose a post-EG/H pipeline (kernel can override or disable)
-           (post-eg-h-pipeline*
-             (or post-eg-h-pipeline *post-eg-h-pipeline*)))
-      ;; Dynamically extend rewrite rules for this kernel, if requested
+           (post-eg-h-pipeline* (or post-eg-h-pipeline *post-eg-h-pipeline*)))
       (expr-ir:with-kernel-rewrite-rules
           (extra-equivalence-rules extra-optimization-rules)
-
-        ;; 3. Geometry consistency checks and auto-fill on lowered block
         (when manual-deriv-spec
-          (check-intermediate-geometry!
-           base-block* coord-vars manual-deriv-spec)
+          (check-intermediate-geometry! base-block* coord-vars manual-deriv-spec)
           (auto-fill-intermediate-geometry-from-ad
            base-block* coord-vars manual-deriv-spec
            :compute-second-derivs t
            :reuse-assignments    t))
-
-        ;; 3. Build up core E/G/H assignments from BASE-BLOCK*
-        (format t "[KERNEL ~a] 3. start building core E/G/H assignments (current-stmts from base-block*)~%" name)
-        (let ((current-stmts
-                (copy-list (stmt-ir:block-statements base-block*))))
-
-          ;; 4a. Gradient
+        (format t "[KERNEL ~a] 3. start building core E/G/H assignments~%" name)
+        (let* ((current-stmts (copy-list (stmt-ir:block-statements base-block*)))
+               (current-block (stmt-ir:make-block-stmt current-stmts)))
           (when compute-grad
-            (format t "[KERNEL ~a] 4a. adding gradient assignments and running pipeline (if any)~%" name)
-            (stmt-ir:debug-block base-block* :label "base-block* at step 4a")
-            (let ((grad-stmts
-                    (make-gradient-assignments-from-block
-                     base-block* energy-var coord-vars #'general-grad-name
-                     manual-deriv-spec)))
-              (setf current-stmts (append current-stmts grad-stmts)))
-            (when pipeline
-              (let ((grad-block (stmt-ir:make-block-stmt current-stmts)))
-                (multiple-value-bind (grad-opt results total-before total-after)
-                    (progn
-                      (format t "[KERNEL ~a] 4a.1 run-optimization-pipeline on gradient block~%" name)
-                      (stmt-ir:run-optimization-pipeline
-                       pass-counter pipeline grad-block
-                       :name (the-name "e-grad")
-                       :log-stream *trace-output*))
-                  (declare (ignore results total-before total-after))
-                  (setf current-stmts
-                        (copy-list (stmt-ir:block-statements grad-opt)))))))
-
-          ;; 4b. Hessian
-          (when compute-hess
-            (format t "[KERNEL ~a] 4b. adding Hessian assignments and running pipeline (if any)~%" name)
-            (let ((hess-stmts
-                    (make-hessian-assignments-from-block
-                     base-block* energy-var coord-vars #'general-hess-name
-                     manual-deriv-spec)))
-              (setf current-stmts (append current-stmts hess-stmts)))
+            (setf current-block
+                  (inject-gradients-after-energy
+                   current-block coord-vars energy-var #'general-grad-name))
+            (stmt-ir:debug-block current-block :label "After gradient added")
+            (setf current-stmts (copy-list (stmt-ir:block-statements current-block))))
+          (when pipeline
+            (let ((grad-block (stmt-ir:make-block-stmt current-stmts)))
+              (multiple-value-bind (grad-opt results total-before total-after)
+                  (stmt-ir:run-optimization-pipeline
+                   pass-counter pipeline grad-block
+                   :name (the-name "e-grad")
+                   :log-stream *trace-output*)
+                (declare (ignore results total-before total-after))
+                (setf current-stmts
+                      (copy-list (stmt-ir:block-statements grad-opt))))))
+          (let ((h-targets-pre nil))
+            (when compute-hess
+              (let ((hess-stmts (make-hessian-assignments-from-block
+                                 base-block* energy-var coord-vars #'general-hess-name
+                                 manual-deriv-spec)))
+                (setf current-stmts (append current-stmts hess-stmts)))
+              ;; Trace before post-hessian pipeline
+              (let* ((assign-targets (loop for st in current-stmts
+                                           when (typep st 'stmt-ir:assignment-statement)
+                                             collect (stmt-ir:stmt-target-name st)))
+                     (h-targets (remove-if-not (lambda (sym)
+                                                 (and (symbolp sym)
+                                                      (let ((s (symbol-name sym)))
+                                                        (and (>= (length s) 2)
+                                                             (string= (subseq s 0 2) "H_")))))
+                                               assign-targets)))
+                (setf h-targets-pre h-targets)
+                (format t "[make-kernel-from-block/~a] pre-hess-pipeline scalars (~d): ~s~%"
+                        name (length h-targets-pre) h-targets-pre)))
             (when pipeline
               (let ((hess-block (stmt-ir:make-block-stmt current-stmts)))
                 (multiple-value-bind (hess-opt results total-before total-after)
-                    (progn
-                      (format t "[KERNEL ~a] 4b.1 run-optimization-pipeline on E/G/H block~%" name)
-                      (stmt-ir:run-optimization-pipeline
-                       pass-counter pipeline hess-block
-                       :name (the-name "e-g-hess")
-                       :log-stream *trace-output*))
+                    (stmt-ir:run-optimization-pipeline
+                     pass-counter pipeline hess-block
+                     :name (the-name "e-g-hess")
+                     :log-stream *trace-output*)
                   (declare (ignore results total-before total-after))
                   (setf current-stmts
-                        (copy-list (stmt-ir:block-statements hess-opt)))))))
-
-          ;; 5. Coordinate loads + EG/H transform + optional post-EG/H clean-up
-          (let* ((core-block
-                   (progn
-                     (format t "[KERNEL ~a] 5. finalize CORE-BLOCK from optimized current-stmts~%" name)
+                        (copy-list (stmt-ir:block-statements hess-opt))))))
+            ;; Trace which Hessian scalars survived the pipeline, before EG/H lowering.
+            (let* ((assign-targets (loop for st in current-stmts
+                                         when (typep st 'stmt-ir:assignment-statement)
+                                           collect (stmt-ir:stmt-target-name st)))
+                   (h-targets (remove-if-not (lambda (sym)
+                                               (and (symbolp sym)
+                                                    (let ((s (symbol-name sym)))
+                                                      (and (>= (length s) 2)
+                                                           (string= (subseq s 0 2) "H_")))))
+                                             assign-targets)))
+              (format t "[make-kernel-from-block/~a] pre-transform Hessians (~d): ~s~%"
+                      name (length h-targets) h-targets)
+              (when compute-hess
+                (let* ((missing (set-difference h-targets-pre h-targets :test #'eq)))
+                  (format t "[make-kernel-from-block/~a] Hessians dropped by pipeline (~d): ~s~%"
+                          name (length missing) missing))))
+            (let* ((core-block
                      (let ((blk (stmt-ir:make-block-stmt current-stmts)))
-                       ;; Catch any use-before-def issues even when no pipeline runs.
                        (stmt-ir:check-def-before-use-in-block blk :errorp t)
-                       blk)))
-                 (block-with-coords
-                   (if coord-load-stmts
-                       (progn
-                         (format t "[KERNEL ~a] 6. wrap CORE-BLOCK with coordinate loads -> BLOCK-WITH-COORDS~%" name)
-                         (stmt-ir:debug-block core-block :label "core-block at step 6")
+                       blk))
+                   (block-with-coords
+                     (if coord-load-stmts
                          (stmt-ir:make-block-stmt
-                          (append coord-load-stmts (list core-block))))
-                       core-block))
-                 ;; expands ACCUMULATE-HERE into *Energy/Force/Hessian acc macros
-                 (eg-h-block
-                   (progn
-                     (format t "[KERNEL ~a] 7. transform BLOCK-WITH-COORDS -> EG-H-BLOCK via transform-eg-h-block~%" name)
+                          (append coord-load-stmts (list core-block)))
+                         core-block))
+                   (eg-h-block
                      (transform-eg-h-block
                       block-with-coords layout coord-vars
-                      #'general-grad-name #'general-hess-name)))
-                 (eg-h-block*
-                   (if post-eg-h-pipeline*
-                       (multiple-value-bind (post-block results total-before total-after)
-                           (progn
-                             (format t "[KERNEL ~a] 8. run post-EG/H pipeline on EG-H-BLOCK~%" name)
+                      #'general-grad-name #'general-hess-name))
+                   (eg-h-block*
+                     (if post-eg-h-pipeline*
+                         (multiple-value-bind (post-block results total-before total-after)
                              (stmt-ir:run-optimization-pipeline
                               pass-counter post-eg-h-pipeline* eg-h-block
                               :name (the-name "post-eg-h")
-                              :log-stream *trace-output*))
-                         (declare (ignore results total-before total-after))
-                         post-block)
-                       eg-h-block)))
-            ;; 6. Construct kernel IR object
-            (make-kernel-ir
-             :name name
-             :layout layout
-             :coord-vars coord-vars
-             :coord-load-stmts coord-load-stmts
-             :params params
-             :core-block core-block
-             :eg-h-block eg-h-block*
-             :compute-energy-p compute-energy
-             :compute-grad-p   compute-grad
-             :compute-hess-p   compute-hess
-             :manual-deriv-spec manual-deriv-spec
-             :pipeline pipeline
-             :extra-equivalence-rules extra-equivalence-rules
-             :extra-optimization-rules extra-optimization-rules
-             :return-type return-type
-             :return-expr return-expr)))))))
+                              :log-stream *trace-output*)
+                           (declare (ignore results total-before total-after))
+                           post-block)
+                         eg-h-block)))
+              (make-kernel-ir
+               :group group
+               :name name
+               :layout layout
+               :coord-vars coord-vars
+               :coord-load-stmts coord-load-stmts
+               :params params
+               :core-block core-block
+               :eg-h-block eg-h-block*
+               :compute-energy-p compute-energy
+               :compute-grad-p   compute-grad
+               :compute-hess-p   compute-hess
+               :manual-deriv-spec manual-deriv-spec
+               :pipeline pipeline
+               :extra-equivalence-rules extra-equivalence-rules
+               :extra-optimization-rules extra-optimization-rules
+               :return-type return-type
+               :return-expr return-expr))))))))
 
 
 ;;; ------------------------------------------------------------
@@ -1533,6 +1818,7 @@ inside BLOCK into explicit derivative assignments."
                 (coord-load-stmts ,coord-load)
                 (base-block ,body-form))
            (make-kernel-from-block
+            :group ,c-function-name
             :name ',(format nil "~a_~a" c-function-name (string-downcase compute-mode))
             :pipeline ,pipeline
             :layout layout
@@ -1541,6 +1827,7 @@ inside BLOCK into explicit derivative assignments."
             :base-block base-block
             :params ',params
             :compute-energy t
+            :compute-mode ',compute-mode
             :compute-grad ,want-grad
             :compute-hess ,want-hess
             :derivatives ',deriv-spec

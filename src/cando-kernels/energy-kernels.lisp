@@ -4,6 +4,11 @@
 
 (in-package :mathkernel-user)
 
+;;; Run all the tests
+(stmt-ir.tests:run-all)
+
+
+
 (defparameter *pipeline*
   (stmt-ir:make-optimization-pipeline
    :name :kernel-full
@@ -247,7 +252,7 @@
 
 
 
-(build-multiple-kernels (kernels "nonbond" (:energy :gradient :hessian))
+(build-multiple-kernels (kernels "nonbond" (:gradient :energy :hessian))
   (:pipeline *pipeline*)
   (:params ((double A)  ;; LJ A coefficient  (A / r^12)
             (double B)  ;; LJ B coefficient  (B / r^6)
@@ -342,15 +347,18 @@
 
 
 
-(build-multiple-kernels (kernels "nonbond_dd_cutoff" (:energy :gradient :hessian))
+(build-multiple-kernels (kernels "nonbond_dd_cutoff" (:gradient :energy :hessian))
   (:pipeline *pipeline*)
 
-  (:params ((double A)        ;; LJ A coefficient  (A / r^12)
-            (double B)        ;; LJ B coefficient  (B / r^6)
-            (double qq)       ;; Coulomb prefactor
-            (double dd)       ;; epsilon(r) = dd*r
-            (double r_switch) ;; switching start
-            (double r_cut)    ;; cutoff
+  (:params ((double A)         ;; LJ A coefficient  (A / r^12)
+            (double B)         ;; LJ B coefficient  (B / r^6)
+            (double qq)        ;; Coulomb prefactor
+            (double dd)        ;; epsilon(r) = dd*r
+            (double r_switch)  ;; switching start
+            (double r_switch2) ;; switching start squared
+            (double r_cut)     ;; cutoff
+            (double r_cut2)    ;; cutoff^2
+            (double inv_range) ;; 1.0/(r_cur - r_switch)
             (size_t i3x1)
             (size_t i3x2)
             (double* position)
@@ -373,68 +381,94 @@
 
   (:body
    (stmt-block
-     ;; geometry
      (=. dx "x1 - x2")
      (=. dy "y1 - y2")
      (=. dz "z1 - z2")
      (=. r2 "dx*dx + dy*dy + dz*dz")
-     (=. r  "sqrt(r2)")
-
-     ;; outer cutoff: only do work if r < r_cut
      (stmt-ir:make-if-stmt
-      (expr-ir:parse-expr "r < r_cut")
+      (expr-ir:parse-expr "r2 < r_cut2")
       (stmt-block
-        ;; channel work (invr, invr2, invr6, e_lj, e_coul, e_base)
-        (=. invr  "r^-1")
+        (=. invr  "r2^-0.5")            ; one pow/sqrt
+        (=. r     "r2*invr")            ; reuse, no extra sqrt
         (=. invr2 "invr*invr")
         (=. invr3 "invr*invr2")
+        (=. invr4 "invr2*invr2")
         (=. invr6 "invr2*invr2*invr2")
         (=. e_lj   "A*invr6*invr6 - B*invr6")
         (=. e_coul "qq*invr2/dd")
         (=. e_base "e_lj + e_coul")
-
-        ;; base radial derivatives via AD
-        (D! e_base r)
-        (D! de_base_dr r)
-
-        ;; inner piecewise structure as before:
+        ;; base radial derivatives
+        (=. dE_base_dr   "(-12.0*A*invr6*invr6*invr) + (6.0*B*invr6*invr) + (-2.0*qq*invr3/dd)"
+            :modes (:gradient :hessian))
+        (=. d2E_base_dr2 "(156.0*A*invr6*invr6*invr2) + (-42.0*B*invr6*invr2) + (6.0*qq*invr4/dd)"
+            :modes (:hessian))
         (stmt-ir:make-if-stmt
-         (expr-ir:parse-expr "r < r_switch")
+         (expr-ir:parse-expr "r2 < r_switch2")
          (stmt-block
-           (=. energy  "e_base")
-           (=. dE_dr   "de_base_dr")
-           (=. d2E_dr2 "dde_base_dr_dr"))
+           (=. energy "e_base")
+           (=. dE_dr   "dE_base_dr" :modes (:gradient :hessian))
+           (=. d2E_dr2 "d2E_base_dr2" :modes (:hessian)))
          (stmt-block
-           ;; smoothing region
-           (=. drs       "r - r_switch")
-           (=. inv_range "1.0 / (r_cut - r_switch)")
+           (=. drs "r - r_switch")
            (=. t  "drs*inv_range")
            (=. t2 "t*t")
            (=. t3 "t2*t")
            (=. t4 "t2*t2")
            (=. t5 "t3*t2")
-           ;; S(t) = 1 - 10 t^3 + 15 t^4 - 6 t^5
            (=. s "1.0 - 10.0*t3 + 15.0*t4 - 6.0*t5")
-           ;; dS/dt, d²S/dt²
-           (=. ds_dt   "-30.0*t2 + 60.0*t3 - 30.0*t4")
-           (=. d2s_dt2 "-60.0*t + 180.0*t2 - 120.0*t3")
-           ;; dS/dr, d²S/dr²
-           (=. ds_dr   "ds_dt*inv_range")
-           (=. d2s_dr2 "d2s_dt2*inv_range*inv_range")
-
-           ;; E(r) = S(r)*E_base(r)
+           (=. ds_dt "(-30.0*t2 + 60.0*t3 - 30.0*t4)" :modes (:gradient :hessian))
+           (=. d2s_dt2 "(-60.0*t + 180.0*t2 - 120.0*t3)" :modes (:hessian))
+           (=. ds_dr "ds_dt*inv_range" :modes (:gradient :hessian))
+           (=. d2s_dr2 "d2s_dt2*inv_range*inv_range" :modes (:hessian))
            (=. energy "s*e_base")
+           (=. dE_dr   "(s*dE_base_dr) + (ds_dr*e_base)" :modes (:gradient :hessian))
+           (=. d2E_dr2 "(s*d2E_base_dr2) + (2.0*ds_dr*dE_base_dr) + (d2s_dr2*e_base)" :modes (:hessian)))))))
 
-           ;; dE/dr   = S'*E_base + S*dE_base/dr
-           ;; d²E/dr² = S''*E_base + 2*S'*dE_base/dr + S*d2E_base/dr2
-           (=. dE_dr   "ds_dr*e_base + s*dE_base_dr")
-           (=. d2E_dr2 "d2s_dr2*e_base + 2.0*ds_dr*dE_base_dr + s*ddE_base_dr_dr"))
-         )
-        (ACCUMULATE-HERE)
-        )
-      ;; else-branch: optionally nothing
-      )
-     ))
+
+
+   #+(or)(stmt-block
+           ;; geometry
+           (=. dx "x1 - x2")
+           (=. dy "y1 - y2")
+           (=. dz "z1 - z2")
+           (=. r2 "dx*dx + dy*dy + dz*dz")
+
+           (stmt-ir:make-if-stmt
+            (expr-ir:parse-expr "r2 < r_cut2")
+            (stmt-block
+              ;; base pieces
+              (=. r "r2^(1/2)")
+              (=. invr  "r^-1")
+              (=. invr2 "invr*invr")
+              (=. invr3 "invr*invr2")
+              (=. invr6 "invr2*invr2*invr2")
+              (=. e_lj   "A*invr6*invr6 - B*invr6")
+              (=. e_coul "qq*invr2/dd")
+              (=. e_base "e_lj + e_coul")
+
+              (stmt-ir:make-if-stmt
+               (expr-ir:parse-expr "r2 < r_switch2")
+               (stmt-block
+                 (=. energy "e_base"))
+               (stmt-block
+                 (=. drs       "r - r_switch")
+                 (=. inv_range "1.0 / (r_cut - r_switch)")
+                 (=. t  "drs*inv_range")
+                 (=. t2 "t*t")
+                 (=. t3 "t2*t")
+                 (=. t4 "t2*t2")
+                 (=. t5 "t3*t2")
+                 ;; S(t) = 1 - 10 t^3 + 15 t^4 - 6 t^5
+                 (=. s "1.0 - 10.0*t3 + 15.0*t4 - 6.0*t5")
+                 ;; dS/dt, d²S/dt²
+                 #+(or)(=. ds_dt   "-30.0*t2 + 60.0*t3 - 30.0*t4" :modes (:gradient :hessian))
+                 #+(or)(=. d2s_dt2 "-60.0*t + 180.0*t2 - 120.0*t3" :modes (:hessian))
+                 ;; dS/dr, d²S/dr²
+                 #+(or)(=. ds_dr   "ds_dt*inv_range" :modes (:gradient :hessian))
+                 #+(or)(=. d2s_dr2 "d2s_dt2*inv_range*inv_range" :modes (:hessian))
+
+                 ;; E(r) = S(r)*E_base(r)
+                 (=. energy "s*e_base")))))))
 
   (:derivatives
    (:mode :manual
@@ -594,7 +628,7 @@
      (=. ENERGY "K * (CO + Q)^3")
 
      ;; Accumulate E/G/H at this point
-     (accumulate-here))))
+     )))
 
 
 (build-multiple-kernels (kernels "anchor" (:energy :gradient :hessian))
@@ -612,7 +646,7 @@
      (=. dz "z1 - za")
      (=. r2 "dx*dx + dy*dy + dz*dz")
      (=. energy "ka * r2")
-     (accumulate-here)))
+     ))
   (:params ((double ka)
             (double xa)
             (double ya)
@@ -761,7 +795,12 @@
      ;; Harmonic restraint energy
      (=. ENERGY "kdh*deltaPhiModFn*deltaPhiModFn")
 
-     (accumulate-here))))
+     )))
 
 (write-all kernels)
 
+(mathkernel:emit-c-tests (last kernels 3)
+                         "/home/meister/Development/cando/extensions/cando/include/cando/chem/energyKernels/"
+                         "~/tmp/tests/position.c"
+                         "~/tmp/tests/calls.c"
+                         "~/tmp/tests/all-tests.c")

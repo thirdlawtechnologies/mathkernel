@@ -47,6 +47,7 @@
                  test-deriv-two-step-chain
                  test-deriv-assignments-generation
                  test-deriv-env-ignores-non-assignments
+                 test-energy-only-strips-derivative-requests
                  test-c-function-container-and-deriv
                  test-simplify-block-basic
 
@@ -233,6 +234,49 @@
                              (sexpr-alpha-equal sexpr expected2))
                          'test-deriv-assignments-generation
                          "dbar_dx unexpected shape: ~S" sexpr)))))))
+
+(deftest test-energy-only-strips-derivative-requests
+  "Energy-only kernels should drop derivative requests instead of expanding them."
+  (let* ((req (stmt-ir:make-derivative-request-stmt 'u 'x))
+         (block (make-block-stmt (list req)))
+         (stripped (mathkernel::remove-derivative-requests block)))
+    (assert-true (null (block-statements stripped))
+                 'test-energy-only-strips-derivative-requests
+                 "derivative request was not removed in energy-only mode"))
+  ;; Also drop any assignments whose targets match derivative names introduced
+  ;; by the requests we removed.
+  (let* ((req (stmt-ir:make-derivative-request-stmt 'foo 'x))
+         (dname (stmt-ir:make-derivative-name 'foo 'x))
+         (assign (make-assignment-stmt dname (make-expr-const 0)))
+         (block (make-block-stmt (list req assign)))
+         (stripped (mathkernel::remove-derivative-requests block)))
+    (assert-true (null (block-statements stripped))
+                 'test-energy-only-strips-derivative-requests
+                 "derivative assignment was not stripped in energy-only mode"))
+  ;; And drop assignments that *use* derivative variables from requests.
+  (let* ((req (stmt-ir:make-derivative-request-stmt 'foo 'x))
+         (dname (stmt-ir:make-derivative-name 'foo 'x))
+         (assign (make-assignment-stmt 'bar (make-expr-var dname)))
+         (block (make-block-stmt (list req assign)))
+         (stripped (mathkernel::remove-derivative-requests block)))
+    (assert-true (null (block-statements stripped))
+                 'test-energy-only-strips-derivative-requests
+                 "assignment using derivative variable was not stripped"))
+  ;; Drop dead assignments chained only into derivative vars.
+  (let* ((req (stmt-ir:make-derivative-request-stmt 'foo 'x))
+         (dname (stmt-ir:make-derivative-name 'foo 'x))
+         (assign1 (make-assignment-stmt 'tmp (make-expr-const 1)))
+         (assign2 (make-assignment-stmt dname (make-expr-var 'tmp)))
+         (block (make-block-stmt (list req assign1 assign2)))
+         (stripped (mathkernel::remove-derivative-requests block)))
+    ;; Only the non-derivative assignment should remain.
+    (assert-true (= (length (block-statements stripped)) 1)
+                 'test-energy-only-strips-derivative-requests
+                 "expected non-derivative assignment to remain after stripping")
+    (assert-true (string= (symbol-name (stmt-target-name (first (block-statements stripped))))
+                          "TMP")
+                 'test-energy-only-strips-derivative-requests
+                 "remaining assignment target not TMP")))
 
 ;;; ----------------------------------------------------------------------
 ;;; 4. Derivative logic should ignore non-assignment statements at the

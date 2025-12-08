@@ -19,4 +19,6 @@
                                            (:file "statement-diff")
                                            (:file "energy-blocks")
                                            (:file "kernel-dsl")
-                                           (:file "statement-tests")))))))
+                                           (:file "statement-tests")
+                                           (:file "kernel-compare")
+                                           ))))))
