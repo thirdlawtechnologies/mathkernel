@@ -195,12 +195,13 @@
    #:factor-temp-param-products-optimization
    #:normalize-signs-optimization
    #:make-optimization-pipeline
-   #:make-optimization
-   #:run-optimization-pipeline
-   #:make-pass-id-counter
-   #:make-derivative-request-stmt
-   #:derivative-request-statement
-   #:dr-target-var
+  #:make-optimization
+  #:run-optimization-pipeline
+  #:make-pass-id-counter
+  #:reorder-block-def-before-use
+  #:make-derivative-request-stmt
+  #:derivative-request-statement
+  #:dr-target-var
    #:dr-base-var
    #:make-derivative-name
    #:sexpr-size
@@ -216,7 +217,10 @@
   #:emit-compare-preamble
   #:emit-kernel-test-c
   #:emit-main-for-tests
-  #:write-kernel-compare-harness))
+  #:write-kernel-compare-harness
+  #:raw-c-generator
+  #:make-anchored-assignment-stmt
+  #:anchored-assignment-statement))
 
 (defpackage :stmt-ir.tests
   (:use :cl :expr-ir :stmt-ir)
@@ -240,6 +244,9 @@
    #:write-c-code
    #:*post-eg-h-pipeline*
    #:write-all
+   #:numeric-gradient!
+   #:numeric-hessian!
+   #:numeric-force-and-hessian!
    #:define-multiple-kernels
    #:push-kernel
    #:build-multiple-kernels

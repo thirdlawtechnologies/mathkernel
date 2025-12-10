@@ -20,6 +20,17 @@
     Statements define sequencing and control flow and *contain* expression
     IR nodes from the :expr-ir layer where needed (RHS, conditions, indices)."))
 
+;;; ------------------------------------------------------------
+;;; Statements that carry a single expression
+;;; ------------------------------------------------------------
+
+(defclass expression-statement (statement)
+  ((expression
+    :initarg :expression
+    :accessor stmt-expression
+    :documentation "Expression IR node associated with this statement."))
+  (:documentation "Base class for statements that carry exactly one expression."))
+
 ;; ----------------------------------------------------------------------
 ;;; Assignment statements
 ;;; ----------------------------------------------------------------------
@@ -32,7 +43,7 @@
 ;;;   NAME = 'grad, INDICES = (i-expr)  ->  grad[i]
 ;;;   NAME = 'hess, INDICES = (i j)     ->  hess[i][j]
 
-(defclass assignment-statement (statement)
+(defclass assignment-statement (expression-statement)
   ((target-name
     :initarg :target-name
     :accessor stmt-target-name
@@ -44,29 +55,46 @@
     :accessor stmt-target-indices
     :documentation
     "List of index expressions (expression IR nodes) for array subscripts.
-     NIL means scalar variable (no indices).")
-   (expression
-    :initarg :expression
-    :accessor stmt-expression
-    :documentation
-    "Right-hand side expression (expression IR node)."))
+     NIL means scalar variable (no indices)."))
   (:documentation
    "Assignment: target = expression;
     The actual C LHS rendering is defined in the code generator using
     TARGET-NAME and TARGET-INDICES."))
 
-(defmethod print-object ((obj assignment-statement) stream)
-  (print-unreadable-object (obj stream :type t)
-    (format stream "~s := ~s" (stmt-target-name obj) (stmt-expression obj))))
+(defun anchored-target-name-p (target-name)
+  "Return T if TARGET-NAME is a gradient/Hessian variable (G_/H_*)."
+  (let* ((target-str (symbol-name target-name))
+         (len (length target-str)))
+    (and (>= len 2)
+         (or (string= target-str "H_" :end1 2)
+             (string= target-str "G_" :end1 2)))))
 
 (defun make-assignment-stmt (target-name expression &optional target-indices)
-  "Convenience constructor for an assignment-statement."
-  (let ((target-name (expr-ir:ev target-name)))
-    (make-instance 'assignment-statement
+  "Convenience constructor for a normal assignment-statement."
+  (let* ((target-name (expr-ir:ev target-name))
+         (class (if (anchored-target-name-p target-name)
+                    'anchored-assignment-statement
+                    'assignment-statement)))
+    (make-instance class
                    :target-name target-name
                    :target-indices target-indices
                    :expression expression)))
 
+(defclass anchored-assignment-statement (assignment-statement)
+  ()
+  (:documentation "Assignment whose target name must not be altered/aliased."))
+
+(defun make-anchored-assignment-stmt (target-name expression &optional target-indices)
+  "Constructor for an anchored-assignment-statement (target must not be aliased)."
+  (let ((target-name (expr-ir:ev target-name)))
+    (make-instance 'anchored-assignment-statement
+                   :target-name target-name
+                   :target-indices target-indices
+                   :expression expression)))
+
+(defmethod print-object ((obj assignment-statement) stream)
+  (print-unreadable-object (obj stream :type t)
+    (format stream "~s := ~s" (stmt-target-name obj) (stmt-expression obj))))
 ;;; ----------------------------------------------------------------------
 ;;; Raw C statement
 ;;; ----------------------------------------------------------------------
@@ -76,25 +104,49 @@
 ;;;   - #include (if you choose to allow it here)
 ;;;   - hand-written snippets
 
-(defclass raw-c-statement (statement)
-  ((text
-    :initarg :text
-    :accessor raw-c-text
-    :type string
+(defclass raw-c-statement (expression-statement)
+  ((generator
+    :initarg :generator
+    :accessor raw-c-generator
     :documentation
-    "Literal C code for this statement. Emitted as-is (with a newline
-     or semicolon added by the emitter as appropriate)."))
+    "Either a function of one argument (a C-expression string) that returns
+     C source text, or a literal string for legacy/expr-less use."))
   (:documentation
-   "Opaque raw C statement. Used when code is easier to write directly
-    than to express through the structured IR."))
+   "Raw C statement with an optional associated expression. If EXPRESSION is
+    non-NIL, the C emitter formats it and passes the string to GENERATOR to
+    obtain the final C text."))
 
 (defmethod print-object ((obj raw-c-statement) stream)
   (print-unreadable-object (obj stream :type t)
-    (format stream "~a" (raw-c-text obj))))
+    (let* ((gen   (raw-c-generator obj))
+           (expr  (stmt-expression obj))
+           (c-expr (and expr (expr-ir:expr->c-expr-string expr)))
+           (preview (etypecase gen
+                      (function (handler-case 
+                                  (funcall gen c-expr)
+                                  (error (ee) "#<raw-c fn>"))
+                                )
+                      (t gen))))
+      (format stream "~a" preview))))
 
-(defun make-raw-c-statement (text)
-  "Convenience constructor for raw-c-statement."
-  (make-instance 'raw-c-statement :text text))
+(defun make-raw-c-statement (generator &optional expression)
+  "Convenience constructor for raw-c-statement.
+
+GENERATOR may be:
+  - a function of one argument (formatted C expr) → returns C text
+  - a literal string (legacy)
+EXPRESSION, if non-NIL, is an EXPR-IR node that will be rewritten by
+optimizations; when emitting C, it is formatted and passed to GENERATOR."
+  (when (and expression (stringp generator))
+    (error "make-raw-c-statement: provide a function generator when using an expression"))
+  (let ((expr (cond
+                ((null expression) nil)
+                ((symbolp expression) (expr-ir:make-expr-var expression))
+                ((typep expression 'expr-ir:numeric-expression) expression)
+                (t (error "make-raw-c-statement: unknown expression type ~S" expression)))))
+    (make-instance 'raw-c-statement
+                   :generator generator
+                   :expression expr)))
 
 (defmacro raw-c (text)
   "Insert a RAW-C-STATEMENT into a stmt-block.
@@ -237,8 +289,15 @@ just before the closing brace."))
 (defun simplify-statement (stmt)
   "Return a simplified copy of STMT, with all expression IR children
 passed through EXPR-IR:SIMPLIFY-EXPR."
-  (typecase stmt
+  (etypecase stmt
     ;; Assignment: simplify RHS and indices
+    (anchored-assignment-statement
+     (let* ((name    (stmt-target-name stmt))
+            (indices (stmt-target-indices stmt))
+            (rhs     (stmt-expression stmt))
+            (s-indices (mapcar #'expr-ir:simplify-expr indices))
+            (s-rhs     (expr-ir:simplify-expr rhs)))
+       (make-anchored-assignment-stmt name s-rhs s-indices)))
     (assignment-statement
      (let* ((name    (stmt-target-name stmt))
             (indices (stmt-target-indices stmt))
@@ -313,7 +372,7 @@ to *TRACE-OUTPUT* so it plays nicely with your existing tracing."
   (flet ((indent! ()
            (dotimes (i indent)
              (write-char #\Space stream))))
-    (typecase stmt
+    (etypecase stmt
       (block-statement
        (indent!) (format stream "{~%")
        (dolist (s (block-statements stmt))
@@ -383,7 +442,7 @@ This ignores non-temp variables (E, G_X1, X1, etc.)."
                           label v))))
              (rec-block (blk)
                (dolist (cycle (block-statements blk))
-                 (typecase cycle
+                 (etypecase cycle
                    (assignment-statement
                     (check-expr (stmt-expression cycle))
                     (let ((tgt (stmt-target-name cycle)))
@@ -423,7 +482,7 @@ Each statement is numbered. For each assignment we show:
              (rec-block (blk)
                (dolist (cycle (block-statements blk))
                  (incf idx)
-                 (typecase cycle
+                 (etypecase cycle
                    (assignment-statement
                     (let* ((tgt (stmt-target-name cycle))
                            (expr (stmt-expression cycle))
@@ -486,7 +545,11 @@ that are also assignment targets in the same run."
 
 ;;;; Low-level: check a list of assignment statements
 
-(defun check-assignment-run-def-before-use (stmts &key (errorp t) (already-defined nil))
+(defun check-assignment-run-def-before-use (stmts
+                                     &key
+                                       (errorp t)
+                                       (already-defined nil)
+                                       (all-defs nil))
   "Check that within the list of ASSIGNMENT-STATEMENTs STMTS, every
 statement only uses variables (that are also assigned in STMTS) after
 those variables' own assignments.
@@ -503,6 +566,7 @@ ALREADY-DEFINED and all targets in STMTS)."
                    if (typep st 'assignment-statement)
                      collect (stmt-target-name st))))
     (let* ((defs    (collect-defs stmts))
+           (all-defs (or all-defs defs))
            (defined (copy-list already-defined)))
       (dolist (st stmts (values t defined))
         (when (typep st 'assignment-statement)
@@ -510,7 +574,7 @@ ALREADY-DEFINED and all targets in STMTS)."
                  (used (vars-used-in-expr-via-sexpr expr)))
             ;; check each used var
             (dolist (v used)
-              (when (and (member v defs :test #'eq)
+              (when (and (member v all-defs :test #'eq)
                          (not (member v defined :test #'eq)))
                 (if errorp
                     (error "Assignment order violation: variable ~S~% used before its definition in statement ~S."
@@ -522,7 +586,7 @@ ALREADY-DEFINED and all targets in STMTS)."
 
 ;;;; Block-level: recursively check blocks and if-statements
 
-(defun check-def-before-use-in-block (block &key (errorp t))
+(defun check-def-before-use-in-block (block &key (errorp t) (already-defined '()))
   "Check that within BLOCK (a BLOCK-STATEMENT), all assignment statements
 are ordered so that any variable whose value is assigned in a given
 'run' (between barriers) is never used in an assignment in that run
@@ -535,67 +599,74 @@ non-barrier statements remain in place and are ignored for ordering.
 Signals ERROR on violation if ERRORP is true. Returns T if all is OK,
 or NIL if a violation is found and ERRORP is NIL."
   (declare (optimize (debug 3)))
-  (labels
-      ((assignment-p (st)
-         (typep st 'assignment-statement))
+  (let ((all-defs (collect-scalar-targets-in-block block)))
+    (labels
+        ((assignment-p (st)
+           (typep st 'assignment-statement))
 
-       (barrier-p (st)
-         (typecase st
-           (if-statement   t)
-           (block-statement t)
-           (t nil)))
+         (barrier-p (st)
+           (etypecase st
+             (if-statement   t)
+             (block-statement t)
+             (t nil)))
 
-       ;; recurse into nested statements
-       (check-stmt (st defined)
-         (typecase st
-           (block-statement
-            (check-stmt-list (block-statements st) defined))
-           (if-statement
-            (progn
-              (when (if-then-block st)
-                (check-stmt-list (block-statements (if-then-block st)) defined))
-              (when (if-else-block st)
-                (check-stmt-list (block-statements (if-else-block st)) defined))))
-           ;; non-barriers do not change what is considered defined
-           (t
-            defined)))
+         ;; recurse into nested statements
+         (check-stmt (st defined)
+           (etypecase st
+             (block-statement
+              (check-stmt-list (block-statements st) defined))
+             (if-statement
+              ;; track definitions that are valid after both branches
+              (let* ((d1 (if (if-then-block st)
+                             (check-stmt-list (block-statements (if-then-block st))
+                                              defined)
+                             defined))
+                     (d2 (if (if-else-block st)
+                             (check-stmt-list (block-statements (if-else-block st))
+                                              defined)
+                             defined)))
+                (intersection d1 d2 :test #'eq)))
+             ;; non-barriers do not change what is considered defined
+             (t
+              defined)))
 
-       (check-run (run defined)
-         "RUN is a list of statements in program order with no barriers.
+         (check-run (run defined)
+           "RUN is a list of statements in program order with no barriers.
 We extract the assignment statements from RUN and verify def-before-use
-among them only."
-         (let ((assignments (remove-if-not #'assignment-p run)))
-           (if assignments
-               (multiple-value-bind (_ok new-defined)
-                   (check-assignment-run-def-before-use assignments
-                                                        :errorp errorp
-                                                        :already-defined defined)
-                 (declare (ignore _ok))
-                 new-defined)
-               defined)))
+against assignments anywhere in the enclosing BLOCK."
+           (let ((assignments (remove-if-not #'assignment-p run)))
+             (if assignments
+                 (multiple-value-bind (_ok new-defined)
+                     (check-assignment-run-def-before-use assignments
+                                                          :errorp errorp
+                                                          :already-defined defined
+                                                          :all-defs all-defs)
+                   (declare (ignore _ok))
+                   new-defined)
+                 defined)))
 
-       (check-stmt-list (stmts defined)
-         (labels ((flush-run (run defined)
-                    (if run
-                        (check-run (nreverse run) defined)
-                        defined)))
-           (let ((run '())
-                 (cur-defined defined))
-             (dolist (st stmts cur-defined)
-               (if (barrier-p st)
-                   (progn
-                     ;; finish current run, then recurse into the barrier node
-                     (setf cur-defined (flush-run run cur-defined))
-                     (setf run '())
-                     (setf cur-defined (check-stmt st cur-defined)))
-                   ;; non-barrier, part of the current run
-                   (push st run)))
-             ;; flush trailing run
-             (setf cur-defined (flush-run run cur-defined))
-             cur-defined))))
-    ;; Only intended for top-level blocks; initial defined set is empty.
-    (check-stmt-list (block-statements block) nil)
-    t))
+         (check-stmt-list (stmts defined)
+           (labels ((flush-run (run defined)
+                      (if run
+                          (check-run (nreverse run) defined)
+                          defined)))
+             (let ((run '())
+                   (cur-defined defined))
+               (dolist (st stmts cur-defined)
+                 (if (barrier-p st)
+                     (progn
+                       ;; finish current run, then recurse into the barrier node
+                       (setf cur-defined (flush-run run cur-defined))
+                       (setf run '())
+                       (setf cur-defined (check-stmt st cur-defined)))
+                     ;; non-barrier, part of the current run
+                     (push st run)))
+               ;; flush trailing run
+               (setf cur-defined (flush-run run cur-defined))
+               cur-defined))))
+      ;; Only intended for top-level blocks; initial defined set starts from ALREADY-DEFINED.
+      (check-stmt-list (block-statements block) already-defined)
+      t)))
 
 
 
@@ -685,7 +756,7 @@ around them may be reordered as needed to satisfy def-before-use."
   (labels
       ;; recurse into a single statement
       ((reorder-stmt (st)
-         (typecase st
+         (etypecase st
            (assignment-statement
             st)
            (block-statement
@@ -709,7 +780,7 @@ around them may be reordered as needed to satisfy def-before-use."
 
        ;; a barrier is something we must not reorder across
        (barrier-p (st)
-         (typecase st
+         (etypecase st
            (if-statement t)
            (block-statement t)
            (t nil)))
@@ -750,9 +821,9 @@ around them may be reordered as needed to satisfy def-before-use."
        (reorder-stmt-list (stmts)
          (labels ((flush-run (run acc)
                     (if run
-                        (nconc acc (reorder-run run))
+                        ;; RUN is collected in reverse via PUSH; restore order first.
+                        (nconc acc (reorder-run (nreverse run)))
                         acc)))
-           stmts
            (let ((acc '())
                  (run '()))
              (dolist (st stmts)
@@ -762,18 +833,13 @@ around them may be reordered as needed to satisfy def-before-use."
                      (setf acc (flush-run run acc)
                            run '())
                      (let ((reordered (reorder-stmt st)))
-                       (push reordered acc)))
+                       (setf acc (nconc acc (list reordered)))))
                    ;; st is not a barrier: include it in the current run
                    (push st run)))
              ;; flush final run if there is one
-             (setf acc (flush-run run acc))
-             (check-assignment-run-def-before-use acc)
-             acc))))
+             (flush-run run acc)))))
     (let ((reordered-stmt-list (reorder-stmt-list (block-statements block))))
-      (let ((*print-pretty* nil))
-        (format t "input block = ~{~s~%~}~%" (block-statements block))
-        (format t "output block = ~{~s~%~}~%" reordered-stmt-list))
-      (make-block-stmt (nreverse reordered-stmt-list)))))
+      (make-block-stmt reordered-stmt-list))))
 
 ;;; ------------------------------------------------------------
 ;;; Helpers
@@ -798,6 +864,10 @@ around them may be reordered as needed to satisfy def-before-use."
 (defun %indent (n stream)
   (dotimes (_ (* 2 n)) (write-char #\Space stream)))
 
+(defun %c-type (ctype)
+  "Render a C type token in lowercase (e.g. DOUBLE -> double)."
+  (string-downcase (princ-to-string ctype)))
+
 
 ;;; ------------------------------------------------------------
 ;;; Statement / block emitters
@@ -818,7 +888,7 @@ around them may be reordered as needed to satisfy def-before-use."
     (when (and ctype (not already-declared))
       ;; declare it here
       (setf (gethash name *c-declared-locals*) t)
-      (format stream "~a " ctype))
+      (format stream "~a " (%c-type ctype)))
     ;; assignment (either \"x = ...\" or \"DOUBLE x = ...\")
     (format stream "~a = " (string-downcase (symbol-name name)))
     (format stream "~a" (expr->c-expr-string expr))
@@ -827,12 +897,17 @@ around them may be reordered as needed to satisfy def-before-use."
 
 (defun emit-statement-c (stmt indent stream)
   "Emit one statement to STREAM at INDENT (indent = logical level)."
-  (typecase stmt
+  (etypecase stmt
     (assignment-statement
      (emit-assignment-statement-c stmt indent stream))
 
     (raw-c-statement
-     (let ((code (raw-c-text stmt)))
+     (let* ((expr   (stmt-expression stmt))
+            (c-expr (and expr (expr-ir:expr->c-expr-string expr)))
+            (gen    (raw-c-generator stmt))
+            (code   (etypecase gen
+                      (function (funcall gen c-expr))
+                      (t gen))))
        (%indent indent stream)
        (format stream "~A~%" code)))
 
@@ -893,10 +968,11 @@ Return a hash-table mapping NAME -> CTYPE."
 (defun emit-c-function (fn stream)
   "Emit a C function from FN to STREAM, declaring locals at first assignment."
   (let* ((name       (c-function-name fn))
-         (ret-type   (c-function-return-type fn))  ; e.g. \"void\"
+         (ret-type   (%c-type (c-function-return-type fn)))  ; e.g. \"void\"
          (params     (c-function-parameters fn))   ; list of (ctype name)
          (locals     (c-function-locals fn))
          (body       (c-function-body fn))
+         (return-expr (c-function-return-expr fn))
          (*c-local-types*    (build-c-local-type-table locals))
          (*c-declared-locals* (make-hash-table :test #'eq)))
     ;; function header
@@ -905,10 +981,13 @@ Return a hash-table mapping NAME -> CTYPE."
           for i from 0
           do (progn
                (when (> i 0) (format stream ", "))
-               (format stream "~a ~a" ptype (string-downcase pname))))
+               (format stream "~a ~a" (%c-type ptype) (string-downcase pname))))
     (format stream ")~%{~%")
     ;; body
     (emit-statement-c body 1 stream)
+    ;; optional implicit return expression
+    (when return-expr
+      (format stream "  ~a~%" return-expr))
     (format stream "}~%")))
 
 (defun c-function->c-source-string (cfun)
@@ -961,21 +1040,22 @@ in this block."
                  (accum-sexpr (expr-ir:expr->sexpr expr) idx)))
         (loop for cycle in stmts
               for idx from 0 do
-                (typecase cycle
+                (etypecase cycle
                   (assignment-statement
                    (accum-expr (stmt-expression cycle) idx))
                   (if-statement
-                   ;; condition only; we don't try to share across branches here
+                   ;; Only consider the condition at this level; treat branches as barriers.
                    (accum-expr (if-condition cycle) idx))
                   (block-statement
-                   ;; you can recurse here if you want intra-subblock CSE
+                   ;; Treat nested block as barrier for hoisting.
                    nil)
                   (t nil))))
 
       ;; ------------------------------------------------------------
       ;; Phase 2: collect definition indices (for temps we depend on)
       ;; ------------------------------------------------------------
-      (let ((def-index (make-hash-table :test #'eq)))
+      (let ((def-index (make-hash-table :test #'eq))
+            (all-defs (collect-scalar-targets-in-block block)))
         (loop for cycle in stmts
               for idx from 0 do
                 (when (typep cycle 'assignment-statement)
@@ -1020,6 +1100,13 @@ in this block."
                        (uses    (expr-ir:expr-free-vars
                                  (expr-ir:sexpr->expr-ir sexpr)))
                        (first   (gethash sexpr first-use)) ; earliest use index of this sexpr
+                       ;; If any operand has no recorded definition in this block
+                       ;; (e.g., only inside a branch), skip hoisting here.
+                       (blocked-p (some (lambda (u)
+                                          (or (null (gethash u def-index nil))
+                                              (and (member u all-defs :test #'eq)
+                                                   (null (gethash u def-index nil)))))
+                                        uses))
                        (dep-max (if uses
                                     (loop with max-di = nil
                                           for u in uses
@@ -1032,8 +1119,9 @@ in this block."
                                     -1))
                        (min-insert (max (1+ dep-max) 0))
                        (max-allowed (or first n)))
-                  ;; Skip impossible placement (deps defined after first use).
-                  (when (<= min-insert max-allowed)
+                  ;; Skip if blocked by barrier scope or impossible placement.
+                  (when (and (not blocked-p)
+                             (<= min-insert max-allowed))
                     (let ((insert-idx (min min-insert max-allowed)))
                       (setf (gethash sexpr sexpr->temp) temp)
                       (setf (gethash temp  temp-insert) insert-idx)))))
@@ -1051,7 +1139,11 @@ in this block."
                          (expr-ir:sexpr->expr-ir
                           (rewrite-sexpr (expr-ir:expr->sexpr expr))))
                        (rewrite-stmt (cycle)
-                         (typecase cycle
+                         (etypecase cycle
+                           (anchored-assignment-statement
+                            (make-anchored-assignment-stmt
+                             (stmt-target-name cycle)
+                             (rewrite-expr (stmt-expression cycle))))
                            (assignment-statement
                             (make-assignment-stmt
                              (stmt-target-name cycle)
@@ -1109,7 +1201,7 @@ in this block."
   (labels ((rec (blk acc)
              (dolist (cycle (stmt-ir:block-statements blk) acc)
                (setf acc
-                     (typecase cycle
+                     (etypecase cycle
                        (stmt-ir:assignment-statement
                         (let ((name (stmt-ir:stmt-target-name cycle)))
                           (pushnew name acc :test #'eq)))
@@ -1137,7 +1229,7 @@ We scan BLOCK recursively."
          (max-index 0))
     (labels ((scan-block (blk)
                (dolist (cycle (block-statements blk))
-                 (typecase cycle
+                 (etypecase cycle
                    (assignment-statement
                     (let ((name (stmt-target-name cycle)))
                       (when (symbolp name)
@@ -1153,7 +1245,9 @@ We scan BLOCK recursively."
                    (if-statement
                     (scan-block (if-then-block cycle))
                     (when (if-else-block cycle)
-                      (scan-block (if-else-block cycle))))))))
+                      (scan-block (if-else-block cycle))))
+                   (raw-c-statement nil)
+                   ))))
       (scan-block block))
     max-index))
 
@@ -1212,22 +1306,16 @@ If no useful candidate is found, return BLOCK unchanged (EQ)."
                  (collect-expr (expr idx)
                    (collect-sexpr (expr-ir:expr->sexpr expr) idx))
                  (collect-stmt (cycle idx)
-                   (typecase cycle
+                   (etypecase cycle
                      (assignment-statement
-                      (collect-expr (stmt-expression cycle) idx))
+                 (collect-expr (stmt-expression cycle) idx))
                      (if-statement
-                      (collect-expr (if-condition cycle) idx)
-                      (let ((tb (if-then-block cycle))
-                            (eb (if-else-block cycle)))
-                        (when tb
-                          (dolist (sub (block-statements tb))
-                            (collect-stmt sub idx)))
-                        (when eb
-                          (dolist (sub (block-statements eb))
-                            (collect-stmt sub idx)))))
+                      ;; Do not collect product candidates from inside branches;
+                      ;; avoid hoisting across barriers.
+                      (collect-expr (if-condition cycle) idx))
                      (block-statement
-                      (dolist (sub (block-statements cycle))
-                        (collect-stmt sub idx)))
+                      ;; Skip nested blocks at this level for factoring.
+                      nil)
                      (t nil))))
           (loop for cycle in stmts
                 for idx from 0 do
@@ -1346,19 +1434,20 @@ If no useful candidate is found, return BLOCK unchanged (EQ)."
                        (temp-expr   (expr-ir:sexpr->expr-ir
                                      (cons '* best-cand)))
                        (vars-used   (expr-ir:expr-free-vars temp-expr))
-                       (dep-max
-                         (if vars-used
-                             (loop with max-di = nil
-                                   for u in vars-used
-                                   for di = (gethash u def-index nil)
-                                   when di do (setf max-di
-                                                    (if max-di
-                                                        (max max-di di)
-                                                        di))
-                                   finally (return (or max-di -1)))
-                             -1))
+                       ;; Barrier-aware: only allow temps defined within the same stmt run.
+                       (deps-defined-indices
+                         (loop for u in vars-used
+                               for di = (gethash u def-index nil)
+                               if di collect di))
+                       (dep-max (if deps-defined-indices
+                                    (reduce #'max deps-defined-indices)
+                                    -1))
                        (min-insert (max (1+ dep-max) 0))
                        (max-allowed (or best-first-use n)))
+                  ;; If any dependency has no definition in this block, do not
+                  ;; hoist across barriers; skip factoring.
+                  (when (and vars-used (null deps-defined-indices))
+                    (return-from cse-factor-products-in-block block))
                   ;; If dependencies are defined after first use, skip factoring.
                   (when (> min-insert max-allowed)
                     (return-from cse-factor-products-in-block block))
@@ -1407,28 +1496,31 @@ If no useful candidate is found, return BLOCK unchanged (EQ)."
                                   (rsexpr (rewrite-sexpr sexpr)))
                              (expr-ir:sexpr->expr-ir rsexpr)))
                          (rewrite-stmt (cycle)
-                           (typecase cycle
+                           (etypecase cycle
+                             (anchored-assignment-statement
+                              (make-anchored-assignment-stmt
+                               (stmt-target-name cycle)
+                               (rewrite-expr (stmt-expression cycle))))
                              (assignment-statement
                               (make-assignment-stmt
                                (stmt-target-name cycle)
                                (rewrite-expr (stmt-expression cycle))))
+                             (raw-c-statement
+                              (let ((expr (stmt-expression cycle)))
+                                (if expr
+                                    (make-raw-c-statement
+                                     (raw-c-generator cycle)
+                                     (rewrite-expr expr))
+                                    cycle)))
                              (if-statement
+                              ;; Do not hoist/introduce temps across branches: recurse only into condition.
                               (make-if-stmt
                                (rewrite-expr (if-condition cycle))
-                               (let ((tb (if-then-block cycle)))
-                                 (when tb
-                                   (make-block-stmt
-                                    (mapcar #'rewrite-stmt
-                                            (block-statements tb)))))
-                               (let ((eb (if-else-block cycle)))
-                                 (when eb
-                                   (make-block-stmt
-                                    (mapcar #'rewrite-stmt
-                                            (block-statements eb)))))))
+                               (if-then-block cycle)
+                               (if-else-block cycle)))
                              (block-statement
-                              (make-block-stmt
-                               (mapcar #'rewrite-stmt
-                                       (block-statements cycle))))
+                              ;; Treat nested block as barrier; leave intact.
+                              cycle)
                              (t cycle))))
                       (let ((new-stmts '()))
                         (loop for idx from 0 below n do
@@ -1574,8 +1666,8 @@ We:
            from to)))
 
        (rename-symbol-in-stmt (cycle from to)
-         (typecase cycle
-           (assignment-statement
+         (etypecase cycle
+           (anchored-assignment-statement
             (let* ((tgt      (stmt-target-name cycle))
                    (idxs     (stmt-target-indices cycle))
                    (new-tgt  (if (eq tgt from) to tgt))
@@ -1585,7 +1677,27 @@ We:
                                           idxs)))
                    (new-expr (rename-symbol-in-expr
                               (stmt-expression cycle) from to)))
+              (unless (eq new-tgt tgt)
+                (error "What do we do here - I don't think we want to change the target from ~s to ~s" tgt new-tgt))
+              (make-anchored-assignment-stmt new-tgt new-expr new-idxs)))
+           (assignment-statement
+           (let* ((tgt      (stmt-target-name cycle))
+                  (idxs     (stmt-target-indices cycle))
+                  (new-tgt  (if (eq tgt from) to tgt))
+                  (new-idxs (and idxs
+                                 (mapcar (lambda (e)
+                                           (rename-symbol-in-expr e from to))
+                                         idxs)))
+                  (new-expr (rename-symbol-in-expr
+                             (stmt-expression cycle) from to)))
               (make-assignment-stmt new-tgt new-expr new-idxs)))
+           (raw-c-statement
+            (let ((expr (stmt-expression cycle)))
+              (if expr
+                  (make-raw-c-statement
+                   (raw-c-generator cycle)
+                   (rename-symbol-in-expr expr from to))
+                  cycle)))
            (block-statement
             (make-block-stmt
              (mapcar (lambda (sub)
@@ -1642,7 +1754,16 @@ definitions visible at the join; we keep those assignments instead of
 turning them into pure env aliases."
          (let ((new-stmts '()))
            (dolist (cycle (block-statements blk))
-             (typecase cycle
+             (etypecase cycle
+               (anchored-assignment-statement
+                (let* ((target   (stmt-target-name cycle))
+                       (expr     (stmt-expression cycle))
+                       (new-expr (rewrite-expr expr env)))
+                  ;; never alias/downgrade anchored targets
+                  (remhash target env)
+                  (push (make-anchored-assignment-stmt target new-expr
+                                                       (stmt-target-indices cycle))
+                        new-stmts)))
                (assignment-statement
                 (let* ((target   (stmt-target-name cycle))
                        (expr     (stmt-expression cycle))
@@ -1696,7 +1817,7 @@ turning them into pure env aliases."
                 ;; treats the IF as a barrier for copy-propagation.
                 (let* ((cond-expr (rewrite-expr (if-condition cycle) env))
                        (then-env (copy-env-hash-table env))
-                       (else-env (copy-env-hash-table env)))
+                      (else-env (copy-env-hash-table env)))
                   (multiple-value-bind (then-block then-env-out)
                       (process-block (if-then-block cycle) then-env t)
                     (declare (ignore then-env-out))
@@ -1708,8 +1829,17 @@ turning them into pure env aliases."
                       (push (make-if-stmt cond-expr then-block else-block)
                             new-stmts)))))
 
-               (t
-                (push cycle new-stmts))))
+              (raw-c-statement
+               (let ((expr (stmt-expression cycle)))
+                 (if expr
+                     (push (make-raw-c-statement
+                            (raw-c-generator cycle)
+                            (rewrite-expr expr env))
+                           new-stmts)
+                     (push cycle new-stmts))))
+
+              (t
+               (push cycle new-stmts))))
            (values (make-block-stmt (nreverse new-stmts)) env))))
     (multiple-value-bind (new-block env)
         (process-block block (make-hash-table :test #'eq))
@@ -1775,7 +1905,21 @@ We:
            from to)))
 
        (rename-symbol-in-stmt (cycle from to)
-         (typecase cycle
+         (etypecase cycle
+           (anchored-assignment-statement
+            (let* ((tgt        (stmt-target-name cycle))
+                   (idxs       (stmt-target-indices cycle))
+                   (new-tgt    (if (eq tgt from) to tgt))
+                   (new-idxs   (and idxs
+                                    (mapcar (lambda (e)
+                                              (rename-symbol-in-expr e from to))
+                                            idxs)))
+                   (new-expr   (rename-symbol-in-expr
+                                (stmt-expression cycle) from to)))
+              (unless (eq new-tgt tgt)
+                (error "copy-propagate: refusing to retarget anchored ~S -> ~S"
+                       tgt new-tgt))
+              (make-anchored-assignment-stmt tgt new-expr new-idxs)))
            (assignment-statement
             (let* ((tgt        (stmt-target-name cycle))
                    (idxs       (stmt-target-indices cycle))
@@ -1838,7 +1982,16 @@ assignment-statement in STMTS."
          "Return (new-block new-env)."
          (let ((new-stmts '()))
            (dolist (cycle (block-statements blk))
-             (typecase cycle
+             (etypecase cycle
+               (anchored-assignment-statement
+                (let* ((target   (stmt-target-name cycle))
+                       (expr     (stmt-expression cycle))
+                       (new-expr (rewrite-expr expr env)))
+                  ;; do not alias anchored targets
+                  (remhash target env)
+                  (push (make-anchored-assignment-stmt target new-expr
+                                                       (stmt-target-indices cycle))
+                        new-stmts)))
                (assignment-statement
                 (let* ((target   (stmt-target-name cycle))
                        (expr     (stmt-expression cycle))
@@ -1918,29 +2071,41 @@ EXPR-IR:FACTOR-SUM-OF-PRODUCTS applied."
                                              :min-factors min-factors
                                              :min-size min-size))
            (rewrite-stmt (cycle)
-             (typecase cycle
-               (assignment-statement
-                (make-assignment-stmt
-                 (stmt-target-name cycle)
-                 (rewrite-expr (stmt-expression cycle))
-                 (stmt-target-indices cycle)))
-               (block-statement
-                (make-block-stmt
-                 (mapcar #'rewrite-stmt (block-statements cycle))))
-               (if-statement
-                (let* ((new-cond (rewrite-expr (if-condition cycle)))
-                       (then-b   (if-then-block cycle))
-                       (else-b   (if-else-block cycle))
-                       (new-then (when then-b
-                                   (make-block-stmt
-                                    (mapcar #'rewrite-stmt
-                                            (block-statements then-b)))))
-                       (new-else (when else-b
-                                   (make-block-stmt
-                                    (mapcar #'rewrite-stmt
-                                            (block-statements else-b))))))
-                  (make-if-stmt new-cond new-then new-else)))
-               (t cycle))))
+           (etypecase cycle
+             (anchored-assignment-statement
+              (make-anchored-assignment-stmt
+               (stmt-target-name cycle)
+               (rewrite-expr (stmt-expression cycle))
+               (stmt-target-indices cycle)))
+             (assignment-statement
+              (make-assignment-stmt
+               (stmt-target-name cycle)
+               (rewrite-expr (stmt-expression cycle))
+               (stmt-target-indices cycle)))
+             (raw-c-statement
+              (let ((expr (stmt-expression cycle)))
+                (if expr
+                    (make-raw-c-statement
+                     (raw-c-generator cycle)
+                     (rewrite-expr expr))
+                    cycle)))
+             (block-statement
+              (make-block-stmt
+               (mapcar #'rewrite-stmt (block-statements cycle))))
+             (if-statement
+              (let* ((new-cond (rewrite-expr (if-condition cycle)))
+                     (then-b   (if-then-block cycle))
+                     (else-b   (if-else-block cycle))
+                     (new-then (when then-b
+                                 (make-block-stmt
+                                  (mapcar #'rewrite-stmt
+                                          (block-statements then-b)))))
+                     (new-else (when else-b
+                                 (make-block-stmt
+                                  (mapcar #'rewrite-stmt
+                                          (block-statements else-b))))))
+                (make-if-stmt new-cond new-then new-else)))
+             (t cycle))))
     (make-block-stmt
      (mapcar #'rewrite-stmt (block-statements block)))))
 
@@ -2013,7 +2178,8 @@ Returns (values new-factors matched-p)."
   (let* ((stmts      (block-statements block))
          (n          (length stmts))
          (candidates (make-hash-table :test #'equal))
-         (def-index  (make-hash-table :test #'eq)))
+         (def-index  (make-hash-table :test #'eq))
+         (all-defs   (collect-scalar-targets-in-block block)))
     ;; record where each symbol is defined in this block
     (loop for cycle in stmts
           for idx from 0 do
@@ -2064,22 +2230,19 @@ Returns (values new-factors matched-p)."
          (collect-from-expr (expr stmt-idx)
            (walk-sexpr (expr-ir:expr->sexpr expr) stmt-idx 0))
          (collect-from-stmt (stmt stmt-idx)
-           (typecase stmt
+           (etypecase stmt
              (assignment-statement
               (collect-from-expr (stmt-expression stmt) stmt-idx))
+             (raw-c-statement
+              (let ((expr (stmt-expression stmt)))
+                (when expr
+                  (collect-from-expr expr stmt-idx))))
              (block-statement
-              (dolist (sub (block-statements stmt))
-                (collect-from-stmt sub stmt-idx)))
+              ;; avoid collecting across barrier scopes here
+              nil)
              (if-statement
-              (collect-from-expr (if-condition stmt) stmt-idx)
-              (let ((then-b (if-then-block stmt))
-                    (else-b (if-else-block stmt)))
-                (when then-b
-                  (dolist (sub (block-statements then-b))
-                    (collect-from-stmt sub stmt-idx)))
-                (when else-b
-                  (dolist (sub (block-statements else-b))
-                    (collect-from-stmt sub stmt-idx)))))
+              ;; avoid collecting across barrier scopes here
+              (collect-from-expr (if-condition stmt) stmt-idx))
              (t nil))))
       ;; walk each top-level statement
       (loop for idx from 0 below n do
@@ -2146,6 +2309,12 @@ Returns (values new-factors matched-p)."
 	                      (cons '* best-combo)))
 	     (temp-expr   (expr-ir:sexpr->expr-ir temp-sexpr))
 	     (vars-used   (expr-ir:expr-free-vars temp-expr))
+         ;; If any operand is assigned somewhere in this block but not
+         ;; defined at this level (e.g., only inside a branch), skip.
+         (blocked-p (some (lambda (u)
+                            (and (member u all-defs :test #'eq)
+                                 (null (gethash u def-index nil))))
+                          vars-used))
 	     (dep-max
 	       (if vars-used
 	           (loop with max-di = nil
@@ -2159,6 +2328,8 @@ Returns (values new-factors matched-p)."
 	           -1))
 	     (min-insert (max (1+ dep-max) 0))
 	     (max-allowed (or best-first-idx n)))
+        (when blocked-p
+          (return-from factor-temp-param-products-optimization block))
         (when (> min-insert max-allowed)
           ;; Cannot place temp before its first use; skip factoring.
           (return-from factor-temp-param-products-optimization block))
@@ -2194,7 +2365,12 @@ Returns (values new-factors matched-p)."
                      (expr-ir:sexpr->expr-ir
                       (rewrite-sexpr (expr-ir:expr->sexpr expr))))
                    (rewrite-stmt (stmt)
-                     (typecase stmt
+                     (etypecase stmt
+                       (anchored-assignment-statement
+                        (make-anchored-assignment-stmt
+                         (stmt-target-name stmt)
+                         (rewrite-expr (stmt-expression stmt))
+                         (stmt-target-indices stmt)))
                        (assignment-statement
                         (make-assignment-stmt
                          (stmt-target-name stmt)
@@ -2215,8 +2391,8 @@ Returns (values new-factors matched-p)."
                                            (make-block-stmt
                                             (mapcar #'rewrite-stmt
                                                     (block-statements else-b))))))
-                          (make-if-stmt new-cond new-then new-else)))
-                       (t stmt))))
+           (make-if-stmt new-cond new-then new-else)))
+               (t stmt))))
             (let ((new-stmts '()))
               (loop for idx from 0 below n do
                 (when (= idx insert-idx)
@@ -2232,15 +2408,27 @@ has had EXPR-IR:NORMALIZE-SIGNS-EXPR applied."
   (labels ((rewrite-expr (expr)
              (expr-ir:normalize-signs-expr expr))
            (rewrite-stmt (cycle)
-             (typecase cycle
-               (assignment-statement
-                (make-assignment-stmt
-                 (stmt-target-name cycle)
-                 (rewrite-expr (stmt-expression cycle))
-                 (stmt-target-indices cycle)))
-               (block-statement
-                (make-block-stmt
-                 (mapcar #'rewrite-stmt
+           (etypecase cycle
+             (anchored-assignment-statement
+              (make-anchored-assignment-stmt
+               (stmt-target-name cycle)
+               (rewrite-expr (stmt-expression cycle))
+               (stmt-target-indices cycle)))
+             (assignment-statement
+              (make-assignment-stmt
+               (stmt-target-name cycle)
+               (rewrite-expr (stmt-expression cycle))
+               (stmt-target-indices cycle)))
+             (raw-c-statement
+              (let ((expr (stmt-expression cycle)))
+                (if expr
+                    (make-raw-c-statement
+                     (raw-c-generator cycle)
+                     (rewrite-expr expr))
+                    cycle)))
+             (block-statement
+              (make-block-stmt
+               (mapcar #'rewrite-stmt
                          (block-statements cycle))))
                (if-statement
                 (let* ((new-cond (rewrite-expr (if-condition cycle)))
@@ -2274,7 +2462,16 @@ BLOCK is a STMT-IR:BLOCK-STATEMENT."
       ((rewrite-expr (e)
          (rewrite-expr-ir-with-rules e rules :max-iterations max-iterations))
        (rewrite-stmt (st)
-         (typecase st
+         (etypecase st
+           (stmt-ir:anchored-assignment-statement
+            (let* ((rhs (stmt-ir:stmt-expression st))
+                   (rhs2 (rewrite-expr rhs)))
+              (if (eq rhs rhs2)
+                  st
+                  (stmt-ir:make-anchored-assignment-stmt
+                   (stmt-ir:stmt-target-name st)
+                   rhs2
+                   (stmt-ir:stmt-target-indices st)))))
            (stmt-ir:assignment-statement
             (let* ((rhs (stmt-ir:stmt-expression st))
                    (rhs2 (rewrite-expr rhs)))
@@ -2325,7 +2522,7 @@ in RHSs, indices, and conditions."
       ((comp-expr (expr)
          (expr-complexity expr))
        (comp-stmt (cycle)
-         (typecase cycle
+         (etypecase cycle
            (assignment-statement
             (let ((rhs (stmt-expression cycle))
                   (idx (stmt-target-indices cycle)))
@@ -2338,11 +2535,14 @@ in RHSs, indices, and conditions."
                (if (if-then-block cycle)
                    (comp-stmt (if-then-block cycle))
                    0)
-               (if (if-else-block cycle)
-                   (comp-stmt (if-else-block cycle))
-                   0)))
+           (if (if-else-block cycle)
+               (comp-stmt (if-else-block cycle))
+               0)))
            (raw-c-statement
-            0)
+            (let ((expr (stmt-expression cycle)))
+              (if expr
+                  (%sexpr-node-count (expr-ir:expr->sexpr expr))
+                  0)))
            (t
             0)))
        (comp-block (blk)
@@ -2366,28 +2566,40 @@ Only linear subexpressions are changed; non-linear ones are left as-is."
          (expr-ir:simplify-expr
           (expr-ir:canonicalize-linear-subexprs expr)))
 
-       (rewrite-stmt (st)
-         (typecase st
-           (assignment-statement
-            (make-assignment-stmt
-             (stmt-target-name st)
-             (rewrite-expr (stmt-expression st))
-             (stmt-target-indices st)))
+      (rewrite-stmt (st)
+        (etypecase st
+          (anchored-assignment-statement
+           (make-anchored-assignment-stmt
+            (stmt-target-name st)
+            (rewrite-expr (stmt-expression st))
+            (stmt-target-indices st)))
+          (assignment-statement
+           (make-assignment-stmt
+            (stmt-target-name st)
+            (rewrite-expr (stmt-expression st))
+            (stmt-target-indices st)))
+          (raw-c-statement
+           (let ((expr (stmt-expression st)))
+             (if expr
+                 (make-raw-c-statement
+                  (raw-c-generator st)
+                  (rewrite-expr expr))
+                 st)))
 
-           (if-statement
-            (let* ((new-cond (rewrite-expr (if-condition st)))
-                   (then-blk (if-then-block st))
-                   (else-blk (if-else-block st))
-                   (new-then (rewrite-stmt then-blk))
-                   (new-else (and else-blk (rewrite-stmt else-blk))))
-              (make-if-stmt new-cond new-then new-else)))
+          (if-statement
+           (let* ((new-cond (rewrite-expr (if-condition st)))
+                  (then-blk (if-then-block st))
+                  (else-blk (if-else-block st))
+                  (new-then (rewrite-stmt then-blk))
+                  (new-else (and else-blk (rewrite-stmt else-blk))))
+             (make-if-stmt new-cond new-then new-else)))
 
-           (block-statement
-            (make-block-stmt
-             (mapcar #'rewrite-stmt (block-statements st))))
+          (block-statement
+           (make-block-stmt
+            (mapcar #'rewrite-stmt (block-statements st))))
 
-           (t
-            st))))
+          (t
+           st))))
     (rewrite-stmt block)))
 
 
@@ -2519,13 +2731,14 @@ If MIN-IMPROVEMENT on OPT is > 0, we only accept the new block if
        (when (and name (search "e-g-hess" (string name)))
          (labels ((h-targets (blk)
                     (loop for st in (block-statements blk)
-                          when (typep st 'assignment-statement)
-                            for tgt = (stmt-target-name st)
-                            when (and (symbolp tgt)
-                                      (let ((s (symbol-name tgt)))
-                                        (and (>= (length s) 2)
-                                             (string= (subseq s 0 2) "H_"))))
-                              collect tgt)))
+                          for tgt = (and (typep st 'assignment-statement)
+                                         (stmt-target-name st))
+                          when (and tgt
+                                    (symbolp tgt)
+                                    (let ((s (symbol-name tgt)))
+                                      (and (>= (length s) 2)
+                                           (string= (subseq s 0 2) "H_"))))
+                            collect tgt)))
            (let* ((before-h (h-targets block))
                   (after-h  (h-targets result-block))
                   (dropped  (set-difference before-h after-h :test #'eq))
@@ -2652,19 +2865,40 @@ to the variable T.
       ((process-block (blk env)
          (let ((new-stmts '()))
            (dolist (st (block-statements blk))
-             (typecase st
+             (etypecase st
+               (anchored-assignment-statement
+               ;; First, rewrite RHS with current aliases
+               (let* ((expr      (stmt-expression st))
+                      (new-expr  (rewrite-expr-using-aliases expr env))
+                      (new-stmt  (make-anchored-assignment-stmt
+                                  (stmt-target-name st)
+                                  new-expr
+                                  (stmt-target-indices st))))
+                 ;; Keep the rewritten assignment
+                 (push new-stmt new-stmts)
+                 ;; Then possibly register a new alias based on its RHS
+                 (note-alias-from-assignment new-stmt env)))
                (assignment-statement
-                ;; First, rewrite RHS with current aliases
-                (let* ((expr      (stmt-expression st))
-                       (new-expr  (rewrite-expr-using-aliases expr env))
-                       (new-stmt  (make-assignment-stmt
-                                   (stmt-target-name st)
-                                   new-expr
-                                   (stmt-target-indices st))))
-                  ;; Keep the rewritten assignment
-                  (push new-stmt new-stmts)
-                  ;; Then possibly register a new alias based on its RHS
-                  (note-alias-from-assignment new-stmt env)))
+               ;; First, rewrite RHS with current aliases
+               (let* ((expr      (stmt-expression st))
+                      (new-expr  (rewrite-expr-using-aliases expr env))
+                      (new-stmt  (make-assignment-stmt
+                                  (stmt-target-name st)
+                                  new-expr
+                                  (stmt-target-indices st))))
+                 ;; Keep the rewritten assignment
+                 (push new-stmt new-stmts)
+                 ;; Then possibly register a new alias based on its RHS
+                 (note-alias-from-assignment new-stmt env)))
+
+               (raw-c-statement
+                (let ((expr (stmt-expression st)))
+                  (push (if expr
+                            (make-raw-c-statement
+                             (raw-c-generator st)
+                             (rewrite-expr-using-aliases expr env))
+                            st)
+                        new-stmts)))
 
                (block-statement
                 (multiple-value-bind (sub-block env-out)

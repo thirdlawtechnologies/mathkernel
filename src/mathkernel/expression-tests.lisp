@@ -114,6 +114,7 @@ canonically sorted. Used to ignore operand order in comparisons."
                  test-stretch-diff-x1
                  test-stretch-diff-kb
                  test-stretch-energy-grad-numeric
+                 test-numeric-force-and-hessian-quadratic
                  )))
     (dolist (fn tests)
       (handler-case
@@ -656,3 +657,32 @@ canonically sorted. Used to ignore operand order in comparisons."
                  'test-stretch-energy-grad-numeric
                  "dE/dx1 analytic vs numeric mismatch: ~A vs ~A"
                  dE-dx1-val dE-dx1-num)))
+
+(deftest test-numeric-force-and-hessian-quadratic
+  (let* ((k #(2.0d0 3.0d0 5.0d0))
+         (energy-fn (lambda (pos &rest ignore)
+                      (declare (ignore ignore))
+                      (+ (* 0.5d0 (aref k 0) (aref pos 0) (aref pos 0))
+                         (* 0.5d0 (aref k 1) (aref pos 1) (aref pos 1))
+                         (* 0.5d0 (aref k 2) (aref pos 2) (aref pos 2)))))
+         (pos (make-array 3 :element-type 'double-float
+                          :initial-contents '(0.1d0 -0.2d0 0.05d0)))
+         (force (make-array 3 :element-type 'double-float :initial-element 0d0))
+         (hess  (make-array 9 :element-type 'double-float :initial-element 0d0))
+         (tol 1.0d-6))
+    (mathkernel:numeric-force-and-hessian! energy-fn pos force hess :h 1.0d-6)
+    ;; Force should be -k_i * x_i
+    (dotimes (i 3)
+      (let ((expected (- (* (aref k i) (aref pos i))))
+            (actual (aref force i)))
+        (assert-true (< (abs (- actual expected)) tol)
+                     'test-numeric-force-and-hessian-quadratic
+                     "force[~A] mismatch: ~A vs ~A" i actual expected)))
+    ;; Hessian should be diagonal with k_i on the diagonal.
+    (dotimes (i 3)
+      (dotimes (j 3)
+        (let ((expected (if (= i j) (aref k i) 0d0))
+              (actual (aref hess (+ (* 3 i) j))))
+          (assert-true (< (abs (- actual expected)) 1.0d-4)
+                       'test-numeric-force-and-hessian-quadratic
+                       "hess[~A,~A] mismatch: ~A vs ~A" i j actual expected))))))

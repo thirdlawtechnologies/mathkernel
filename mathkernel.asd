@@ -13,6 +13,7 @@
                                            (:file "expression-ir")
                                            (:file "expression-parse")
                                            (:file "expression-rewrite")
+                                           (:file "numeric-diff")
                                            (:file "expression-tests")
                                            (:file "statement-ir")
                                            (:file "expression-diff")

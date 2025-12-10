@@ -70,13 +70,13 @@ EXPR-IR:SIMPLIFY-EXPR before being wrapped in an assignment."
     ;; Energy assignment, if requested
     (when energy-target
       (let ((e-expr (%maybe-simplify energy-expr simplify)))
-        (push (make-assignment-stmt (expr-ir:ev energy-target) e-expr) stmts)))
+        (push (make-assignment-stmt (expr-ir:ev energy-target) e-expr nil nil) stmts)))
     ;; Gradient components
     (dolist (v coord-vars)
       (let* ((dexpr (expr-ir:differentiate-expr energy-expr v))
              (dexpr-s (%maybe-simplify dexpr simplify))
              (target (funcall grad-target-fn v)))
-        (push (make-assignment-stmt (expr-ir:ev target) dexpr-s) stmts)))
+        (push (make-anchored-assignment-stmt (expr-ir:ev target) dexpr-s nil) stmts)))
     (make-block-stmt (nreverse stmts))))
 
 ;;; ------------------------------------------------------------
@@ -133,14 +133,14 @@ EXPR-IR:SIMPLIFY-EXPR before being wrapped in assignments."
     ;; Energy assignment
     (when energy-target
       (let ((e-expr (%maybe-simplify energy-expr simplify)))
-        (push (make-assignment-stmt (expr-ir:ev energy-target) e-expr) stmts)))
+        (push (make-assignment-stmt (expr-ir:ev energy-target) e-expr nil nil) stmts)))
     ;; Gradient assignments, cache exprs
     (dolist (v coord-vars)
       (let* ((dexpr (expr-ir:differentiate-expr energy-expr v))
              (dexpr-s (%maybe-simplify dexpr simplify))
              (g-target (funcall grad-target-fn v)))
         (setf (gethash v grad-table) dexpr-s)
-        (push (make-assignment-stmt (expr-ir:ev g-target) dexpr-s) stmts)))
+        (push (make-anchored-assignment-stmt (expr-ir:ev g-target) dexpr-s nil) stmts)))
     ;; Hessian assignments for i <= j
     (loop
       for i from 0 below (length coord-vars)
@@ -157,7 +157,7 @@ EXPR-IR:SIMPLIFY-EXPR before being wrapped in assignments."
               (let* ((hij (expr-ir:differentiate-expr gi vj))
                      (hij-s (%maybe-simplify hij simplify))
                      (h-target (funcall hess-target-fn vi vj)))
-                (push (make-assignment-stmt (expr-ir:ev h-target) hij-s) stmts)))))
+                (push (make-anchored-assignment-stmt (expr-ir:ev h-target) hij-s nil) stmts)))))
     (make-block-stmt (nreverse stmts))))
 
 
@@ -218,7 +218,7 @@ are appended after the original BODY statements."
             (let* ((gi-s (%maybe-simplify gi simplify))
                    (g-target (funcall grad-target-fn vi)))
               ;; dE/dvi
-              (push (make-assignment-stmt (expr-ir:ev g-target) gi-s) gh-stmts)
+              (push (make-anchored-assignment-stmt (expr-ir:ev g-target) gi-s nil) gh-stmts)
               ;; Hessian entries for j >= i
               (loop
                 for j from i below n
@@ -227,8 +227,26 @@ are appended after the original BODY statements."
                          (hij   (expr-ir:differentiate-expr gi vj env-j))
                          (hij-s (%maybe-simplify hij simplify))
                          (h-target (funcall hess-target-fn vi vj)))
-                    (push (make-assignment-stmt (expr-ir:ev h-target) hij-s) gh-stmts))))))
-      (setf result-stmts
-            (append result-stmts (nreverse gh-stmts))))
+                  (push (make-anchored-assignment-stmt (expr-ir:ev h-target) hij-s nil) gh-stmts))))))
+      ;; If the body ends with an IF, keep gradient/Hessian assignments inside
+      ;; the same conditional scope so their dependencies are defined.
+      (let ((gh-stmts (nreverse gh-stmts)))
+        (let ((last (car (last result-stmts))))
+          (if (typep last 'if-statement)
+              (let* ((then-b (if-then-block last))
+                     (else-b (if-else-block last))
+                     (new-then (and then-b
+                                    (make-block-stmt
+                                     (append (block-statements then-b)
+                                             (copy-list gh-stmts)))))
+                     (new-else (and else-b
+                                    (make-block-stmt
+                                     (append (block-statements else-b)
+                                             (copy-list gh-stmts))))))
+                (setf result-stmts
+                      (append (butlast result-stmts 1)
+                              (list (make-if-stmt (if-condition last)
+                                                  new-then new-else)))))
+              (setf result-stmts (append result-stmts gh-stmts))))))
     (make-block-stmt result-stmts))))
   

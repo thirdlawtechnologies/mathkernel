@@ -56,13 +56,9 @@
      :name :normalize-signs
      :function 'stmt-ir:normalize-signs-optimization))))
 
-
-
-
-
 (defparameter kernels nil)
 
-(build-multiple-kernels (kernels "stretch" (:energy :gradient :hessian))
+(build-multiple-kernels (kernels "stretch" (:hessian :gradient :energy))
   (:pipeline *pipeline*)
   (:params ((double kb)
             (double r0)
@@ -100,8 +96,6 @@
 
 
 (build-multiple-kernels (kernels "angle" (:energy :gradient :hessian))
-  (:return-type "bool")
-  (:return-expr "return true;")
   (:pipeline *pipeline*)
   (:params ((double kt)
             (double t0)
@@ -141,13 +135,13 @@
 
      ;; dot products and norms
      (=. dot   "vx1*vx2 + vy1*vy2 + vz1*vz2")
-     (raw-c "if (fabs(dot)>(1.0-VERY_SMALL)) return false;")
      (=. n1_sq "vx1*vx1 + vy1*vy1 + vz1*vz1")
      (=. n2_sq "vx2*vx2 + vy2*vy2 + vz2*vz2")
      (=. n1    "sqrt(n1_sq)")
      (=. n2    "sqrt(n2_sq)")
 
      (=. cos_theta "dot / (n1*n2)")
+     (raw-c "if (fabs(cos_theta)>(1.0-VERYSMALL)) linear_angle_error();")
      (=. sin_theta "sqrt(1 - cos_theta^2)")
      (=. theta     "acos(cos_theta)")
      (=. dtheta    "theta - t0")
@@ -160,9 +154,10 @@
 
 (build-multiple-kernels (kernels "dihedral" (:energy :gradient :hessian))
   (:pipeline *pipeline*)
-  (:params ((double V)     ;; amplitude
-            (double n)     ;; multiplicity
-            (double phase) ;; phase offset δ
+  (:params ((double V)        ;; amplitude
+            (double n)        ;; multiplicity
+            (double sinPhase) ;; sin(phase offset δ)
+            (double cosPhase) ;; cos(phase offset δ)
             (size_t i3x1)
             (size_t i3x2)
             (size_t i3x3)
@@ -229,9 +224,13 @@
 
      ;; Amber-style torsion:
      ;; E(phi) = V * (1 + cos(n*phi - phase))
-     (=. nphi  "n*phi")
-     (=. angle "nphi - phase")
-     (=. energy "V*(1.0 + cos(angle))")))
+     ;; Use sinPhase/cosPhase inputs instead of the raw phase.
+     (=. nphi      "n*phi")
+     (=. sin_nphi  "sin(nphi)")
+     (=. cos_nphi  "cos(nphi)")
+     (=. cos_angle "cos_nphi*cosPhase + sin_nphi*sinPhase") ;; cos(nphi - phase)
+     (=. sin_angle "sin_nphi*cosPhase - cos_nphi*sinPhase") ;; sin(nphi - phase)
+     (=. energy "V*(1.0 + cos_angle)")))
 
   (:derivatives
    (:mode :manual
@@ -239,12 +238,14 @@
 
     ;; no manual geometry; AD provides dphi/dcoord
 
-    ;; E(phi) = V*(1 + cos(angle)), angle = n*phi - phase
-    ;; dE/dphi  = -V*n*sin(angle)
-    ;; d²E/dphi² = -V*n^2*cos(angle)
+    ;; E(phi) = V*(1 + cos_angle), where
+    ;; cos_angle = cos(nphi - phase) = cos_nphi*cosPhase + sin_nphi*sinPhase
+    ;; sin_angle = sin(nphi - phase) = sin_nphi*cosPhase - cos_nphi*sinPhase
+    ;; dE/dphi  = -V*n*sin_angle
+    ;; d²E/dphi² = -V*n*n*cos_angle
     :energy->intermediate
-    (:gradient ((phi "-V*n*sin(angle)"))
-     :hessian  (((phi phi) "-V*n*n*cos(angle)")))
+    (:gradient ((phi "-V*n*sin_angle"))
+     :hessian  (((phi phi) "-V*n*n*cos_angle")))
 
     :hessian-modes ((phi :outer-product-only))
     :geometry-check :warn)))
@@ -358,7 +359,7 @@
             (double r_switch2) ;; switching start squared
             (double r_cut)     ;; cutoff
             (double r_cut2)    ;; cutoff^2
-            (double inv_range) ;; 1.0/(r_cur - r_switch)
+            (double inv_range) ;; 1.0/(r_cut - r_switch)
             (size_t i3x1)
             (size_t i3x2)
             (double* position)
@@ -410,8 +411,8 @@
            (=. d2E_dr2 "d2E_base_dr2" :modes (:hessian)))
          (stmt-block
            (=. drs "r - r_switch")
-           (=. t  "drs*inv_range")
-           (=. t2 "t*t")
+           (=. t1 "drs*inv_range")
+           (=. t2 "t1*t1")
            (=. t3 "t2*t")
            (=. t4 "t2*t2")
            (=. t5 "t3*t2")
@@ -799,7 +800,9 @@
 
 (write-all kernels)
 
-(mathkernel:emit-c-tests (last kernels 3)
+(mathkernel:emit-c-tests (loop for kernel in kernels
+                               when (member (mathkernel::kernel-group kernel) '("stretch" "angle" "dihedral") :test 'string=)
+                                 collect kernel)
                          "/home/meister/Development/cando/extensions/cando/include/cando/chem/energyKernels/"
                          "~/tmp/tests/position.c"
                          "~/tmp/tests/calls.c"

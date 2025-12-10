@@ -554,7 +554,7 @@ using the assignments visible along that control-flow path."
                                     new-seen q energy-var)))
                         (when dexpr
                           (let ((g-sym (funcall grad-target-fn q)))
-                            (push (stmt-ir:make-assignment-stmt g-sym dexpr) out))))))
+                            (push (stmt-ir:make-anchored-assignment-stmt g-sym dexpr) out))))))
                   (setf seen new-seen)))
                (stmt-ir:block-statement
                 (multiple-value-bind (sub-stmts new-seen)
@@ -846,7 +846,7 @@ If MANUAL-DERIV-SPEC is NIL, fall back to the existing pure AD path."
                      (unless (and (typep sum-simplified 'expr-ir:constant-expression)
                                   (zerop (expr-ir:expression-value sum-simplified)))
                        (let* ((h-sym (funcall hess-target-fn qi qj))
-                              (stmt  (stmt-ir:make-assignment-stmt h-sym sum-simplified)))
+                              (stmt  (stmt-ir:make-anchored-assignment-stmt h-sym sum-simplified)))
                          (push stmt hess-assignments))))))))))
        (let* ((out (reverse hess-assignments))
               (targets (mapcar #'stmt-ir:stmt-target-name out)))
@@ -874,7 +874,7 @@ If MANUAL-DERIV-SPEC is NIL, fall back to the existing pure AD path."
                    (unless (and (typep d2E 'expr-ir:constant-expression)
                                 (zerop (expr-ir:expression-value d2E)))
                      (let* ((h-sym (funcall hess-target-fn qi qj))
-                            (stmt  (stmt-ir:make-assignment-stmt h-sym d2E)))
+                            (stmt  (stmt-ir:make-anchored-assignment-stmt h-sym d2E)))
                        (push stmt hess-assignments))))))))
          (let* ((out (reverse hess-assignments))
                 (targets (mapcar #'stmt-ir:stmt-target-name out)))
@@ -1076,11 +1076,11 @@ Otherwise, fall back to pure AD on ENERGY-VAR wrt each coordinate."
                      (let* ((sum (if (cdr terms)
                                      (expr-ir:make-expr-add terms)
                                      (car terms)))
-                            (sum-simplified (expr-ir:simplify-expr sum)))
+                           (sum-simplified (expr-ir:simplify-expr sum)))
                        (unless (and (typep sum-simplified 'expr-ir:constant-expression)
                                     (zerop (expr-ir:expression-value sum-simplified)))
                          (let* ((grad-sym (funcall grad-target-fn q))
-                                (stmt    (stmt-ir:make-assignment-stmt grad-sym sum-simplified)))
+                                (stmt    (stmt-ir:make-anchored-assignment-stmt grad-sym sum-simplified)))
                            (push stmt grad-assignments)))))))))
             ;; Default / AD path (existing behavior)
             (t
@@ -1093,7 +1093,7 @@ Otherwise, fall back to pure AD on ENERGY-VAR wrt each coordinate."
                                 (zerop (expr-ir:expression-value dE-dq-s)))
                      (let* ((grad-sym  (funcall grad-target-fn q))
                             (grad-expr dE-dq-s)
-                            (stmt      (stmt-ir:make-assignment-stmt grad-sym grad-expr)))
+                            (stmt      (stmt-ir:make-anchored-assignment-stmt grad-sym grad-expr)))
                        (push stmt grad-assignments))))))))))
     result
     ))
@@ -1564,27 +1564,205 @@ energy-only kernels where D! requests are unnecessary."
                core-block))
          ;; turn energy/grad/hess assignments into KernelGradientAcc/KernelDiagHessAcc/... macros
          (transformed
-           (progn
-             (transform-eg-h-block
-              block-with-coords
-              layout
-              coord-vars
-              #'general-grad-name
-              #'general-hess-name)))
-         (locals (infer-kernel-locals transformed params coord-vars)))
+           (transform-eg-h-block
+            block-with-coords
+            layout
+            coord-vars
+            #'general-grad-name
+            #'general-hess-name))
+         ;; variables known to be defined before derivative/CSE work:
+         ;; parameters and coord-load locals
+         (initial-defined (nconc (mapcar (lambda (p) (expr-ir:ev (second p))) params)
+                                 (mapcar #'expr-ir:ev coord-vars)))
+         ;; sanity check ordering after optimization
+         (_ (stmt-ir:check-def-before-use-in-block transformed
+                                                   :already-defined initial-defined))
+         ;; ensure assignments are ordered so definitions precede uses
+         (ordered (stmt-ir:reorder-block-def-before-use transformed))
+         (locals (infer-kernel-locals ordered params coord-vars)))
     (stmt-ir:make-c-function
      (kernel-name kernel)
-     transformed
+     ordered
      :return-type (kernel-return-type kernel)
      :parameters  params
      :locals      locals
      :return-expr (kernel-return-expr kernel))))
 
+;; ------------------------------------------------------------
+;; Finite-difference wrappers (energy/gradient/hessian)
+;; ------------------------------------------------------------
+
+(defun %fd-param-name (param)
+  (string-downcase (symbol-name (second param))))
+
+(defun %fd-param-type (param)
+  (string-downcase (princ-to-string (first param))))
+
+(defun %fd-param-list-string (params)
+  (format nil "~{~a ~a~^, ~}"
+          (loop for p in params
+                append (list (%fd-param-type p)
+                             (%fd-param-name p)))))
+
+(defun %fd-call-args (params &key energy-accum force hessian dvec hdvec)
+  "Return a list of argument strings matching PARAMS, with optional overrides."
+  (mapcar (lambda (p)
+            (let* ((nm (%fd-param-name p)))
+              (cond
+                ((and energy-accum (string= nm "energy_accumulate")) energy-accum)
+                ((and force (string= nm "force")) force)
+                ((and hessian (string= nm "hessian")) hessian)
+                ((and dvec (string= nm "dvec")) dvec)
+                ((and hdvec (string= nm "hdvec")) hdvec)
+                (t nm))))
+          params))
+
+(defun %fd-coord-specs (kernel)
+  "Return plist entries (:ibase :offset) per coord-var using LAYOUT."
+  (let ((layout (kernel-layout kernel)))
+    (mapcar (lambda (cv)
+              (multiple-value-bind (ibase off)
+                  (coord-name->ibase+offset (string-upcase (symbol-name cv)) layout)
+                (list :ibase (string-downcase (symbol-name ibase))
+                      :offset off)))
+            (kernel-coord-vars kernel))))
+
+(defun fd-wrapper-c-source (kernel)
+  "Return finite-difference wrapper C sources per translation unit:
+   - Energy TU: <group>_energy_fd
+   - Gradient TU: <group>_gradient_fd
+   - Hessian TU: <group>_hessian_fd"
+  (when (kernel-compute-energy-p kernel)
+    (let* ((params (kernel-params kernel))
+           (param-list (%fd-param-list-string params))
+           (coord-specs (%fd-coord-specs kernel))
+           (ret-type   (or (kernel-return-type kernel) "void"))
+           (ret-type-str (if (stringp ret-type) ret-type (princ-to-string ret-type)))
+           (return-expr (kernel-return-expr kernel))
+           (energy-name (format nil "~a_energy" (string-downcase (kernel-group kernel))))
+           (group-name (string-downcase (kernel-group kernel)))
+           (energy-fd-name (format nil "~a_energy_fd" group-name))
+           (grad-name  (format nil "~a_gradient_fd" group-name))
+           (hess-name  (format nil "~a_hessian_fd" group-name))
+           (call-args-base (%fd-call-args params
+                                          :energy-accum "&e0"
+                                          :force "0" :hessian "0" :dvec "0" :hdvec "0"))
+           (call-args-base-str (format nil "~{~a~^, ~}" call-args-base))
+           (call-args-plus (lambda (var)
+                             (%fd-call-args params
+                                            :energy-accum (format nil "&~a" var)
+                                            :force "0" :hessian "0" :dvec "0" :hdvec "0")))
+           (hval-denom "(h*h)")
+           (ret-void? (string= (string-downcase ret-type-str) "void")))
+      (cond
+        ;; Energy TU: emit only energy_fd
+        ((and (not (kernel-compute-grad-p kernel))
+              (not (kernel-compute-hess-p kernel)))
+         (with-output-to-string (s)
+           (let ((call-args (format nil "~{~a~^, ~}" (%fd-call-args params))))
+             (format s "~a ~a(~a)~%{~%" ret-type-str energy-fd-name param-list)
+             (cond
+               (return-expr
+                (format s "  ~a(~a);~%~a~%" energy-name call-args return-expr))
+               (ret-void?
+                (format s "  ~a(~a);~%" energy-name call-args))
+               (t
+                (format s "  return ~a(~a);~%" energy-name call-args)))
+             (format s "}~%"))))
+        ;; Gradient TU: emit only gradient_fd
+        ((and (kernel-compute-grad-p kernel)
+              (not (kernel-compute-hess-p kernel)))
+         (with-output-to-string (s)
+           (format s "extern ~a ~a(~a);~%~%" ret-type-str energy-name param-list)
+           (format s "~a ~a(~a)~%{~%" ret-type-str grad-name param-list)
+           (format s "  const double h = 1.0e-5;~%  const double inv2h = 1.0/(2.0*h);~%  double e0 = 0.0;~%  ~a(~a);~%  if (energy_accumulate) { *energy_accumulate += e0; }~%"
+                   energy-name call-args-base-str)
+           (dolist (cs coord-specs)
+             (let* ((idx (format nil "~a + ~d" (getf cs :ibase) (getf cs :offset)))
+                    (ibase (getf cs :ibase))
+                    (off   (getf cs :offset)))
+               (format s
+                       "  {~%    double saved = position[~a];~%    double e_plus = 0.0;~%    double e_minus = 0.0;~%    position[~a] = saved + h;~%    ~a(~a);~%    position[~a] = saved - h;~%    ~a(~a);~%    position[~a] = saved;~%    double d = (e_plus - e_minus) * inv2h;~%    KernelGradientAcc(~a, ~d, d);~%  }~%"
+                       idx idx
+                       energy-name (format nil "~{~a~^, ~}" (funcall call-args-plus "e_plus"))
+                       idx
+                       energy-name (format nil "~{~a~^, ~}" (funcall call-args-plus "e_minus"))
+                       idx
+                       ibase off)))
+           (cond
+             (return-expr
+              (format s "~a~%}~%" return-expr))
+             (ret-void?
+              (format s "}~%"))
+             (t
+              (format s "  return 0;~%}~%")))))
+        ;; Hessian TU: emit only hessian_fd
+        ((kernel-compute-hess-p kernel)
+         (with-output-to-string (s)
+           (format s "extern ~a ~a(~a);~%~%" ret-type-str energy-name param-list)
+           (format s "~a ~a(~a)~%{~%" ret-type-str hess-name param-list)
+           (format s "  const double h = 1.0e-5;~%  const double inv2h = 1.0/(2.0*h);~%  const double invh2 = 1.0/(~a);~%  double e0 = 0.0;~%  ~a(~a);~%  if (energy_accumulate) { *energy_accumulate += e0; }~%"
+                   hval-denom energy-name call-args-base-str)
+           (dolist (cs coord-specs)
+             (let* ((idx (format nil "~a + ~d" (getf cs :ibase) (getf cs :offset)))
+                    (ibase (getf cs :ibase))
+                    (off   (getf cs :offset)))
+               (format s
+                       "  {~%    double saved = position[~a];~%    double e_plus = 0.0;~%    double e_minus = 0.0;~%    position[~a] = saved + h;~%    ~a(~a);~%    position[~a] = saved - h;~%    ~a(~a);~%    position[~a] = saved;~%    double d = (e_plus - e_minus) * inv2h;~%    KernelGradientAcc(~a, ~d, d);~%  }~%"
+                       idx idx
+                       energy-name (format nil "~{~a~^, ~}" (funcall call-args-plus "e_plus"))
+                       idx
+                       energy-name (format nil "~{~a~^, ~}" (funcall call-args-plus "e_minus"))
+                       idx
+                       ibase off)))
+           (dolist (cs coord-specs)
+             (let* ((idx (format nil "~a + ~d" (getf cs :ibase) (getf cs :offset)))
+                    (ibase (getf cs :ibase))
+                    (off   (getf cs :offset)))
+               (format s
+                       "  {~%    double saved = position[~a];~%    double e_plus = 0.0;~%    double e_minus = 0.0;~%    position[~a] = saved + h;~%    ~a(~a);~%    position[~a] = saved - h;~%    ~a(~a);~%    position[~a] = saved;~%    double hval = (e_plus + e_minus - (2.0*e0)) * invh2;~%    KernelDiagHessAcc(~a, ~d, ~a, ~d, hval);~%  }~%"
+                       idx idx
+                       energy-name (format nil "~{~a~^, ~}" (funcall call-args-plus "e_plus"))
+                       idx
+                       energy-name (format nil "~{~a~^, ~}" (funcall call-args-plus "e_minus"))
+                       idx
+                       ibase off ibase off)))
+           (loop for i from 0 below (length coord-specs) do
+                 (loop for j from 0 below i do
+                       (let* ((csi (nth i coord-specs))
+                              (csj (nth j coord-specs))
+                              (idx-i (format nil "~a + ~d" (getf csi :ibase) (getf csi :offset)))
+                              (idx-j (format nil "~a + ~d" (getf csj :ibase) (getf csj :offset)))
+                              (ibase-i (getf csi :ibase))
+                              (off-i   (getf csi :offset))
+                              (ibase-j (getf csj :ibase))
+                              (off-j   (getf csj :offset)))
+                         (format s
+                                 "  {~%    double saved_i = position[~a];~%    double saved_j = position[~a];~%    double e_pp = 0.0;~%    double e_pm = 0.0;~%    double e_mp = 0.0;~%    double e_mm = 0.0;~%    position[~a] = saved_i + h; position[~a] = saved_j + h;~%    ~a(~a);~%    position[~a] = saved_j - h;~%    ~a(~a);~%    position[~a] = saved_i - h; position[~a] = saved_j + h;~%    ~a(~a);~%    position[~a] = saved_j - h;~%    ~a(~a);~%    position[~a] = saved_i; position[~a] = saved_j;~%    double hval = (e_pp - e_pm - e_mp + e_mm) * (0.25*invh2);~%    KernelOffDiagHessAcc(~a, ~d, ~a, ~d, hval);~%  }~%"
+                                 idx-i idx-j
+                                 idx-i idx-j energy-name (format nil "~{~a~^, ~}" (funcall call-args-plus "e_pp"))
+                                 idx-j energy-name (format nil "~{~a~^, ~}" (funcall call-args-plus "e_pm"))
+                                 idx-i idx-j energy-name (format nil "~{~a~^, ~}" (funcall call-args-plus "e_mp"))
+                                 idx-j energy-name (format nil "~{~a~^, ~}" (funcall call-args-plus "e_mm"))
+                                 idx-i idx-j
+                                 ibase-i off-i ibase-j off-j))))
+           (cond
+             (return-expr
+              (format s "~a~%}~%" return-expr))
+             (ret-void?
+              (format s "}~%"))
+             (t
+              (format s "  return 0;~%}~%")))))))))
+
 (defun write-c-code (kernel pathname)
   (ensure-directories-exist pathname)
   (with-open-file (fout pathname :direction :output :if-exists :supersede)
-    (let ((fun (compile-kernel-to-c-function kernel)))
-      (write-line (stmt-ir:c-function->c-source-string fun) fout))))
+    (let* ((fun (compile-kernel-to-c-function kernel))
+           (core-src (stmt-ir:c-function->c-source-string fun))
+           (fd-src  (fd-wrapper-c-source kernel)))
+      (write-line core-src fout)
+      (when fd-src
+        (write-line fd-src fout)))))
 
 
 
@@ -1674,29 +1852,73 @@ energy-only kernels where D! requests are unnecessary."
         (format t "[KERNEL ~a] 3. start building core E/G/H assignments~%" name)
         (let* ((current-stmts (copy-list (stmt-ir:block-statements base-block*)))
                (current-block (stmt-ir:make-block-stmt current-stmts)))
-          (when compute-grad
-            (setf current-block
-                  (inject-gradients-after-energy
-                   current-block coord-vars energy-var #'general-grad-name))
-            (stmt-ir:debug-block current-block :label "After gradient added")
-            (setf current-stmts (copy-list (stmt-ir:block-statements current-block))))
-          (when pipeline
-            (let ((grad-block (stmt-ir:make-block-stmt current-stmts)))
-              (multiple-value-bind (grad-opt results total-before total-after)
-                  (stmt-ir:run-optimization-pipeline
-                   pass-counter pipeline grad-block
-                   :name (the-name "e-grad")
-                   :log-stream *trace-output*)
-                (declare (ignore results total-before total-after))
-                (setf current-stmts
-                      (copy-list (stmt-ir:block-statements grad-opt))))))
-          (let ((h-targets-pre nil))
-            (when compute-hess
-              (let ((hess-stmts (make-hessian-assignments-from-block
-                                 base-block* energy-var coord-vars #'general-hess-name
-                                 manual-deriv-spec)))
-                (setf current-stmts (append current-stmts hess-stmts)))
-              ;; Trace before post-hessian pipeline
+          (flet ((append-at-tail-or-into-if (stmts extra)
+                   "Append EXTRA statements; if the last stmt is an IF, append inside its branches."
+                   (if (and stmts (typep (car (last stmts)) 'stmt-ir:if-statement))
+                       (let* ((last-if (car (last stmts)))
+                              (rest    (butlast stmts 1))
+                              (then-b  (stmt-ir:if-then-block last-if))
+                              (else-b  (stmt-ir:if-else-block last-if))
+                              (new-then (and then-b
+                                             (stmt-ir:make-block-stmt
+                                              (append (stmt-ir:block-statements then-b)
+                                                      (copy-list extra)))))
+                              (new-else (and else-b
+                                             (stmt-ir:make-block-stmt
+                                              (append (stmt-ir:block-statements else-b)
+                                                      (copy-list extra))))))
+                         (append rest
+                                 (list (stmt-ir:make-if-stmt
+                                        (stmt-ir:if-condition last-if)
+                                        new-then new-else))))
+                       (append stmts extra))))
+            (when compute-grad
+              (setf current-block
+                    (inject-gradients-after-energy
+                     current-block coord-vars energy-var #'general-grad-name))
+              (stmt-ir:debug-block current-block :label "After gradient added")
+              (setf current-stmts (copy-list (stmt-ir:block-statements current-block))))
+            (when pipeline
+              (let ((grad-block (stmt-ir:make-block-stmt current-stmts)))
+                (multiple-value-bind (grad-opt results total-before total-after)
+                    (stmt-ir:run-optimization-pipeline
+                     pass-counter pipeline grad-block
+                     :name (the-name "e-grad")
+                     :log-stream *trace-output*)
+                  (declare (ignore results total-before total-after))
+                  (setf current-stmts
+                        (copy-list (stmt-ir:block-statements grad-opt))))))
+            (let ((h-targets-pre nil))
+              (when compute-hess
+                (let ((hess-stmts (make-hessian-assignments-from-block
+                                   base-block* energy-var coord-vars #'general-hess-name
+                                   manual-deriv-spec)))
+                  (setf current-stmts
+                        (append-at-tail-or-into-if current-stmts hess-stmts)))
+                ;; Trace before post-hessian pipeline
+                (let* ((assign-targets (loop for st in current-stmts
+                                             when (typep st 'stmt-ir:assignment-statement)
+                                               collect (stmt-ir:stmt-target-name st)))
+                       (h-targets (remove-if-not (lambda (sym)
+                                                   (and (symbolp sym)
+                                                        (let ((s (symbol-name sym)))
+                                                          (and (>= (length s) 2)
+                                                               (string= (subseq s 0 2) "H_")))))
+                                                 assign-targets)))
+                  (setf h-targets-pre h-targets)
+                  (format t "[make-kernel-from-block/~a] pre-hess-pipeline scalars (~d): ~s~%"
+                          name (length h-targets-pre) h-targets-pre)))
+              (when pipeline
+                (let ((hess-block (stmt-ir:make-block-stmt current-stmts)))
+                  (multiple-value-bind (hess-opt results total-before total-after)
+                      (stmt-ir:run-optimization-pipeline
+                       pass-counter pipeline hess-block
+                       :name (the-name "e-g-hess")
+                       :log-stream *trace-output*)
+                    (declare (ignore results total-before total-after))
+                    (setf current-stmts
+                          (copy-list (stmt-ir:block-statements hess-opt))))))
+              ;; Trace which Hessian scalars survived the pipeline, before EG/H lowering.
               (let* ((assign-targets (loop for st in current-stmts
                                            when (typep st 'stmt-ir:assignment-statement)
                                              collect (stmt-ir:stmt-target-name st)))
@@ -1706,76 +1928,53 @@ energy-only kernels where D! requests are unnecessary."
                                                         (and (>= (length s) 2)
                                                              (string= (subseq s 0 2) "H_")))))
                                                assign-targets)))
-                (setf h-targets-pre h-targets)
-                (format t "[make-kernel-from-block/~a] pre-hess-pipeline scalars (~d): ~s~%"
-                        name (length h-targets-pre) h-targets-pre)))
-            (when pipeline
-              (let ((hess-block (stmt-ir:make-block-stmt current-stmts)))
-                (multiple-value-bind (hess-opt results total-before total-after)
-                    (stmt-ir:run-optimization-pipeline
-                     pass-counter pipeline hess-block
-                     :name (the-name "e-g-hess")
-                     :log-stream *trace-output*)
-                  (declare (ignore results total-before total-after))
-                  (setf current-stmts
-                        (copy-list (stmt-ir:block-statements hess-opt))))))
-            ;; Trace which Hessian scalars survived the pipeline, before EG/H lowering.
-            (let* ((assign-targets (loop for st in current-stmts
-                                         when (typep st 'stmt-ir:assignment-statement)
-                                           collect (stmt-ir:stmt-target-name st)))
-                   (h-targets (remove-if-not (lambda (sym)
-                                               (and (symbolp sym)
-                                                    (let ((s (symbol-name sym)))
-                                                      (and (>= (length s) 2)
-                                                           (string= (subseq s 0 2) "H_")))))
-                                             assign-targets)))
-              (format t "[make-kernel-from-block/~a] pre-transform Hessians (~d): ~s~%"
-                      name (length h-targets) h-targets)
-              (when compute-hess
-                (let* ((missing (set-difference h-targets-pre h-targets :test #'eq)))
-                  (format t "[make-kernel-from-block/~a] Hessians dropped by pipeline (~d): ~s~%"
-                          name (length missing) missing))))
-            (let* ((core-block
-                     (let ((blk (stmt-ir:make-block-stmt current-stmts)))
-                       (stmt-ir:check-def-before-use-in-block blk :errorp t)
-                       blk))
-                   (block-with-coords
-                     (if coord-load-stmts
-                         (stmt-ir:make-block-stmt
-                          (append coord-load-stmts (list core-block)))
-                         core-block))
-                   (eg-h-block
-                     (transform-eg-h-block
-                      block-with-coords layout coord-vars
-                      #'general-grad-name #'general-hess-name))
-                   (eg-h-block*
-                     (if post-eg-h-pipeline*
-                         (multiple-value-bind (post-block results total-before total-after)
-                             (stmt-ir:run-optimization-pipeline
-                              pass-counter post-eg-h-pipeline* eg-h-block
-                              :name (the-name "post-eg-h")
-                              :log-stream *trace-output*)
-                           (declare (ignore results total-before total-after))
-                           post-block)
-                         eg-h-block)))
-              (make-kernel-ir
-               :group group
-               :name name
-               :layout layout
-               :coord-vars coord-vars
-               :coord-load-stmts coord-load-stmts
-               :params params
-               :core-block core-block
-               :eg-h-block eg-h-block*
-               :compute-energy-p compute-energy
-               :compute-grad-p   compute-grad
-               :compute-hess-p   compute-hess
-               :manual-deriv-spec manual-deriv-spec
-               :pipeline pipeline
-               :extra-equivalence-rules extra-equivalence-rules
-               :extra-optimization-rules extra-optimization-rules
-               :return-type return-type
-               :return-expr return-expr))))))))
+                (format t "[make-kernel-from-block/~a] pre-transform Hessians (~d): ~s~%"
+                        name (length h-targets) h-targets)
+                (when compute-hess
+                  (let* ((missing (set-difference h-targets-pre h-targets :test #'eq)))
+                    (format t "[make-kernel-from-block/~a] Hessians dropped by pipeline (~d): ~s~%"
+                            name (length missing) missing))))
+              (let* ((core-block
+                       (let ((blk (stmt-ir:make-block-stmt current-stmts)))
+                         (stmt-ir:check-def-before-use-in-block blk :errorp t)
+                         blk))
+                     (block-with-coords
+                       (if coord-load-stmts
+                           (stmt-ir:make-block-stmt
+                            (append coord-load-stmts (list core-block)))
+                           core-block))
+                     (eg-h-block
+                       (transform-eg-h-block
+                        block-with-coords layout coord-vars
+                        #'general-grad-name #'general-hess-name))
+                     (eg-h-block*
+                       (if post-eg-h-pipeline*
+                           (multiple-value-bind (post-block results total-before total-after)
+                               (stmt-ir:run-optimization-pipeline
+                                pass-counter post-eg-h-pipeline* eg-h-block
+                                :name (the-name "post-eg-h")
+                                :log-stream *trace-output*)
+                             (declare (ignore results total-before total-after))
+                             post-block)
+                           eg-h-block)))
+                (make-kernel-ir
+                 :group group
+                 :name name
+                 :layout layout
+                 :coord-vars coord-vars
+                 :coord-load-stmts coord-load-stmts
+                 :params params
+                 :core-block core-block
+                 :eg-h-block eg-h-block*
+                 :compute-energy-p compute-energy
+                 :compute-grad-p   compute-grad
+                 :compute-hess-p   compute-hess
+                 :manual-deriv-spec manual-deriv-spec
+                 :pipeline pipeline
+                 :extra-equivalence-rules extra-equivalence-rules
+                 :extra-optimization-rules extra-optimization-rules
+                 :return-type return-type
+                 :return-expr return-expr)))))))))
 
 
 ;;; ------------------------------------------------------------
