@@ -1621,6 +1621,223 @@ We scan BLOCK recursively."
      (push st (cse-acc-stmts (cse-ctx-acc ctx)))
      (values st ctx))))
 
+(defun collect-products-in-block (block def-env acc pass-id min-uses min-factors min-size cse-only outer-symbols verbose)
+  "Walk BLOCK with a shared accumulator ACC, updating DEF-ENV. Returns ACC."
+  (let ((ctx (make-cse-factor-context
+              :env def-env
+              :idx -1
+              :pass-id pass-id
+              :min-uses min-uses
+              :min-factors min-factors
+              :min-size min-size
+              :cse-only cse-only
+              :verbose verbose
+              :outer-symbols outer-symbols
+              :acc acc)))
+    (walk-block-with-context :cse-factor-products ctx block)
+    acc))
+
+(defun choose-best-factor (products min-factors min-size min-uses cse-only env-product->sym pass-id verbose)
+  "Score candidates and return (values best-cand best-score best-uses best-first-use)."
+  (labels ((multiset-intersection (counts1 counts2)
+             (let ((result '()))
+               (maphash
+                (lambda (k v1)
+                  (let ((v2 (gethash k counts2 0)))
+                    (when (> (min v1 v2) 0)
+                      (dotimes (i (min v1 v2))
+                        (push k result)))))
+                counts1)
+               (sort result #'string< :key (lambda (sexpr) (format nil "~S" sexpr)))))
+           (multiset-subset-p (cand-counts prod-counts)
+             (let ((ok t))
+               (maphash (lambda (k v)
+                          (unless (<= v (gethash k prod-counts 0))
+                            (setf ok nil)))
+                        cand-counts)
+               ok))
+           (counts-from-factors (factors)
+             (let ((ht (make-hash-table :test #'equal)))
+               (dolist (f factors ht)
+                 (incf (gethash f ht 0))))))
+    (let ((candidate-lists '()))
+      (let ((plist (coerce products 'vector))
+            (m     (length products)))
+        (loop for i from 0 below (1- m) do
+          (let* ((ppi (aref plist i))
+                 (ci  (product-descriptor-counts ppi)))
+            (loop for j from (1+ i) below m do
+              (let* ((pj (aref plist j))
+                     (cj (product-descriptor-counts pj))
+                     (common (multiset-intersection ci cj)))
+                (when (and (>= (length common) min-factors)
+                           (or (not cse-only)
+                               (every #'cse-temp-symbol-p common)))
+                  (push common candidate-lists)))))))
+      (setf candidate-lists (remove-duplicates candidate-lists :test #'equal))
+      (setf candidate-lists
+            (sort candidate-lists #'string<
+                  :key (lambda (cand) (format nil "~S" cand))))
+      (when (null candidate-lists)
+        (verbose-log verbose "~&[CSE-FACT pass ~D] no factor candidates found~%"
+                     pass-id)
+        (return-from choose-best-factor (values nil 0 0 nil)))
+      (verbose-log verbose "~&[CSE-FACT pass ~D] ~D candidates across ~D products~%"
+                   pass-id (length candidate-lists) (length products))
+      (verbose-log verbose 2 "~&[CSE-FACT pass ~D] candidates:~%  ~{~A~%  ~}"
+                   pass-id
+                   (mapcar (lambda (cand) (format nil "~S" cand)) candidate-lists))
+      (let ((best-cand nil)
+            (best-score 0)
+            (best-uses  0)
+            (best-first-use nil))
+        (dolist (cand candidate-lists)
+          (let* ((cand-counts (counts-from-factors cand))
+                 (prod-sexpr  (cons '* cand))
+                 (size        (sexpr-size prod-sexpr))
+                 (uses        0)
+                 (first-use   nil))
+            (cond
+              ((< size min-size)
+               (verbose-log verbose 2 "~&[CSE-FACT pass ~D] skip cand ~S (size ~D < min-size ~D)~%"
+                            pass-id cand size min-size))
+              (t
+               (dolist (prod products)
+                 (let ((pc (product-descriptor-counts prod)))
+                   (when (multiset-subset-p cand-counts pc)
+                     (incf uses)
+                     (let ((idx (product-descriptor-stmt-index prod)))
+                       (setf first-use (if first-use (min first-use idx) idx))))))
+               (let ((score (* (- uses 1) size)))
+                 (verbose-log verbose 2 "~&[CSE-FACT pass ~D] cand ~S size=~D uses=~D first-use=~A score=~D (min-uses=~D)~%"
+                              pass-id cand size uses first-use score min-uses)
+                 (when (>= uses min-uses)
+                   (cond
+                     ((> score best-score)
+                      (setf best-score score
+                            best-cand cand
+                            best-uses uses
+                            best-first-use first-use))
+                     ((and (= score best-score) best-cand
+                           (string< (format nil "~S" cand)
+                                    (format nil "~S" best-cand)))
+                      (setf best-cand cand
+                            best-uses uses
+                            best-first-use first-use))))))))))
+        (values best-cand best-score best-uses best-first-use)))))
+
+(defun rewrite-with-factor (stmts env-product->sym def-env all-defs best-cand best-first-use pass-id verbose)
+  "Insert/reuse temp for BEST-CAND and rewrite STMTs accordingly.
+Returns (values new-stmts changed-p)."
+  (let* ((n (length stmts))
+         (counts-from-factors (lambda (factors)
+                                (let ((ht (make-hash-table :test #'equal)))
+                                  (dolist (f factors ht)
+                                    (incf (gethash f ht 0))))))
+         (cand-counts (funcall counts-from-factors best-cand))
+         (start-index (next-cse-temp-index-for-pass (make-block-stmt stmts) pass-id))
+         (existing (gethash (cons '* best-cand) env-product->sym))
+         (temp (or existing
+                   (intern (format nil "CSE_P~D_T~D" pass-id (1+ start-index))
+                           (symbol-package 'stmt-ir::cse-t))))
+         (temp-expr (expr-ir:sexpr->expr-ir (cons '* best-cand)))
+         (vars-used (expr-ir:expr-free-vars temp-expr))
+         (def-table (binding-env-table def-env))
+         (deps-defined-indices
+           (loop for u in vars-used
+                 for entry = (gethash u def-table nil)
+                 for di = (and entry (env-entry-index entry))
+                 when (and entry (not (typep entry 'outer-env-entry)) (integerp di))
+                   collect di))
+         (missing-dep (some (lambda (u)
+                              (and (member u all-defs :test #'eq)
+                                   (null (gethash u def-table nil))))
+                            vars-used))
+         (dep-max (if deps-defined-indices (reduce #'max deps-defined-indices) -1))
+         (min-insert (max (1+ dep-max) 0))
+         (max-allowed (or best-first-use n)))
+    (when (and vars-used missing-dep)
+      (verbose-log verbose "~&[CSE-FACT pass ~D] skip ~S (missing deps in scope)~%"
+                   pass-id best-cand)
+      (return-from rewrite-with-factor (values stmts products nil)))
+    (when (> min-insert max-allowed)
+      (verbose-log verbose "~&[CSE-FACT pass ~D] skip ~S (deps after first use: min-insert=~D max=~D)~%"
+                   pass-id best-cand min-insert max-allowed)
+      (return-from rewrite-with-factor (values stmts products nil)))
+    (let* ((insert-idx (min min-insert max-allowed))
+           (temp-assign (and (not existing)
+                             (make-assignment-stmt temp temp-expr))))
+      (labels ((multiset-subset-p (cand-counts prod-counts)
+                 (let ((ok t))
+                   (maphash (lambda (k v)
+                              (unless (<= v (gethash k prod-counts 0))
+                                (setf ok nil)))
+                            cand-counts)
+                   ok))
+             (rewrite-sexpr (sexpr target)
+               (cond
+                 ((and (consp sexpr) (eq (car sexpr) '*))
+                  (let* ((orig-factors (cdr sexpr))
+                         (prod-counts (funcall counts-from-factors orig-factors)))
+                    (if (multiset-subset-p cand-counts prod-counts)
+                        (let ((remaining '()))
+                          (maphash
+                           (lambda (k vc)
+                             (let* ((cc (gethash k cand-counts 0))
+                                    (rc (- vc cc)))
+                               (when (> rc 0)
+                                 (dotimes (i rc) (push k remaining)))))
+                           prod-counts)
+                          (let ((new-remaining (mapcar (lambda (s) (rewrite-sexpr s target))
+                                                       remaining)))
+                            (cond
+                              ((null new-remaining)
+                               (if (and existing target (eq target temp))
+                                   sexpr
+                                   temp))
+                              (t
+                               (cons '* (cons (if (and existing target (eq target temp))
+                                                  sexpr
+                                                  temp)
+                                              new-remaining))))))
+                        (cons '* (mapcar (lambda (s) (rewrite-sexpr s target))
+                                         orig-factors)))))
+                 ((consp sexpr)
+                  (cons (car sexpr)
+                        (mapcar (lambda (s) (rewrite-sexpr s target)) (cdr sexpr))))
+                 (t sexpr))))
+               (rewrite-expr (expr target)
+                 (expr-ir:sexpr->expr-ir (rewrite-sexpr (expr-ir:expr->sexpr expr) target)))
+               (rewrite-stmt (cycle)
+                 (etypecase cycle
+                   (anchored-assignment-statement
+                    (make-anchored-assignment-stmt
+                     (stmt-target-name cycle)
+                     (rewrite-expr (stmt-expression cycle) (stmt-target-name cycle))))
+                   (assignment-statement
+                    (make-assignment-stmt
+                     (stmt-target-name cycle)
+                     (rewrite-expr (stmt-expression cycle) (stmt-target-name cycle))))
+                   (raw-c-statement
+                    (let ((expr (stmt-expression cycle)))
+                      (if expr
+                          (make-raw-c-statement (raw-c-generator cycle)
+                                                (rewrite-expr expr nil))
+                          cycle)))
+                   (if-statement cycle)
+                   (block-statement cycle)
+                   (t cycle))))
+        (let ((new-stmts '()))
+          (loop for idx from 0 below n do
+            (when (and temp-assign (= idx insert-idx))
+              (push temp-assign new-stmts))
+            (push (rewrite-stmt (nth idx stmts)) new-stmts))
+          (when (and temp-assign (= insert-idx n))
+            (push temp-assign new-stmts))
+          ;; record temp for reuse
+          (setf (gethash temp def-table)
+                (make-env-entry (incf (binding-env-counter def-env)) (candidate-expr nil)))
+          (values (nreverse new-stmts) t))))))
 (defun cse-factor-products-in-block
     (block &key (min-uses 2) (min-factors 2) (min-size 2) (pass-id 1)
            (cse-only nil) (defined-env (make-binding-env)) (outer-symbols nil)
@@ -1812,198 +2029,28 @@ are logged to *TRACE-OUTPUT* (higher levels show more detail)."
                                candidate-lists))
 
             ;; Score candidates and pick the best.
-            (let ((best-cand nil)
-                  (best-score 0)
-                  (best-uses  0)
-                  (best-first-use nil)
-                  (debug-caught-maybe-invr4 nil))
-              (dolist (cand candidate-lists)
-                (let* ((cand-counts (counts-from-factors cand))
-                       (prod-sexpr  (cons '* cand))
-                       (size        (sexpr-size prod-sexpr))
-                       (uses        0)
-                       (first-use   nil))
-                  ;; Skip very small candidates early.
-                  #+(or)(when (equal cand '(expr-var::invr2 expr-var::invr2))
-                          (break "factor break here"))
-                  (cond
-                    ((< size min-size)
-                     (verbose-log verbose 2 "~&[CSE-FACT pass ~D] skip cand ~S (size ~D < min-size ~D)~%"
-                                  pass-id cand size min-size))
-                    (t
-                     (dolist (prod products)
-                       (let ((pc (product-descriptor-counts prod)))
-                         (when (multiset-subset-p cand-counts pc)
-                           (incf uses)
-                           (let ((idx (product-descriptor-stmt-index prod)))
-                             (setf first-use
-                                   (if first-use
-                                       (min first-use idx)
-                                       idx))))))
-                     (let ((score (* (- uses 1) size)))
-                       (verbose-log verbose 2 "~&[CSE-FACT pass ~D] cand ~S size=~D uses=~D first-use=~A score=~D (min-uses=~D)~%"
-                                    pass-id cand size uses first-use score min-uses)
-                       (when (>= uses min-uses)
-                         (when (and (> score best-score)
-                                    t)
-                           (setf best-score     score
-                                 best-cand      cand
-                                 best-uses      uses
-                                 best-first-use first-use))
-                         (when (and (= score best-score)
-                                    (not (null best-cand))
-                                    (string< (format nil "~S" cand)
-                                             (format nil "~S" best-cand)))
-                           (setf best-cand      cand
-                                 best-uses      uses
-                                 best-first-use first-use))))))))
-              (verbose-log verbose "~&[CSE-FACT pass ~D] best candidate so far: ~S (score=~D uses=~D first-use=~A)~%"
-                           pass-id best-cand best-score best-uses best-first-use)
-            (when (or (null best-cand)
-                      (< best-uses min-uses)
-                      (<= best-score 0))
-              ;; No beneficial factoring.
-              (verbose-log verbose "~&[CSE-FACT pass ~D] rejecting factoring (best=~S uses=~D score=~D)~%"
-                           pass-id best-cand best-uses best-score)
-              (return-from cse-factor-products-in-block current-block))
-
-            ;; We have a chosen candidate BEST-CAND.
-            (let* ((start-index (next-cse-temp-index-for-pass block pass-id))
-                   (existing (gethash (cons '* best-cand) env-product->sym))
-                   (temp
-                     (or existing
-                         (intern (format nil "CSE_P~D_T~D"
-                                         pass-id (1+ start-index))
-                                 (symbol-package 'stmt-ir::cse-t))))
-                   (cand-counts (counts-from-factors best-cand))
-                   (temp-expr   (expr-ir:sexpr->expr-ir
-                                 (cons '* best-cand)))
-                   (vars-used   (expr-ir:expr-free-vars temp-expr))
-                   ;; Barrier-aware: only allow temps defined within the same stmt run.
-                   (deps-defined-indices
-                     (loop for u in vars-used
-                           for entry = (gethash u def-table nil)
-                           for di = (and entry (env-entry-index entry))
-                           when (and entry
-                                     (not (typep entry 'outer-env-entry))
-                                     (integerp di))
-                             collect di))
-                   ;; Treat undefined symbols that never appear as assignment
-                   ;; targets in this block as outer-scope (params/constants).
-                   (missing-dep (some (lambda (u)
-                                        (and (member u all-defs :test #'eq)
-                                             (null (gethash u def-table nil))))
-                                      vars-used))
-                   (dep-max (if deps-defined-indices
-                                (reduce #'max deps-defined-indices)
-                                -1))
-                   (min-insert (max (1+ dep-max) 0))
-                   (max-allowed (or best-first-use n)))
-              ;; If any dependency has no definition in this block, do not
-              ;; hoist across barriers; skip factoring. Outer env entries
-              ;; count as definitions, even if they do not add ordering.
-              (when (and vars-used missing-dep)
-                (verbose-log verbose "~&[CSE-FACT pass ~D] skip ~S (missing deps in scope)~%"
-                             pass-id best-cand)
-                (return-from cse-factor-products-in-block current-block))
-              ;; If dependencies are defined after first use, skip factoring.
-              (when (> min-insert max-allowed)
-                (verbose-log verbose "~&[CSE-FACT pass ~D] skip ~S (deps after first use: min-insert=~D max=~D)~%"
-                             pass-id best-cand min-insert max-allowed)
-                (return-from cse-factor-products-in-block current-block))
-              (verbose-log verbose "~&[CSE-FACT pass ~D] using temp ~A for ~S (existing? ~A insert=~D deps-max=~D first-use=~A)~%"
-                           pass-id temp best-cand (and existing t)
-                           (min min-insert max-allowed) dep-max best-first-use)
-              (let* ((insert-idx (min min-insert max-allowed))
-                     (temp-assign (and (not existing)
-                                       (make-assignment-stmt temp temp-expr))))
-                ;; Rewrite expressions to use TEMP for BEST-CAND.
-                (labels
-                    ((rewrite-sexpr (sexpr target)
-                       (let ((result (cond
-                                       ;; Multiplication: factor out BEST-CAND if present.
-                                       ((and (consp sexpr)
-                                             (eq (car sexpr) '*))
-                                        (let* ((orig-factors (cdr sexpr))
-                                               (prod-counts (counts-from-factors
-                                                             orig-factors)))
-                                          (if (multiset-subset-p cand-counts prod-counts)
-                                              ;; Build remaining factors = prod-counts - cand-counts.
-                                              (let ((remaining '()))
-                                                (maphash
-                                                 (lambda (k vc)
-                                                   (let* ((cc (gethash k cand-counts 0))
-                                                          (rc (- vc cc)))
-                                                     (when (> rc 0)
-                                                       (dotimes (i rc)
-                                                         (push k remaining)))))
-                                                 prod-counts)
-                                                ;; Recurse into remaining factors before
-                                                ;; rebuilding the product.
-                                                (let ((new-remaining
-                                                        (mapcar (lambda (s) (rewrite-sexpr s target))
-                                                                remaining)))
-                                                  (cond
-                                                    ((null new-remaining)
-                                                     (if (and existing target (eq target temp))
-                                                         sexpr
-                                                         temp))
-                                                    (t
-                                                     (cons '* (cons (if (and existing target (eq target temp))
-                                                                        sexpr
-                                                                        temp)
-                                                                    new-remaining))))))
-                                              ;; No full candidate here; recurse normally.
-                                              (cons '* (mapcar (lambda (s) (rewrite-sexpr s target))
-                                                               orig-factors)))))
-                                       ((consp sexpr)
-                                        (cons (car sexpr)
-                                              (mapcar (lambda (s) (rewrite-sexpr s target))
-                                                      (cdr sexpr))))
-                                       (t
-                                        sexpr))))
-                         result))
-                     (rewrite-expr (expr target)
-                       (let* ((sexpr (expr-ir:expr->sexpr expr))
-                              (rsexpr (rewrite-sexpr sexpr target)))
-                         (expr-ir:sexpr->expr-ir rsexpr)))
-                     (rewrite-stmt (cycle)
-                       (etypecase cycle
-                         (anchored-assignment-statement
-                          (make-anchored-assignment-stmt
-                           (stmt-target-name cycle)
-                           (rewrite-expr (stmt-expression cycle)
-                                         (stmt-target-name cycle))))
-                         (assignment-statement
-                          (make-assignment-stmt
-                           (stmt-target-name cycle)
-                           (rewrite-expr (stmt-expression cycle)
-                                         (stmt-target-name cycle))))
-                         (raw-c-statement
-                          (let ((expr (stmt-expression cycle)))
-                            (if expr
-                                (make-raw-c-statement
-                                 (raw-c-generator cycle)
-                                 (rewrite-expr expr nil))
-                                cycle)))
-                         ;; Children already optimized; leave nested blocks/ifs untouched.
-                         (if-statement cycle)
-                         (block-statement cycle)
-                         (t cycle))))
-                  (let ((new-stmts '()))
-                    (loop for idx from 0 below n do
-                      (when (and temp-assign (= idx insert-idx))
-                        (push temp-assign new-stmts))
-                      (push (rewrite-stmt (nth idx stmts)) new-stmts))
-                    ;; If insertion index is at the end, ensure we append.
-                    (when (and temp-assign (= insert-idx n))
-                      (push temp-assign new-stmts))
-                    (let ((result (make-block-stmt (nreverse new-stmts))))
-                      (verbose-log verbose "~&[CSE-FACT pass ~D] ~A temp ~A at index ~D~%"
-                                   pass-id
-                                   (if temp-assign "inserted" "reused existing")
-                                   temp insert-idx)
-                      result))))))))))))
+      (loop
+        ;; Pick best candidate
+        (multiple-value-bind (best-cand best-score best-uses best-first-use)
+            (choose-best-factor products min-factors min-size min-uses cse-only env-product->sym pass-id verbose)
+          (when (or (null best-cand)
+                    (< best-uses min-uses)
+                    (<= best-score 0))
+            (return (make-block-stmt stmts)))
+          (verbose-log verbose "~&[CSE-FACT pass ~D] best candidate so far: ~S (score=~D uses=~D first-use=~A)~%"
+                       pass-id best-cand best-score best-uses best-first-use)
+          (multiple-value-bind (new-stmts changed)
+              (rewrite-with-factor stmts env-product->sym def-env all-defs best-cand best-first-use pass-id verbose)
+            (declare (ignore changed))
+            (if (eq new-stmts stmts)
+                (return (make-block-stmt stmts))
+                (progn
+                  (setf stmts new-stmts)
+                  ;; Re-walk to collect products again after rewrite.
+                  (let* ((acc2 (make-instance 'cse-factor-accumulator)))
+                    (collect-products-in-block (make-block-stmt stmts) def-env acc2 pass-id min-uses min-factors min-size cse-only outer-symbols verbose)
+                    (setf env-product->sym (cse-acc-env-product->sym acc2))
+                    (setf products (nreverse (cse-acc-products acc2))))))))))))
 
 
 (defun cse-block-multi-optimization (counter block
