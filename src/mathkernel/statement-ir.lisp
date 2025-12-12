@@ -1487,6 +1487,139 @@ We scan BLOCK recursively."
 
 (defparameter *in-rewrite* nil)
 
+;;; ----------------------------------------------------------------------
+;;; CSE factor walker context/accumulator
+;;; ----------------------------------------------------------------------
+
+(defclass cse-factor-accumulator ()
+  ((products
+    :initarg :products
+    :accessor cse-acc-products
+    :initform '()
+    :documentation "Collected product-descriptor objects for this pass.")
+   (env-product->sym
+    :initarg :env-product->sym
+    :accessor cse-acc-env-product->sym
+    :initform (make-hash-table :test #'equal)
+    :documentation "Map product sexpr -> existing temp symbol for reuse.")
+   (stmts
+    :initarg :stmts
+    :accessor cse-acc-stmts
+    :initform '()
+    :documentation "Threaded statements in program order during the walk.")))
+
+(defclass cse-factor-context (walk-context)
+  ((env
+    :initarg :env
+    :accessor cse-ctx-env)
+   (idx
+    :initarg :idx
+    :accessor cse-ctx-idx)
+   (pass-id
+    :initarg :pass-id
+    :reader cse-ctx-pass-id)
+   (min-uses
+    :initarg :min-uses
+    :reader cse-ctx-min-uses)
+   (min-factors
+    :initarg :min-factors
+    :reader cse-ctx-min-factors)
+   (min-size
+    :initarg :min-size
+    :reader cse-ctx-min-size)
+   (cse-only
+    :initarg :cse-only
+    :reader cse-ctx-cse-only)
+   (verbose
+    :initarg :verbose
+    :reader cse-ctx-verbose)
+   (outer-symbols
+    :initarg :outer-symbols
+    :reader cse-ctx-outer-symbols)
+   (acc
+    :initarg :acc
+    :accessor cse-ctx-acc)))
+
+(defun make-cse-factor-context (&key env idx pass-id min-uses min-factors min-size
+                                     cse-only verbose outer-symbols acc)
+  (make-instance 'cse-factor-context
+                 :env env
+                 :idx idx
+                 :pass-id pass-id
+                 :min-uses min-uses
+                 :min-factors min-factors
+                 :min-size min-size
+                 :cse-only cse-only
+                 :verbose verbose
+                 :outer-symbols outer-symbols
+                 :acc acc))
+
+(defmethod clone-context ((operation (eql :cse-factor-products)) (ctx cse-factor-context))
+  ;; Branch-local env/idx are copied; accumulator is shared so branches contribute
+  ;; to the same analysis.
+  (make-cse-factor-context
+   :env (copy-binding-env (cse-ctx-env ctx))
+   :idx -1
+   :pass-id (cse-ctx-pass-id ctx)
+   :min-uses (cse-ctx-min-uses ctx)
+   :min-factors (cse-ctx-min-factors ctx)
+   :min-size (cse-ctx-min-size ctx)
+   :cse-only (cse-ctx-cse-only ctx)
+   :verbose (cse-ctx-verbose ctx)
+   :outer-symbols (cse-ctx-outer-symbols ctx)
+   :acc (cse-ctx-acc ctx)))
+
+(defun %counts-from-factors (factors)
+  (let ((ht (make-hash-table :test #'equal)))
+    (dolist (f factors ht)
+      (incf (gethash f ht 0)))))
+
+(defun %record-products-from-expr (expr idx target acc min-factors)
+  (labels ((rec (sx)
+             (when (and (consp sx) (eq (car sx) '*))
+               (let ((factors (cdr sx)))
+                 (when (>= (length factors) min-factors)
+                   (push (make-instance 'product-descriptor
+                                        :factors factors
+                                        :counts (%counts-from-factors factors)
+                                        :stmt-index idx
+                                        :target target)
+                         (cse-acc-products acc)))))
+             (when (consp sx)
+               (dolist (arg (cdr sx))
+                 (rec arg)))))
+    (rec (expr-ir:expr->sexpr expr))
+    acc))
+
+(defmethod on-statement ((operation (eql :cse-factor-products)) (ctx cse-factor-context) st)
+  (etypecase st
+    (assignment-statement
+     (let* ((env (cse-ctx-env ctx))
+            (def-table (binding-env-table env))
+            (idx (incf (cse-ctx-idx ctx)))
+            (tgt (stmt-target-name st)))
+       (when (gethash tgt def-table)
+         (error "SSA violation: ~S already defined in env" tgt))
+       (setf (gethash tgt def-table)
+             (make-env-entry idx (stmt-expression st)))
+       (%record-products-from-expr (stmt-expression st) idx tgt
+                                   (cse-ctx-acc ctx)
+                                   (cse-ctx-min-factors ctx))
+       (push st (cse-acc-stmts (cse-ctx-acc ctx)))
+       (values st ctx)))
+    (raw-c-statement
+     (push st (cse-acc-stmts (cse-ctx-acc ctx)))
+     (values st ctx))
+    (if-statement
+     ;; Children handled separately in the main function; keep as-is here.
+     (push st (cse-acc-stmts (cse-ctx-acc ctx)))
+     (values st ctx))
+    (block-statement
+     (push st (cse-acc-stmts (cse-ctx-acc ctx)))
+     (values st ctx))
+    (t
+     (push st (cse-acc-stmts (cse-ctx-acc ctx)))
+     (values st ctx))))
 
 (defun cse-factor-products-in-block
     (block &key (min-uses 2) (min-factors 2) (min-size 2) (pass-id 1)
@@ -1515,17 +1648,10 @@ are logged to *TRACE-OUTPUT* (higher levels show more detail)."
   (unless (typep block 'block-statement)
     (error "cse-factor-products-in-block: expected BLOCK-STATEMENT, got ~S" block))
 
-  ;; Recurse through statements in order, threading env so children see prior defs.
-  ;; NOTE: Be careful not to re-optimize children again after this pass; doing so
-  ;; would clobber substitutions made inside them. This traversal is the only
-  ;; point where child blocks/ifs are processed.
   (let* ((def-env (copy-binding-env defined-env))
          (def-table (binding-env-table def-env))
          (all-defs (collect-scalar-targets-in-block block))
-         (env-product->sym (make-hash-table :test #'equal))
-         (products '())
-         (stmts '())
-         (idx -1))
+         (acc (make-instance 'cse-factor-accumulator)))
     ;; Seed outer-scope symbols (e.g., parameters/constants) so we don't treat them as missing deps.
     (dolist (sym outer-symbols)
       (unless (gethash sym def-table)
@@ -1533,52 +1659,63 @@ are logged to *TRACE-OUTPUT* (higher levels show more detail)."
               (make-instance 'outer-env-entry :index -1 :expr nil))))
     (verbose-log verbose "~&[CSE-FACT pass ~D] scanning block with ~D statements (cse-only? ~A)~%"
                  pass-id (length (block-statements block)) cse-only)
-    (dolist (cycle (block-statements block))
-      (incf idx)
-      (etypecase cycle
-        (assignment-statement
-         (let ((tgt (stmt-target-name cycle)))
-           (when (gethash tgt def-table)
-             (error "SSA violation: ~S already defined in env" tgt))
-           (setf (gethash tgt def-table)
-                 (make-env-entry idx (stmt-expression cycle))))
-         (push cycle stmts))
-        (if-statement
-         (let* ((child-env (copy-binding-env def-env))
-                (tb (if-then-block cycle))
-                (eb (if-else-block cycle))
-                (new-tb (and tb (cse-factor-products-in-block tb
-                                                              :min-uses min-uses
-                                                              :min-factors min-factors
-                                                              :min-size min-size
-                                                              :pass-id pass-id
-                                                              :cse-only cse-only
-                                                              :defined-env (copy-binding-env child-env)
-                                                              :verbose verbose)))
-                (new-eb (and eb (cse-factor-products-in-block eb
-                                                              :min-uses min-uses
-                                                              :min-factors min-factors
-                                                              :min-size min-size
-                                                              :pass-id pass-id
-                                                              :cse-only cse-only
-                                                              :defined-env (copy-binding-env child-env)
-                                                              :verbose verbose))))
-           (push (make-if-stmt (if-condition cycle) new-tb new-eb) stmts)))
-        (block-statement
-         (push (cse-factor-products-in-block cycle
-                                             :min-uses min-uses
-                                             :min-factors min-factors
-                                             :min-size min-size
-                                             :pass-id pass-id
-                                             :cse-only cse-only
-                                             :defined-env (copy-binding-env def-env)
-                                             :verbose verbose)
-               stmts))
-        (t
-         (push cycle stmts))))
-    (let* ((stmts (reverse stmts))
-           (n     (length stmts))
-           (current-block (make-block-stmt stmts)))
+    ;; First, factor nested blocks/ifs recursively so they are independent.
+    (let* ((normalized-stmts
+             (loop for st in (block-statements block)
+                   collect
+                     (etypecase st
+                       (if-statement
+                        (let* ((child-env (copy-binding-env def-env))
+                               (tb (if-then-block st))
+                               (eb (if-else-block st))
+                               (new-tb (and tb (cse-factor-products-in-block tb
+                                                                             :min-uses min-uses
+                                                                             :min-factors min-factors
+                                                                             :min-size min-size
+                                                                             :pass-id pass-id
+                                                                             :cse-only cse-only
+                                                                             :defined-env (copy-binding-env child-env)
+                                                                             :outer-symbols outer-symbols
+                                                                             :verbose verbose)))
+                               (new-eb (and eb (cse-factor-products-in-block eb
+                                                                             :min-uses min-uses
+                                                                             :min-factors min-factors
+                                                                             :min-size min-size
+                                                                             :pass-id pass-id
+                                                                             :cse-only cse-only
+                                                                             :defined-env (copy-binding-env child-env)
+                                                                             :outer-symbols outer-symbols
+                                                                             :verbose verbose)))))
+                          (make-if-stmt (if-condition st) new-tb new-eb)))
+                       (block-statement
+                        (cse-factor-products-in-block st
+                                                       :min-uses min-uses
+                                                       :min-factors min-factors
+                                                       :min-size min-size
+                                                       :pass-id pass-id
+                                                       :cse-only cse-only
+                                                       :defined-env (copy-binding-env def-env)
+                                                       :outer-symbols outer-symbols
+                                                       :verbose verbose))
+                       (t st))))
+           (current-block (make-block-stmt normalized-stmts)))
+      ;; Walk top-level statements to collect products/stmts.
+      (let* ((ctx (make-cse-factor-context
+                   :env def-env
+                   :idx -1
+                   :pass-id pass-id
+                   :min-uses min-uses
+                   :min-factors min-factors
+                   :min-size min-size
+                   :cse-only cse-only
+                   :verbose verbose
+                   :outer-symbols outer-symbols
+                   :acc acc)))
+        (walk-block-with-context :cse-factor-products ctx current-block))
+      (let* ((stmts (nreverse (cse-acc-stmts acc)))
+             (n     (length stmts))
+             (env-product->sym (cse-acc-env-product->sym acc))
+             (products (nreverse (cse-acc-products acc))))
 
         
       ;; Seed product list and reuse map from env entries.
