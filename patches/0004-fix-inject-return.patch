@@ -1,0 +1,32 @@
+diff --git a/src/mathkernel/kernel-dsl.lisp b/src/mathkernel/kernel-dsl.lisp
+index 941363d..bc6be5d 100644
+--- a/src/mathkernel/kernel-dsl.lisp
++++ b/src/mathkernel/kernel-dsl.lisp
+@@ -744,9 +744,10 @@ using the assignments visible along that control-flow path."
+          (new-block nil)
+          (new-ctx nil))
+     (declare (ignore new-ctx))
+-    (multiple-value-setq (new-block new-ctx)
+-      (stmt-ir:walk-block-with-context :inject-gradients ctx block))
+-    new-block))
++    (multiple-value-bind (blk ctx-out)
++        (stmt-ir:walk-block-with-context :inject-gradients ctx block)
++      (declare (ignore ctx-out))
++      blk)))
+ 
+ (defun inject-hessians-after-energy (block coord-vars energy-var hess-target-fn
+                                     &optional manual-deriv-spec)
+@@ -761,9 +762,10 @@ using the assignments visible along that control-flow path."
+          (new-block nil)
+          (new-ctx nil))
+     (declare (ignore new-ctx))
+-    (multiple-value-setq (new-block new-ctx)
+-      (stmt-ir:walk-block-with-context :inject-hessians ctx block))
+-    new-block))
++    (multiple-value-bind (blk ctx-out)
++        (stmt-ir:walk-block-with-context :inject-hessians ctx block)
++      (declare (ignore ctx-out))
++      blk)))
+ 
+ 
+ (defun build-assignment-map (block)

@@ -741,8 +741,13 @@ using the assignments visible along that control-flow path."
                :coord-vars coord-vars
                :energy-var energy-var
                :grad-target-fn grad-target-fn))
-         (result (stmt-ir:walk-block-with-context :inject-gradients ctx block)))
-    (car result)))
+         (new-block nil)
+         (new-ctx nil))
+    (declare (ignore new-ctx))
+    (multiple-value-bind (blk ctx-out)
+        (stmt-ir:walk-block-with-context :inject-gradients ctx block)
+      (declare (ignore ctx-out))
+      blk)))
 
 (defun inject-hessians-after-energy (block coord-vars energy-var hess-target-fn
                                     &optional manual-deriv-spec)
@@ -754,8 +759,13 @@ using the assignments visible along that control-flow path."
                :energy-var energy-var
                :hess-target-fn hess-target-fn
                :manual-deriv-spec manual-deriv-spec))
-         (result (stmt-ir:walk-block-with-context :inject-hessians ctx block)))
-    (car result)))
+         (new-block nil)
+         (new-ctx nil))
+    (declare (ignore new-ctx))
+    (multiple-value-bind (blk ctx-out)
+        (stmt-ir:walk-block-with-context :inject-hessians ctx block)
+      (declare (ignore ctx-out))
+      blk)))
 
 
 (defun build-assignment-map (block)
