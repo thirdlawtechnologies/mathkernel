@@ -15,6 +15,7 @@
                                            (:file "expression-rewrite")
                                            (:file "numeric-diff")
                                            (:file "expression-tests")
+                                           (:file "walker")
                                            (:file "statement-ir")
                                            (:file "expression-diff")
                                            (:file "statement-diff")

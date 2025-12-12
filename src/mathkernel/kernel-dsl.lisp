@@ -404,6 +404,7 @@ Signals warnings or errors if mismatches are found, depending on mode."
               (build-deriv-env-for-block base-block q)))
       ;; helper for reporting
       (labels ((report-mismatch (what manual-expr auto-expr sx1 sx2)
+                 (break "Mismatch")
                  (let* ((*package* (find-package :expr-var))
                         (msg (format nil
                                      "Geometry derivative mismatch for ~S:~%  manual: ~A~%  auto:   ~A"
@@ -850,8 +851,6 @@ If MANUAL-DERIV-SPEC is NIL, fall back to the existing pure AD path."
                          (push stmt hess-assignments))))))))))
        (let* ((out (reverse hess-assignments))
               (targets (mapcar #'stmt-ir:stmt-target-name out)))
-         (format t "[make-hessian-assignments-from-block/~a] manual/hibrid emitted ~d targets: ~s~%"
-                 mode (length out) targets)
          out)))
     ;; Default / AD path (existing behavior)
     (t
@@ -878,8 +877,6 @@ If MANUAL-DERIV-SPEC is NIL, fall back to the existing pure AD path."
                        (push stmt hess-assignments))))))))
          (let* ((out (reverse hess-assignments))
                 (targets (mapcar #'stmt-ir:stmt-target-name out)))
-           (format t "[make-hessian-assignments-from-block/ad] auto emitted ~d targets: ~s~%"
-                   (length out) targets)
            out))))))
 
 
@@ -923,7 +920,6 @@ emit a RAW-C-STMT that accumulates it into *energy_accumulate."
   "If TARGET-SYM is a gradient scalar like G_X1, return a RAW-C-STATEMENT
 calling KernelGradientAcc(i_base, offset, g_x1); otherwise return NIL."
   (let ((coord (grad-target-name->coord target-sym)))
-    (warn "make-force-macro-call-from-grad-target target-sym: ~s coord = ~s" target-sym coord)
     (when coord
       (multiple-value-bind (ibase off) (coord-name->ibase+offset coord layout)
         (let* ((ibase-str (string-downcase (symbol-name ibase)))
@@ -938,7 +934,6 @@ calling KernelGradientAcc(i_base, offset, g_x1); otherwise return NIL."
   Otherwise return NIL."
   (multiple-value-bind (c1 c2)
       (hess-target-name->coords target-sym)
-    (warn "make-force-macro-call-from-grad-target target-sym: ~s c1,c2 = ~s,~s" target-sym c1 c2)
     (when (and c1 c2)
       (multiple-value-bind (ibase1 off1) (coord-name->ibase+offset c1 layout)
         (multiple-value-bind (ibase2 off2) (coord-name->ibase+offset c2 layout)
@@ -1021,15 +1016,31 @@ assignments VAR := EXPR-IR-node.
 
 BASE-VAR is a coordinate symbol like X1, Y1, etc."
   (declare (optimize (debug 3)))
-  (let ((deriv-env (expr-ir:make-deriv-env)))
-    ;; Walk the assignments in order and update deriv-env.
-    (dolist (st (stmt-ir:block-statements block) deriv-env)
-      (when (typep st 'stmt-ir:assignment-statement)
-        (let* ((var  (expr-ir:ev (stmt-ir:stmt-target-name st)))
-               (expr (stmt-ir:stmt-expression st))
-               ;; Use your existing differentiator with this env
-               (dvar (expr-ir:differentiate-expr expr base-var deriv-env)))
-          (expr-ir:set-var-derivative var dvar deriv-env))))))
+  (labels ((process-block (blk env)
+             (dolist (st (stmt-ir:block-statements blk) env)
+               (etypecase st
+                 (stmt-ir:assignment-statement
+                  (let* ((var  (expr-ir:ev (stmt-ir:stmt-target-name st)))
+                         (expr (stmt-ir:stmt-expression st))
+                         (dvar (expr-ir:differentiate-expr expr base-var env)))
+                    (expr-ir:set-var-derivative var dvar env)))
+                 (stmt-ir:if-statement
+                  ;; Recurse into branches with copies of env; if both branches
+                  ;; produce a derivative, prefer THEN; otherwise take what's available.
+                  (let* ((then-env (when (stmt-ir:if-then-block st)
+                                     (process-block (stmt-ir:if-then-block st)
+                                                    (expr-ir:copy-deriv-env env))))
+                         (else-env (when (stmt-ir:if-else-block st)
+                                     (process-block (stmt-ir:if-else-block st)
+                                                    (expr-ir:copy-deriv-env env)))))
+                    (when then-env
+                      (maphash (lambda (k v) (expr-ir:set-var-derivative k v env)) then-env))
+                    (when (and else-env (null then-env))
+                      (maphash (lambda (k v) (expr-ir:set-var-derivative k v env)) else-env))))
+                 (stmt-ir:block-statement
+                  (setf env (process-block st env)))
+                 (t env)))))
+    (process-block block (expr-ir:make-deriv-env))))
 
 
 
@@ -1876,7 +1887,6 @@ energy-only kernels where D! requests are unnecessary."
               (setf current-block
                     (inject-gradients-after-energy
                      current-block coord-vars energy-var #'general-grad-name))
-              (stmt-ir:debug-block current-block :label "After gradient added")
               (setf current-stmts (copy-list (stmt-ir:block-statements current-block))))
             (when pipeline
               (let ((grad-block (stmt-ir:make-block-stmt current-stmts)))
@@ -1906,8 +1916,7 @@ energy-only kernels where D! requests are unnecessary."
                                                                (string= (subseq s 0 2) "H_")))))
                                                  assign-targets)))
                   (setf h-targets-pre h-targets)
-                  (format t "[make-kernel-from-block/~a] pre-hess-pipeline scalars (~d): ~s~%"
-                          name (length h-targets-pre) h-targets-pre)))
+                  ))
               (when pipeline
                 (let ((hess-block (stmt-ir:make-block-stmt current-stmts)))
                   (multiple-value-bind (hess-opt results total-before total-after)
@@ -1928,8 +1937,6 @@ energy-only kernels where D! requests are unnecessary."
                                                         (and (>= (length s) 2)
                                                              (string= (subseq s 0 2) "H_")))))
                                                assign-targets)))
-                (format t "[make-kernel-from-block/~a] pre-transform Hessians (~d): ~s~%"
-                        name (length h-targets) h-targets)
                 (when compute-hess
                   (let* ((missing (set-difference h-targets-pre h-targets :test #'eq)))
                     (format t "[make-kernel-from-block/~a] Hessians dropped by pipeline (~d): ~s~%"
@@ -2051,4 +2058,9 @@ energy-only kernels where D! requests are unnecessary."
 
 (defmacro with-kernels ((destination) &body body)
   `(let ((,destination nil))
+     ,@body))
+
+
+(defmacro with-trace-output (filename &body body)
+  `(with-open-file (*trace-output* filename :direction :output :if-exists :supersede)
      ,@body))

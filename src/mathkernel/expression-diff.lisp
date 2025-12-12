@@ -25,6 +25,12 @@
 Keys are variable-name strings (UPCASE). Values are expression IR nodes."
   (make-hash-table :test #'equal))
 
+(defun copy-deriv-env (env)
+  "Shallow copy of DERIV-ENV (derivative environment hash-table)."
+  (let ((new (make-deriv-env)))
+    (maphash (lambda (k v) (setf (gethash k new) v)) env)
+    new))
+
 
 (defun set-var-derivative (var deriv-expr deriv-env)
   "Record d(VAR)/d(base-var) = DERIV-EXPR in DERIV-ENV.

@@ -107,6 +107,7 @@
    #:add-expressions
    #:ev
 
+  #:copy-deriv-env
    #:factor-sum-of-products
    #:normalize-signs-expr
    #:debug-sexpr
@@ -172,7 +173,7 @@
    #:make-block-stmt
    #:make-c-function
 
-   #:build-derivative-env-for-block
+  #:build-derivative-env-for-block
    #:differentiate-target-in-block
    #:make-derivative-assignments-for-block
    #:make-local-partial-derivative-assignments-for-block
@@ -180,22 +181,22 @@
    #:simplify-statement
    #:simplify-block
 
-   #:make-energy-grad-block
-   #:make-energy-grad-hess-block
+  #:make-energy-grad-block
+  #:make-energy-grad-hess-block
 
-   #:c-function->c-source-string
-   #:cse-block-multi-optimization
+  #:c-function->c-source-string
+  #:cse-block-multi-optimization
    #:cse-block-multi
    #:collect-scalar-targets-in-block
    #:copy-propagate-optimization
    #:*debug*
    #:check-cse-temp-order
 
-   #:factor-sums-optimization
-   #:factor-temp-param-products-optimization
-   #:normalize-signs-optimization
-   #:make-optimization-pipeline
-  #:make-optimization
+  #:factor-sums-optimization
+  #:factor-temp-param-products-optimization
+  #:normalize-signs-optimization
+  #:make-optimization-pipeline
+ #:make-optimization
   #:run-optimization-pipeline
   #:make-pass-id-counter
   #:reorder-block-def-before-use
@@ -211,6 +212,10 @@
    #:alias-assigned-exprs-optimization
   #:make-block-stmt-unsafe
   #:check-def-before-use-in-block
+  #:walk-context
+  #:walk-block-with-context
+  #:clone-context
+  #:on-statement
   ;; comparison harness generator
   #:write-kernel-compare-c
   #:write-kernel-compare-from-kernels
@@ -220,7 +225,8 @@
   #:write-kernel-compare-harness
   #:raw-c-generator
   #:make-anchored-assignment-stmt
-  #:anchored-assignment-statement))
+  #:anchored-assignment-statement
+  #:*verbose-optimization*))
 
 (defpackage :stmt-ir.tests
   (:use :cl :expr-ir :stmt-ir)
@@ -252,7 +258,8 @@
    #:build-multiple-kernels
    #:with-kernels
    #:build-kernel
-   #:emit-c-tests))
+   #:emit-c-tests
+   #:with-trace-output))
 
 ;;;; Symbols go in this package
 (defpackage :mathkernel-user

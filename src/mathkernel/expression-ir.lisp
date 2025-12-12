@@ -26,9 +26,11 @@
       ;; When someone asks for READABLE printing (e.g. ~S in some contexts),
       ;; fall back to default so you don't break the reader.
       (call-next-method)
-      (print-unreadable-object (expr stream :type t :identity t)
+      (print-unreadable-object (expr stream :type t)
         (handler-case
-            (prin1 (expr->sexpr expr) stream)
+            (let ((*print-pretty* nil)
+                  (*package* (find-package :expr-var)))
+              (format stream "~s" (expr->sexpr expr)))
           (error ()
             ;; As a fallback, if expr->sexpr blows up, just show the type.
             (princ "<unprintable-expr>" stream))))))

@@ -739,14 +739,14 @@ and return an alist mapping kernel name strings to generated C source strings."
             :name :kernel-full
             :optimizations
             (list
-             (stmt-ir:make-optimization
-              :name :linear-canonicalization
-              :function 'stmt-ir:linear-canonicalization-optimization)
-             (stmt-ir:make-optimization
-              :name :factor-sums
-              :function 'stmt-ir:factor-sums-optimization
-              :keyword-args (list :min-uses 2 :min-factors 1 :min-size 4))
-             (stmt-ir:make-optimization
+            (stmt-ir:make-optimization
+             :name :linear-canonicalization
+             :function 'stmt-ir:linear-canonicalization-optimization)
+            (stmt-ir:make-optimization
+             :name :factor-sums
+             :function 'stmt-ir:factor-sums-optimization
+             :keyword-args (list :min-uses 2 :min-factors 1 :min-size 4))
+            (stmt-ir:make-optimization
               :name :cse-full
               :function 'stmt-ir:cse-block-multi-optimization
               :keyword-args (list :max-passes 50 :min-uses 2 :min-size 1))
