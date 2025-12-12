@@ -2036,127 +2036,85 @@ energy-only kernels where D! requests are unnecessary."
            :compute-second-derivs t
            :reuse-assignments    t))
         (format t "[KERNEL ~a] 3. start building core E/G/H assignments~%" name)
+        ;; Build E/G/H in phases with the walker injectors:
+        ;;   1) insert gradients right after energy assignments (path-sensitive)
+        ;;   2) optimize E+G
+        ;;   3) insert Hessians right after energy assignments (path-sensitive)
+        ;;   4) optimize E+G+H
         (let* ((current-stmts (copy-list (stmt-ir:block-statements base-block*)))
                (current-block (stmt-ir:make-block-stmt current-stmts)))
-          (flet ((append-at-tail-or-into-if (stmts extra)
-                   "Append EXTRA statements; if the last stmt is an IF, append inside its branches."
-                   (if (and stmts (typep (car (last stmts)) 'stmt-ir:if-statement))
-                       (let* ((last-if (car (last stmts)))
-                              (rest    (butlast stmts 1))
-                              (then-b  (stmt-ir:if-then-block last-if))
-                              (else-b  (stmt-ir:if-else-block last-if))
-                              (new-then (and then-b
-                                             (stmt-ir:make-block-stmt
-                                              (append (stmt-ir:block-statements then-b)
-                                                      (copy-list extra)))))
-                              (new-else (and else-b
-                                             (stmt-ir:make-block-stmt
-                                              (append (stmt-ir:block-statements else-b)
-                                                      (copy-list extra))))))
-                         (append rest
-                                 (list (stmt-ir:make-if-stmt
-                                        (stmt-ir:if-condition last-if)
-                                        new-then new-else))))
-                       (append stmts extra))))
-            (when compute-grad
-              (setf current-block
-                    (inject-gradients-after-energy
-                     current-block coord-vars energy-var #'general-grad-name))
-              (setf current-stmts (copy-list (stmt-ir:block-statements current-block))))
-            (when pipeline
-              (let ((grad-block (stmt-ir:make-block-stmt current-stmts)))
-                (multiple-value-bind (grad-opt results total-before total-after)
-                    (stmt-ir:run-optimization-pipeline
-                     pass-counter pipeline grad-block
-                     :name (the-name "e-grad")
-                     :log-stream *trace-output*)
-                  (declare (ignore results total-before total-after))
-                  (setf current-stmts
-                        (copy-list (stmt-ir:block-statements grad-opt))))))
-            (let ((h-targets-pre nil))
-              (when compute-hess
-                (let ((hess-stmts (make-hessian-assignments-from-block
-                                   base-block* energy-var coord-vars #'general-hess-name
-                                   manual-deriv-spec)))
-                  (setf current-stmts
-                        (append-at-tail-or-into-if current-stmts hess-stmts)))
-                ;; Trace before post-hessian pipeline
-                (let* ((assign-targets (loop for st in current-stmts
-                                             when (typep st 'stmt-ir:assignment-statement)
-                                               collect (stmt-ir:stmt-target-name st)))
-                       (h-targets (remove-if-not (lambda (sym)
-                                                   (and (symbolp sym)
-                                                        (let ((s (symbol-name sym)))
-                                                          (and (>= (length s) 2)
-                                                               (string= (subseq s 0 2) "H_")))))
-                                                 assign-targets)))
-                  (setf h-targets-pre h-targets)
-                  ))
-              (when pipeline
-                (let ((hess-block (stmt-ir:make-block-stmt current-stmts)))
-                  (multiple-value-bind (hess-opt results total-before total-after)
-                      (stmt-ir:run-optimization-pipeline
-                       pass-counter pipeline hess-block
-                       :name (the-name "e-g-hess")
-                       :log-stream *trace-output*)
-                    (declare (ignore results total-before total-after))
-                    (setf current-stmts
-                          (copy-list (stmt-ir:block-statements hess-opt))))))
-              ;; Trace which Hessian scalars survived the pipeline, before EG/H lowering.
-              (let* ((assign-targets (loop for st in current-stmts
-                                           when (typep st 'stmt-ir:assignment-statement)
-                                             collect (stmt-ir:stmt-target-name st)))
-                     (h-targets (remove-if-not (lambda (sym)
-                                                 (and (symbolp sym)
-                                                      (let ((s (symbol-name sym)))
-                                                        (and (>= (length s) 2)
-                                                             (string= (subseq s 0 2) "H_")))))
-                                               assign-targets)))
-                (when compute-hess
-                  (let* ((missing (set-difference h-targets-pre h-targets :test #'eq)))
-                    (format t "[make-kernel-from-block/~a] Hessians dropped by pipeline (~d): ~s~%"
-                            name (length missing) missing))))
-              (let* ((core-block
-                       (let ((blk (stmt-ir:make-block-stmt current-stmts)))
-                         (stmt-ir:check-def-before-use-in-block blk :errorp t)
-                         blk))
-                     (block-with-coords
-                       (if coord-load-stmts
-                           (stmt-ir:make-block-stmt
-                            (append coord-load-stmts (list core-block)))
-                           core-block))
-                     (eg-h-block
-                       (transform-eg-h-block
-                        block-with-coords layout coord-vars
-                        #'general-grad-name #'general-hess-name))
-                     (eg-h-block*
-                       (if post-eg-h-pipeline*
-                           (multiple-value-bind (post-block results total-before total-after)
-                               (stmt-ir:run-optimization-pipeline
-                                pass-counter post-eg-h-pipeline* eg-h-block
-                                :name (the-name "post-eg-h")
-                                :log-stream *trace-output*)
-                             (declare (ignore results total-before total-after))
-                             post-block)
-                           eg-h-block)))
-                (make-kernel-ir
-                 :group group
-                 :name name
-                 :layout layout
-                 :coord-vars coord-vars
-                 :coord-load-stmts coord-load-stmts
-                 :params params
-                 :core-block core-block
-                 :eg-h-block eg-h-block*
-                 :compute-energy-p compute-energy
-                 :compute-grad-p   compute-grad
-                 :compute-hess-p   compute-hess
-                 :manual-deriv-spec manual-deriv-spec
-                 :pipeline pipeline
-                 :extra-equivalence-rules extra-equivalence-rules
-                 :extra-optimization-rules extra-optimization-rules
-                 :return-type return-type
-                 :return-expr return-expr)))))))))
+          (when compute-grad
+            (setf current-block
+                  (inject-gradients-after-energy
+                   current-block coord-vars energy-var #'general-grad-name))
+            (setf current-stmts (copy-list (stmt-ir:block-statements current-block))))
+          (when pipeline
+            (let ((grad-block (stmt-ir:make-block-stmt current-stmts)))
+              (multiple-value-bind (grad-opt results total-before total-after)
+                  (stmt-ir:run-optimization-pipeline
+                   pass-counter pipeline grad-block
+                   :name (the-name "e-grad")
+                   :log-stream *trace-output*)
+                (declare (ignore results total-before total-after))
+                (setf current-stmts
+                      (copy-list (stmt-ir:block-statements grad-opt))))))
+          (when compute-hess
+            (let* ((hess-block (stmt-ir:make-block-stmt current-stmts))
+                   (with-h (inject-hessians-after-energy
+                            hess-block coord-vars energy-var #'general-hess-name
+                            manual-deriv-spec)))
+              (setf current-stmts (copy-list (stmt-ir:block-statements with-h)))))
+          (when pipeline
+            (let ((hess-block (stmt-ir:make-block-stmt current-stmts)))
+              (multiple-value-bind (hess-opt results total-before total-after)
+                  (stmt-ir:run-optimization-pipeline
+                   pass-counter pipeline hess-block
+                   :name (the-name "e-g-hess")
+                   :log-stream *trace-output*)
+                (declare (ignore results total-before total-after))
+                (setf current-stmts
+                      (copy-list (stmt-ir:block-statements hess-opt))))))
+          (let* ((core-block
+                   (let ((blk (stmt-ir:make-block-stmt current-stmts)))
+                     (stmt-ir:check-def-before-use-in-block blk :errorp t)
+                     blk))
+                 (block-with-coords
+                   (if coord-load-stmts
+                       (stmt-ir:make-block-stmt
+                        (append coord-load-stmts (list core-block)))
+                       core-block))
+                 (eg-h-block
+                   (transform-eg-h-block
+                    block-with-coords layout coord-vars
+                    #'general-grad-name #'general-hess-name))
+                 (eg-h-block*
+                   (if post-eg-h-pipeline*
+                       (multiple-value-bind (post-block results total-before total-after)
+                           (stmt-ir:run-optimization-pipeline
+                            pass-counter post-eg-h-pipeline* eg-h-block
+                            :name (the-name "post-eg-h")
+                            :log-stream *trace-output*)
+                         (declare (ignore results total-before total-after))
+                         post-block)
+                       eg-h-block)))
+            (make-kernel-ir
+             :group group
+             :name name
+             :layout layout
+             :coord-vars coord-vars
+             :coord-load-stmts coord-load-stmts
+             :params params
+             :core-block core-block
+             :eg-h-block eg-h-block*
+             :compute-energy-p compute-energy
+             :compute-grad-p   compute-grad
+             :compute-hess-p   compute-hess
+             :manual-deriv-spec manual-deriv-spec
+             :pipeline pipeline
+             :extra-equivalence-rules extra-equivalence-rules
+             :extra-optimization-rules extra-optimization-rules
+             :return-type return-type
+             :return-expr return-expr)))))))
 
 
 ;;; ------------------------------------------------------------
