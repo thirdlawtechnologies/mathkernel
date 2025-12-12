@@ -1659,63 +1659,23 @@ are logged to *TRACE-OUTPUT* (higher levels show more detail)."
               (make-instance 'outer-env-entry :index -1 :expr nil))))
     (verbose-log verbose "~&[CSE-FACT pass ~D] scanning block with ~D statements (cse-only? ~A)~%"
                  pass-id (length (block-statements block)) cse-only)
-    ;; First, factor nested blocks/ifs recursively so they are independent.
-    (let* ((normalized-stmts
-             (loop for st in (block-statements block)
-                   collect
-                     (etypecase st
-                       (if-statement
-                        (let* ((child-env (copy-binding-env def-env))
-                               (tb (if-then-block st))
-                               (eb (if-else-block st))
-                               (new-tb (and tb (cse-factor-products-in-block tb
-                                                                             :min-uses min-uses
-                                                                             :min-factors min-factors
-                                                                             :min-size min-size
-                                                                             :pass-id pass-id
-                                                                             :cse-only cse-only
-                                                                             :defined-env (copy-binding-env child-env)
-                                                                             :outer-symbols outer-symbols
-                                                                             :verbose verbose)))
-                               (new-eb (and eb (cse-factor-products-in-block eb
-                                                                             :min-uses min-uses
-                                                                             :min-factors min-factors
-                                                                             :min-size min-size
-                                                                             :pass-id pass-id
-                                                                             :cse-only cse-only
-                                                                             :defined-env (copy-binding-env child-env)
-                                                                             :outer-symbols outer-symbols
-                                                                             :verbose verbose)))))
-                          (make-if-stmt (if-condition st) new-tb new-eb)))
-                       (block-statement
-                        (cse-factor-products-in-block st
-                                                       :min-uses min-uses
-                                                       :min-factors min-factors
-                                                       :min-size min-size
-                                                       :pass-id pass-id
-                                                       :cse-only cse-only
-                                                       :defined-env (copy-binding-env def-env)
-                                                       :outer-symbols outer-symbols
-                                                       :verbose verbose))
-                       (t st))))
-           (current-block (make-block-stmt normalized-stmts)))
-      ;; Walk top-level statements to collect products/stmts.
-      (let* ((ctx (make-cse-factor-context
-                   :env def-env
-                   :idx -1
-                   :pass-id pass-id
-                   :min-uses min-uses
-                   :min-factors min-factors
-                   :min-size min-size
-                   :cse-only cse-only
-                   :verbose verbose
-                   :outer-symbols outer-symbols
-                   :acc acc)))
-        (walk-block-with-context :cse-factor-products ctx current-block))
-      (let* ((stmts (nreverse (cse-acc-stmts acc)))
-             (n     (length stmts))
-             (env-product->sym (cse-acc-env-product->sym acc))
-             (products (nreverse (cse-acc-products acc))))
+    ;; Walk once to collect products/stmts across this block.
+    (let* ((ctx (make-cse-factor-context
+                 :env def-env
+                 :idx -1
+                 :pass-id pass-id
+                 :min-uses min-uses
+                 :min-factors min-factors
+                 :min-size min-size
+                 :cse-only cse-only
+                 :verbose verbose
+                 :outer-symbols outer-symbols
+                 :acc acc)))
+      (walk-block-with-context :cse-factor-products ctx block))
+    (let* ((stmts (nreverse (cse-acc-stmts acc)))
+           (n     (length stmts))
+           (env-product->sym (cse-acc-env-product->sym acc))
+           (products (nreverse (cse-acc-products acc))))
 
         
       ;; Seed product list and reuse map from env entries.
