@@ -10,12 +10,12 @@
                 :components ((:module "mathkernel"
                               :components ((:file "packages")
                                            (:file "math")
+                                           (:file "walker")
                                            (:file "expression-ir")
                                            (:file "expression-parse")
                                            (:file "expression-rewrite")
                                            (:file "numeric-diff")
                                            (:file "expression-tests")
-                                           (:file "walker")
                                            (:file "statement-ir")
                                            (:file "expression-diff")
                                            (:file "statement-diff")

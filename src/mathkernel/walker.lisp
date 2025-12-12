@@ -11,6 +11,7 @@
   ()
   (:documentation "Base class for walkers. Subclasses can carry whatever environments they need."))
 
+
 ;;; ------------------------------------------------------------
 ;;; Generic hooks
 ;;; ------------------------------------------------------------

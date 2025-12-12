@@ -125,7 +125,8 @@
    #:lookup-wild
    #:*lequivalence-canonicalization-rules*
    #:*equivalence-canonicalization-rules*
-   #:with-kernel-rewrite-rules))
+   #:with-kernel-rewrite-rules
+   #:deriv-env-table))
 
 
 
@@ -213,6 +214,8 @@
   #:make-block-stmt-unsafe
   #:check-def-before-use-in-block
   #:walk-context
+  #:deriv-env
+  #:deriv-env-table
   #:walk-block-with-context
   #:clone-context
   #:on-statement

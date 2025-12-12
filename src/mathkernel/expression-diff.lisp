@@ -20,22 +20,39 @@
   "Canonical key for a variable symbol in the derivative environment."
   (string-upcase (symbol-name sym)))
 
+(defclass deriv-env (stmt-ir:walk-context)
+  ((table :initarg :table
+          :accessor deriv-env-table
+          :initform (make-hash-table :test #'equal)
+          :documentation "Derivative environment hash-table keyed by variable name strings."))
+  (:documentation "Context wrapper around a derivative environment hash-table."))
+
 (defun make-deriv-env ()
-  "Create an empty derivative environment (hash-table).
-Keys are variable-name strings (UPCASE). Values are expression IR nodes."
-  (make-hash-table :test #'equal))
+  "Create an empty derivative environment wrapper."
+  (make-instance 'deriv-env))
+
+(defun copy-deriv-env-table (table)
+  "Return a shallow copy of TABLE (a hash-table)."
+  (let ((new (make-hash-table :test #'equal)))
+    (maphash (lambda (k v) (setf (gethash k new) v)) table)
+    new))
 
 (defun copy-deriv-env (env)
-  "Shallow copy of DERIV-ENV (derivative environment hash-table)."
-  (let ((new (make-deriv-env)))
-    (maphash (lambda (k v) (setf (gethash k new) v)) env)
-    new))
+  "Return a shallow copy of ENV (a DERIV-ENV)."
+  (make-instance 'deriv-env
+                 :table (copy-deriv-env-table (deriv-env-table env))))
+
+(defmethod stmt-ir:clone-context ((operation t) (env deriv-env))
+  "Clone DERIV-ENV for branching."
+  (make-instance 'deriv-env
+                 :table (copy-deriv-env-table (deriv-env-table env))))
 
 
 (defun set-var-derivative (var deriv-expr deriv-env)
   "Record d(VAR)/d(base-var) = DERIV-EXPR in DERIV-ENV.
 Keys are the canonical variable-name strings (see VAR-KEY)."
-  (setf (gethash (var-key var) deriv-env) deriv-expr))
+  (let ((key (if (symbolp var) (var-key var) var)))
+    (setf (gethash key (deriv-env-table deriv-env)) deriv-expr)))
 
 (defun lookup-var-derivative (var base-var deriv-env)
   "Return d(var)/d(base-var) as an expression IR node.
@@ -47,7 +64,7 @@ Order of precedence:
   (let* ((vkey  (var-key var))
          (bkey  (var-key base-var)))
     (multiple-value-bind (val presentp)
-        (gethash vkey deriv-env)
+        (gethash vkey (deriv-env-table deriv-env))
       (cond
         (presentp
          val)

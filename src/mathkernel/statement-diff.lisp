@@ -15,9 +15,10 @@
 and a base variable symbol BASE-VAR, build and return a derivative
 environment mapping each intermediate variable name (string)
 to its derivative expression d(var)/d(BASE-VAR)."
-  (let ((env (expr-ir:make-deriv-env)))
+  (let* ((env (expr-ir:make-deriv-env))
+         (table (expr-ir:deriv-env-table env)))
     ;; Seed d(base)/d(base) = 1
-    (setf (gethash (expr-ir:var-key base-var) env)
+    (setf (gethash (expr-ir:var-key base-var) table)
           (expr-ir:make-expr-const 1))
     (dolist (st statements env)
       (when (typep st 'assignment-statement)
@@ -27,7 +28,7 @@ to its derivative expression d(var)/d(BASE-VAR)."
             (let* ((rhs  (stmt-expression st))
                    (drhs (expr-ir:differentiate-expr rhs base-var env))
                    (key  (expr-ir:var-key name)))
-              (setf (gethash key env) drhs))))))
+              (setf (gethash key table) drhs))))))
     env))
 
 
@@ -47,9 +48,10 @@ Returns an expression IR node for the derivative, or NIL if TARGET-VAR
 never appears as an assignment target in STATEMENTS."
   (declare (optimize (debug 3)))
   (let* ((env (build-derivative-env-for-block statements base-var))
-         (key (expr-ir:var-key target-var)))
+         (key (expr-ir:var-key target-var))
+         (table (expr-ir:deriv-env-table env)))
     (multiple-value-bind (d presentp)
-        (gethash key env)
+        (gethash key table)
       (if presentp
           d
           nil))))
@@ -113,18 +115,16 @@ yields (for base-var 'x):
   (let ((env (expr-ir:make-deriv-env))
         (result '()))
     ;; seed base-var
-    (setf (gethash (expr-ir:var-key base-var) env)
-          (expr-ir:make-expr-const 1))
+    (expr-ir:set-var-derivative base-var (expr-ir:make-expr-const 1) env)
     (dolist (st statements (nreverse result))
       (when (typep st 'assignment-statement)
         (let* ((var-name (stmt-target-name st))
                (rhs      (stmt-expression st))
                (drhs     (expr-ir:differentiate-expr rhs base-var env))
                (dvar     (make-derivative-name var-name base-var))
-               (dst      (make-assignment-stmt dvar drhs))
-               (key      (expr-ir:var-key var-name)))
+               (dst      (make-assignment-stmt dvar drhs)))
           ;; store derivative in env so later assignments see it
-          (setf (gethash key env) drhs)
+          (expr-ir:set-var-derivative var-name drhs env)
           (push dst result))))))
 
 ;;; ----------------------------------------------------------------------

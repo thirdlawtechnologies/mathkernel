@@ -1,0 +1,551 @@
+diff --git a/src/mathkernel/kernel-dsl.lisp b/src/mathkernel/kernel-dsl.lisp
+index cbba77c..b1bddff 100644
+--- a/src/mathkernel/kernel-dsl.lisp
++++ b/src/mathkernel/kernel-dsl.lisp
+@@ -366,7 +366,7 @@ Uses:
+                (diff-simple (expr-ir:simplify-expr
+                              (expr-ir:make-expr-add (list e1-raw (expr-ir:make-expr-neg e2-raw)))))
+                (diff-f   (expr-ir:factor-sum-of-products diff))
+-               (diff-sim (expr-ir:simplify-expr diff-f)))
++              (diff-sim (expr-ir:simplify-expr diff-f)))
+           (when (and (typep diff-simple 'expr-ir:constant-expression)
+                      (zerop (expr-ir:expression-value diff-simple)))
+             (return-from expressions-equivalent-p
+@@ -377,98 +377,294 @@ Uses:
+               (values nil sx1 sx2)))))))
+ 
+ 
+-
++(defstruct geometry-check-accumulator
++  (derivatives (make-hash-table :test #'eq)))
++
++(defclass geometry-check-context (stmt-ir:walk-context)
++  ((deriv-env
++    :initarg :deriv-env
++    :accessor geometry-check-ctx-deriv-env)
++   (accumulator
++    :initarg :accumulator
++    :accessor geometry-check-ctx-accumulator)))
++
++(defclass geometry-check-operation ()
++  ((base-var
++    :initarg :base-var
++    :reader geometry-check-operation-base-var)
++   (manual-deriv-spec
++    :initarg :manual-deriv-spec
++    :reader geometry-check-operation-manual-deriv-spec)
++   (base-block
++    :initarg :base-block
++    :reader geometry-check-operation-base-block)
++   (du-dq
++    :initarg :du-dq
++    :reader geometry-check-operation-du-dq)
++   (d2u-dq2
++    :initarg :d2u-dq2
++    :reader geometry-check-operation-d2u-dq2)
++   (intermediate-set
++    :initarg :intermediate-set
++    :reader geometry-check-operation-intermediate-set)
++   (mode
++    :initarg :mode
++    :reader geometry-check-operation-mode)
++   (reuse-assignments
++    :initarg :reuse-assignments
++    :reader geometry-check-operation-reuse-assignments)
++   (accumulator
++    :initarg :accumulator
++    :reader geometry-check-operation-accumulator)))
++
++(defun make-geometry-check-operation (&rest initargs)
++  (apply #'make-instance 'geometry-check-operation initargs))
++
++(defun record-geometry-derivative (acc var expr)
++  (let* ((table (geometry-check-accumulator-derivatives acc))
++         (existing (gethash var table)))
++    (setf (gethash var table) (cons expr existing)))
++  acc)
++
++(defun deriv-env-from-accumulator (acc base-var)
++  (let ((env (expr-ir:make-deriv-env)))
++    (expr-ir:set-var-derivative base-var (expr-ir:make-expr-const 1) env)
++    (when acc
++      (maphash (lambda (var exprs)
++                 (when exprs
++                   (expr-ir:set-var-derivative var (car exprs) env)))
++               (geometry-check-accumulator-derivatives acc)))
++    env))
++
++(defun report-geometry-mismatch (mode what manual-expr auto-expr sx1 sx2)
++  (let* ((*package* (find-package :expr-var))
++         (msg (format nil
++                      "Geometry derivative mismatch for ~S:~%  manual: ~A~%  auto:   ~A"
++                      what
++                      (expr-ir:expr->infix-string manual-expr)
++                      (expr-ir:expr->infix-string auto-expr))))
++    (ecase mode
++      (:warn (progn
++               (format t "WARN: ~a~%" msg)
++               (let ((*package* (find-package :expr-var)))
++                 (format t "transformed manual =~% ~s~%" sx1)
++                 (format t "transformed auto =~% ~s~%" sx2)
++                 (expr-ir:side-by-side-sexpr sx1 sx2
++                                             :label1 "transformed manual"
++                                             :label2 "transformed auto"))))
++      (:error (error msg)))))
++
++(defmethod stmt-ir:clone-context ((operation geometry-check-operation)
++                                  (ctx geometry-check-context))
++  (make-instance 'geometry-check-context
++                 :deriv-env (expr-ir:copy-deriv-env
++                             (geometry-check-ctx-deriv-env ctx))
++                 :accumulator (geometry-check-ctx-accumulator ctx)))
++
++(defmethod stmt-ir:on-statement ((operation geometry-check-operation)
++                                 (ctx geometry-check-context)
++                                 stmt)
++  (let* ((env (geometry-check-ctx-deriv-env ctx))
++         (base-var (geometry-check-operation-base-var operation)))
++    (etypecase stmt
++      ((or stmt-ir:assignment-statement stmt-ir:anchored-assignment-statement)
++       (let* ((target (stmt-ir:stmt-target-name stmt))
++              (rhs    (stmt-ir:stmt-expression stmt))
++              (dvar   (expr-ir:differentiate-expr rhs base-var env)))
++         (expr-ir:set-var-derivative target dvar env)
++         (record-geometry-derivative (geometry-check-operation-accumulator operation)
++                                     target dvar)
++         (when (and dvar
++                    (gethash target (geometry-check-operation-intermediate-set operation)))
++           (let* ((manual (gethash (list target base-var)
++                                   (geometry-check-operation-du-dq operation))))
++             (when manual
++               (let* ((auto (if (geometry-check-operation-reuse-assignments operation)
++                                (rewrite-expr-using-assignments
++                                 dvar
++                                 (geometry-check-operation-base-block operation))
++                                dvar)))
++                 (multiple-value-bind (matched sx1 sx2)
++                     (expressions-equivalent-p manual auto
++                                               (geometry-check-operation-base-block operation))
++                   (unless matched
++                     (report-geometry-mismatch
++                      (geometry-check-operation-mode operation)
++                      (list :du-dq target base-var)
++                      manual auto sx1 sx2))))))))
++       (values stmt ctx))
++      (t
++       (values stmt ctx)))))
+ 
+ (defun check-intermediate-geometry!
+     (base-block coord-vars manual-deriv-spec &key (reuse-assignments t))
+   "If MANUAL-DERIV-SPEC has :geometry-check-mode of :warn or :error and
+ contains manual :intermediate->coord and/or :intermediate->coord2 entries,
+-compare them against AD-generated derivatives from BASE-BLOCK.
+-
+-- BASE-BLOCK: stmt-ir:block-statement
+-- COORD-VARS: list of expr-ir vars (x1 y1 z1 ...)
+-
+-Signals warnings or errors if mismatches are found, depending on mode."
++compare them against AD-generated derivatives from BASE-BLOCK using the stmt
++walker. Signals warnings or errors if mismatches are found, depending on
++mode."
+   (declare (optimize (debug 3)))
+   (let ((mode (manual-deriv-spec-geometry-check-mode manual-deriv-spec)))
+     (unless (member mode '(:warn :error))
+       (return-from check-intermediate-geometry! manual-deriv-spec))
+     (let* ((intermediates (manual-deriv-spec-intermediates manual-deriv-spec))
++           (intermediate-set (let ((ht (make-hash-table :test #'eq)))
++                               (dolist (u intermediates ht)
++                                 (setf (gethash u ht) t))))
+            (du-dq         (manual-deriv-spec-du-dq manual-deriv-spec))
+            (d2u-dq2       (manual-deriv-spec-d2u-dq2 manual-deriv-spec))
+-           ;; derivative envs per coord
+-           (envs (make-hash-table :test #'eq)))
+-      ;; build derivative envs once
++           (acc-by-base   (make-hash-table :test #'eq)))
++      ;; Pass 1: walk block per coordinate to collect AD derivatives and check du/dq.
+       (dolist (q coord-vars)
+-        (setf (gethash q envs)
+-              (build-deriv-env-for-block base-block q)))
+-      ;; helper for reporting
+-      (labels ((report-mismatch (what manual-expr auto-expr sx1 sx2)
+-                 (break "Mismatch")
+-                 (let* ((*package* (find-package :expr-var))
+-                        (msg (format nil
+-                                     "Geometry derivative mismatch for ~S:~%  manual: ~A~%  auto:   ~A"
+-                                     what
+-                                     (expr-ir:expr->infix-string manual-expr)
+-                                     (expr-ir:expr->infix-string auto-expr))))
+-                   (ecase mode
+-                     (:warn (progn
+-                              (format t "WARN: ~a~%" msg)
+-                              (let ((*package* (find-package :expr-var)))
+-                                (format t "transformed manual =~% ~s~%" sx1)
+-                                (format t "transformed auto =~% ~s~%" sx2)
+-                                (expr-ir:side-by-side-sexpr sx1 sx2 :label1 "transformed manual" :label2 "transformed auto")
+-                                )))
+-                     (:error (error msg))))))
+-        ;; --- first derivatives: du/dq ---
++        (let* ((acc (make-geometry-check-accumulator))
++               (env (expr-ir:make-deriv-env))
++               (ctx (make-instance 'geometry-check-context
++                                   :deriv-env env
++                                   :accumulator acc))
++               (op  (make-geometry-check-operation
++                     :base-var q
++                     :manual-deriv-spec manual-deriv-spec
++                     :base-block base-block
++                     :du-dq du-dq
++                     :d2u-dq2 d2u-dq2
++                     :intermediate-set intermediate-set
++                     :mode mode
++                     :reuse-assignments reuse-assignments
++                     :accumulator acc)))
++          (expr-ir:set-var-derivative q (expr-ir:make-expr-const 1) env)
++          (stmt-ir:walk-block-with-context op ctx base-block)
++          (setf (gethash q acc-by-base) acc)))
++      ;; Pass 2: check manual d²u entries against AD by reusing collected du/dq.
++      (let ((n (length coord-vars)))
+         (dolist (u intermediates)
+-          (dolist (q coord-vars)
+-            (let* ((key    (list u q))
+-                   (manual (gethash key du-dq nil)))
+-              (when manual
+-                (let* ((env-q    (gethash q envs))
+-                       (auto-raw (expr-ir:lookup-var-derivative u q env-q)))
+-                  (when auto-raw
+-                    (let* ((auto-expr (if reuse-assignments
+-                                          (rewrite-expr-using-assignments auto-raw base-block )
+-                                          auto-raw)))
+-                      (multiple-value-bind (matched sx1 sx2)
+-                          (expressions-equivalent-p manual auto-expr base-block)
+-                        (unless matched
+-                          (report-mismatch (list :du-dq u q) manual auto-expr sx1 sx2)
+-                          ))
+-                      )))))))
+-        ;; --- second derivatives: d²u/(dqi dqj) ---
+-        (dolist (u intermediates)
+-          (let ((n (length coord-vars)))
+-            (dotimes (i n)
+-              (let* ((qi    (nth i coord-vars))
+-                     (env-i (gethash qi envs))
+-                     ;; prefer manual du/dqi if present, else AD
+-                     (du/qi (or (gethash (list u qi) du-dq)
+-                                (expr-ir:lookup-var-derivative u qi env-i))))
+-                (when du/qi
+-                  (dotimes (j n)
+-                    (when (<= i j)
+-                      (let* ((qj    (nth j coord-vars))
+-                             (keyij (list u qi qj))
+-                             (keyji (list u qj qi))
+-                             (manual (or (gethash keyij d2u-dq2 nil)
+-                                         (gethash keyji d2u-dq2 nil))))
+-                        (when manual
+-                          (let* ((env-j    (gethash qj envs))
+-                                 (auto-raw (expr-ir:differentiate-expr du/qi qj env-j)))
+-                            (when auto-raw
+-                              (let* ((auto-expr (if reuse-assignments
+-                                                    (rewrite-expr-using-assignments auto-raw base-block)
+-                                                    auto-raw)))
+-                                (multiple-value-bind (matched sx1 sx2)
+-                                    (expressions-equivalent-p manual auto-expr base-block)
+-                                  (unless matched
+-                                    (report-mismatch (list :d2u-dq2 u qi qj) manual auto-expr sx1 sx2)
+-                                    ))
+-                                )))))))))))))
+-        manual-deriv-spec)))
++          (dotimes (i n)
++            (let* ((qi    (nth i coord-vars))
++                   (acc-i (gethash qi acc-by-base))
++                   (du/qi (or (gethash (list u qi) du-dq)
++                              (let* ((table (and acc-i
++                                                 (geometry-check-accumulator-derivatives acc-i))))
++                                (and table (car (gethash u table nil)))))))
++              (when du/qi
++                (dotimes (j n)
++                  (when (<= i j)
++                    (let* ((qj     (nth j coord-vars))
++                           (manual (or (gethash (list u qi qj) d2u-dq2 nil)
++                                       (gethash (list u qj qi) d2u-dq2 nil))))
++                      (when manual
++                        (let* ((acc-j   (gethash qj acc-by-base))
++                               (env-j   (and acc-j (deriv-env-from-accumulator acc-j qj)))
++                               (auto-raw (and env-j
++                                              (expr-ir:differentiate-expr du/qi qj env-j))))
++                          (when auto-raw
++                            (let* ((auto (if reuse-assignments
++                                             (rewrite-expr-using-assignments auto-raw base-block)
++                                             auto-raw)))
++                              (multiple-value-bind (matched sx1 sx2)
++                                  (expressions-equivalent-p manual auto base-block)
++                                (unless matched
++                                  (report-geometry-mismatch mode
++                                                            (list :d2u-dq2 u qi qj)
++                                                            manual auto sx1 sx2)))))))))))))))
++      manual-deriv-spec)))
++
++(defclass inject-context-base (stmt-ir:walk-context)
++  ((seen
++    :initarg :seen
++    :accessor inject-ctx-seen)
++   (coord-vars
++    :initarg :coord-vars
++    :reader inject-ctx-coord-vars)
++   (energy-var
++    :initarg :energy-var
++    :reader inject-ctx-energy-var)))
++
++(defclass grad-inject-context (inject-context-base)
++  ((grad-target-fn
++    :initarg :grad-target-fn
++    :reader grad-inject-ctx-grad-target-fn)))
++
++(defclass hess-inject-context (inject-context-base)
++  ((hess-target-fn
++    :initarg :hess-target-fn
++    :reader hess-inject-ctx-hess-target-fn)
++   (manual-deriv-spec
++    :initarg :manual-deriv-spec
++    :reader hess-inject-ctx-manual-deriv-spec)))
++
++(defun make-grad-inject-context (&key coord-vars energy-var grad-target-fn)
++  (make-instance 'grad-inject-context
++                 :seen '()
++                 :coord-vars coord-vars
++                 :energy-var energy-var
++                 :grad-target-fn grad-target-fn))
++
++(defun make-hess-inject-context (&key coord-vars energy-var hess-target-fn manual-deriv-spec)
++  (make-instance 'hess-inject-context
++                 :seen '()
++                 :coord-vars coord-vars
++                 :energy-var energy-var
++                 :hess-target-fn hess-target-fn
++                 :manual-deriv-spec manual-deriv-spec))
++
++(defmethod stmt-ir:clone-context ((op (eql :inject-gradients))
++                                  (ctx grad-inject-context))
++  (make-instance 'grad-inject-context
++                 :seen (copy-list (inject-ctx-seen ctx))
++                 :coord-vars (inject-ctx-coord-vars ctx)
++                 :energy-var (inject-ctx-energy-var ctx)
++                 :grad-target-fn (grad-inject-ctx-grad-target-fn ctx)))
++
++(defmethod stmt-ir:clone-context ((op (eql :inject-hessians))
++                                  (ctx hess-inject-context))
++  (make-instance 'hess-inject-context
++                 :seen (copy-list (inject-ctx-seen ctx))
++                 :coord-vars (inject-ctx-coord-vars ctx)
++                 :energy-var (inject-ctx-energy-var ctx)
++                 :hess-target-fn (hess-inject-ctx-hess-target-fn ctx)
++                 :manual-deriv-spec (hess-inject-ctx-manual-deriv-spec ctx)))
++
++(defmethod stmt-ir:on-statement ((op (eql :inject-gradients))
++                                 (ctx grad-inject-context)
++                                 st)
++  (etypecase st
++    (stmt-ir:assignment-statement
++     (let* ((seen (append (inject-ctx-seen ctx) (list st)))
++            (energy (inject-ctx-energy-var ctx)))
++       (setf (inject-ctx-seen ctx) seen)
++       (if (eq (stmt-ir:stmt-target-name st) energy)
++           (let ((extra '()))
++             (dolist (q (inject-ctx-coord-vars ctx))
++               (let ((dex (stmt-ir:differentiate-target-in-block seen q energy)))
++                 (when dex
++                   (push (stmt-ir:make-anchored-assignment-stmt
++                          (funcall (grad-inject-ctx-grad-target-fn ctx) q)
++                          dex)
++                         extra))))
++             (values (nconc (list st) (nreverse extra)) ctx))
++           (values st ctx))))
++    (t
++     (values st ctx))))
++
++(defmethod stmt-ir:on-statement ((op (eql :inject-hessians))
++                                 (ctx hess-inject-context)
++                                 st)
++  (etypecase st
++    (stmt-ir:assignment-statement
++     (let* ((seen (append (inject-ctx-seen ctx) (list st)))
++            (energy (inject-ctx-energy-var ctx)))
++       (setf (inject-ctx-seen ctx) seen)
++       (if (eq (stmt-ir:stmt-target-name st) energy)
++           (let* ((blk (stmt-ir:make-block-stmt seen))
++                  (hess-stmts (make-hessian-assignments-from-block
++                               blk
++                               energy
++                               (inject-ctx-coord-vars ctx)
++                               (hess-inject-ctx-hess-target-fn ctx)
++                               (hess-inject-ctx-manual-deriv-spec ctx))))
++             (values (nconc (list st) hess-stmts) ctx))
++           (values st ctx))))
++    (t
++     (values st ctx))))
+ 
+ ;;; -------------------------------
+ ;;; Small string / name utilities
+@@ -541,51 +737,25 @@ If SYM is not a Hessian target, return NIL."
+   "Return a new BLOCK with per-branch gradient assignments inserted
+ immediately after any assignment to ENERGY-VAR. Gradients are computed
+ using the assignments visible along that control-flow path."
+-  (labels
+-      ((walk-stmts (stmts seen)
+-         (let ((out '()))
+-           (dolist (st stmts)
+-             (typecase st
+-               (stmt-ir:assignment-statement
+-                (push st out)
+-                (let ((new-seen (append seen (list st))))
+-                  (when (eq (stmt-ir:stmt-target-name st) energy-var)
+-                    (dolist (q coord-vars)
+-                      (let ((dexpr (stmt-ir:differentiate-target-in-block
+-                                    new-seen q energy-var)))
+-                        (when dexpr
+-                          (let ((g-sym (funcall grad-target-fn q)))
+-                            (push (stmt-ir:make-anchored-assignment-stmt g-sym dexpr) out))))))
+-                  (setf seen new-seen)))
+-               (stmt-ir:block-statement
+-                (multiple-value-bind (sub-stmts new-seen)
+-                    (walk-stmts (stmt-ir:block-statements st) seen)
+-                  (declare (ignore new-seen))
+-                  (push (stmt-ir:make-block-stmt sub-stmts) out)))
+-               (stmt-ir:if-statement
+-                (multiple-value-bind (then-stmts seen-then)
+-                    (walk-stmts (stmt-ir:block-statements (stmt-ir:if-then-block st))
+-                                (copy-list seen))
+-                    (declare (ignore seen-then))
+-                  (multiple-value-bind (else-stmts seen-else)
+-                      (if (stmt-ir:if-else-block st)
+-                          (walk-stmts (stmt-ir:block-statements (stmt-ir:if-else-block st))
+-                                      (copy-list seen))
+-                          (values nil seen))
+-                    (declare (ignore seen-else))
+-                    (push (stmt-ir:make-if-stmt
+-                           (stmt-ir:if-condition st)
+-                           (stmt-ir:make-block-stmt then-stmts)
+-                           (when else-stmts
+-                             (stmt-ir:make-block-stmt else-stmts)))
+-                          out))))
+-               (t
+-                (push st out))))
+-           (values (nreverse out) seen))))
+-    (multiple-value-bind (stmts _)
+-        (walk-stmts (stmt-ir:block-statements block) '())
+-      (declare (ignore _))
+-      (stmt-ir:make-block-stmt stmts))))
++  (let* ((ctx (make-grad-inject-context
++               :coord-vars coord-vars
++               :energy-var energy-var
++               :grad-target-fn grad-target-fn))
++         (result (stmt-ir:walk-block-with-context :inject-gradients ctx block)))
++    (car result)))
++
++(defun inject-hessians-after-energy (block coord-vars energy-var hess-target-fn
++                                    &optional manual-deriv-spec)
++  "Return a new BLOCK with per-branch Hessian assignments inserted
++immediately after any assignment to ENERGY-VAR. Hessians are computed
++using the assignments visible along that control-flow path."
++  (let* ((ctx (make-hess-inject-context
++               :coord-vars coord-vars
++               :energy-var energy-var
++               :hess-target-fn hess-target-fn
++               :manual-deriv-spec manual-deriv-spec))
++         (result (stmt-ir:walk-block-with-context :inject-hessians ctx block)))
++    (car result)))
+ 
+ 
+ (defun build-assignment-map (block)
+@@ -1026,7 +1196,7 @@ BASE-VAR is a coordinate symbol like X1, Y1, etc."
+                     (expr-ir:set-var-derivative var dvar env)))
+                  (stmt-ir:if-statement
+                   ;; Recurse into branches with copies of env; if both branches
+-                  ;; produce a derivative, prefer THEN; otherwise take what's available.
++                 ;; produce a derivative, prefer THEN; otherwise take what's available.
+                   (let* ((then-env (when (stmt-ir:if-then-block st)
+                                      (process-block (stmt-ir:if-then-block st)
+                                                     (expr-ir:copy-deriv-env env))))
+@@ -1034,9 +1204,13 @@ BASE-VAR is a coordinate symbol like X1, Y1, etc."
+                                      (process-block (stmt-ir:if-else-block st)
+                                                     (expr-ir:copy-deriv-env env)))))
+                     (when then-env
+-                      (maphash (lambda (k v) (expr-ir:set-var-derivative k v env)) then-env))
++                      (maphash (lambda (k v)
++                                 (expr-ir:set-var-derivative k v env))
++                               (expr-ir:deriv-env-table then-env)))
+                     (when (and else-env (null then-env))
+-                      (maphash (lambda (k v) (expr-ir:set-var-derivative k v env)) else-env))))
++                      (maphash (lambda (k v)
++                                 (expr-ir:set-var-derivative k v env))
++                               (expr-ir:deriv-env-table else-env)))))
+                  (stmt-ir:block-statement
+                   (setf env (process-block st env)))
+                  (t env)))))
+@@ -1044,6 +1218,7 @@ BASE-VAR is a coordinate symbol like X1, Y1, etc."
+ 
+ 
+ 
++#+(or)
+ (defun make-gradient-assignments-from-block
+     (base-block energy-var coord-vars grad-target-fn &optional manual-deriv-spec)
+   "Return a list of assignment statements G_q := ∂(ENERGY-VAR)/∂q for each q.
+diff --git a/src/mathkernel/statement-diff.lisp b/src/mathkernel/statement-diff.lisp
+index ede41a8..8160df4 100644
+--- a/src/mathkernel/statement-diff.lisp
++++ b/src/mathkernel/statement-diff.lisp
+@@ -15,9 +15,10 @@
+ and a base variable symbol BASE-VAR, build and return a derivative
+ environment mapping each intermediate variable name (string)
+ to its derivative expression d(var)/d(BASE-VAR)."
+-  (let ((env (expr-ir:make-deriv-env)))
++  (let* ((env (expr-ir:make-deriv-env))
++         (table (expr-ir:deriv-env-table env)))
+     ;; Seed d(base)/d(base) = 1
+-    (setf (gethash (expr-ir:var-key base-var) env)
++    (setf (gethash (expr-ir:var-key base-var) table)
+           (expr-ir:make-expr-const 1))
+     (dolist (st statements env)
+       (when (typep st 'assignment-statement)
+@@ -27,7 +28,7 @@ to its derivative expression d(var)/d(BASE-VAR)."
+             (let* ((rhs  (stmt-expression st))
+                    (drhs (expr-ir:differentiate-expr rhs base-var env))
+                    (key  (expr-ir:var-key name)))
+-              (setf (gethash key env) drhs))))))
++              (setf (gethash key table) drhs))))))
+     env))
+ 
+ 
+@@ -47,9 +48,10 @@ Returns an expression IR node for the derivative, or NIL if TARGET-VAR
+ never appears as an assignment target in STATEMENTS."
+   (declare (optimize (debug 3)))
+   (let* ((env (build-derivative-env-for-block statements base-var))
+-         (key (expr-ir:var-key target-var)))
++         (key (expr-ir:var-key target-var))
++         (table (expr-ir:deriv-env-table env)))
+     (multiple-value-bind (d presentp)
+-        (gethash key env)
++        (gethash key table)
+       (if presentp
+           d
+           nil))))
+@@ -113,18 +115,16 @@ yields (for base-var 'x):
+   (let ((env (expr-ir:make-deriv-env))
+         (result '()))
+     ;; seed base-var
+-    (setf (gethash (expr-ir:var-key base-var) env)
+-          (expr-ir:make-expr-const 1))
++    (expr-ir:set-var-derivative base-var (expr-ir:make-expr-const 1) env)
+     (dolist (st statements (nreverse result))
+       (when (typep st 'assignment-statement)
+         (let* ((var-name (stmt-target-name st))
+                (rhs      (stmt-expression st))
+                (drhs     (expr-ir:differentiate-expr rhs base-var env))
+                (dvar     (make-derivative-name var-name base-var))
+-               (dst      (make-assignment-stmt dvar drhs))
+-               (key      (expr-ir:var-key var-name)))
++               (dst      (make-assignment-stmt dvar drhs)))
+           ;; store derivative in env so later assignments see it
+-          (setf (gethash key env) drhs)
++          (expr-ir:set-var-derivative var-name drhs env)
+           (push dst result))))))
+ 
+ ;;; ----------------------------------------------------------------------
