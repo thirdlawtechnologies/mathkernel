@@ -3,3 +3,4 @@
 src/.DS_Store
 src/mathkernel/.DS_Store
 *.fasl
+patches/*

@@ -42,7 +42,7 @@
   (make-instance 'deriv-env
                  :table (copy-deriv-env-table (deriv-env-table env))))
 
-(defmethod stmt-ir:clone-context ((operation t) (env deriv-env))
+(defmethod stmt-ir:clone-context ((operation t) (env deriv-env) block)
   "Clone DERIV-ENV for branching."
   (make-instance 'deriv-env
                  :table (copy-deriv-env-table (deriv-env-table env))))

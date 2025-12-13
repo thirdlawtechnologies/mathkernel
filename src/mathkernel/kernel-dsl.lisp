@@ -455,7 +455,8 @@ Uses:
       (:error (error msg)))))
 
 (defmethod stmt-ir:clone-context ((operation geometry-check-operation)
-                                  (ctx geometry-check-context))
+                                  (ctx geometry-check-context)
+                                  block)
   (make-instance 'geometry-check-context
                  :deriv-env (expr-ir:copy-deriv-env
                              (geometry-check-ctx-deriv-env ctx))
@@ -607,7 +608,8 @@ mode."
                  :manual-deriv-spec manual-deriv-spec))
 
 (defmethod stmt-ir:clone-context ((op (eql :inject-gradients))
-                                  (ctx grad-inject-context))
+                                  (ctx grad-inject-context)
+                                  block)
   (make-instance 'grad-inject-context
                  :seen (copy-list (inject-ctx-seen ctx))
                  :coord-vars (inject-ctx-coord-vars ctx)
@@ -615,7 +617,8 @@ mode."
                  :grad-target-fn (grad-inject-ctx-grad-target-fn ctx)))
 
 (defmethod stmt-ir:clone-context ((op (eql :inject-hessians))
-                                  (ctx hess-inject-context))
+                                  (ctx hess-inject-context)
+                                  block)
   (make-instance 'hess-inject-context
                  :seen (copy-list (inject-ctx-seen ctx))
                  :coord-vars (inject-ctx-coord-vars ctx)

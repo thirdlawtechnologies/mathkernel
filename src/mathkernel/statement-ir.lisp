@@ -27,22 +27,106 @@
 (defclass binding-env ()
   ((table
     :initarg :table
-    :reader binding-env-table
-    :documentation "Hash table mapping symbols to env-entry/outer-env-entry."))
+    :reader %binding-env-table
+    :documentation "Hash table mapping symbols to env-entry/outer-env-entry.")
+   (parent
+    :initarg :parent
+    :initform nil
+    :accessor binding-env-parent
+    :documentation "Optional parent environment for chained lookups.")
+   (block
+    :initarg :block
+    :initform nil
+    :accessor binding-env-block
+    :documentation "Block associated with this environment (for diagnostics/insertion)."))
   (:documentation "Environment that tracks where symbols are defined for CSE.
-Assumes SSA: no variable is reassigned, and branch definitions do not join."))
+Assumes SSA: no variable is reassigned, and branch definitions do not join.
+Environments can be chained via PARENT; lookups walk the chain."))
 
 (defmethod print-object ((env binding-env) stream)
   (let ((vars '()))
     (maphash (lambda (k _v) (push k vars))
-             (binding-env-table env))
+             (%binding-env-table env))
     (setf vars (sort vars #'string< :key #'symbol-name))
     (print-unreadable-object (env stream :type t)
       (format stream "~{~A~^ ~}" vars))))
 
-(defun make-binding-env (&optional (table (make-hash-table :test #'eq)))
-  "Construct a BINDING-ENV around TABLE (defaults to a fresh hash table)."
-  (make-instance 'binding-env :table table))
+(defun binding-env-ancestors (env)
+  "Return list of ENV and its ancestors, outermost last."
+  (let ((out '()))
+    (loop for e = env then (binding-env-parent e)
+          while e
+          do (push e out))
+    (nreverse out)))
+
+(defun binding-env-descendant-p (ancestor env)
+  "True when ANCESTOR is in the parent chain of ENV (or equal)."
+  (loop for e = env then (binding-env-parent e)
+        while e
+        when (eq e ancestor) do (return t)
+        finally (return nil)))
+
+(defun binding-env-lca (env1 env2)
+  "Lowest common ancestor of ENV1 and ENV2."
+  (when (and env1 env2)
+    (let ((seen (make-hash-table :test #'eq)))
+      (loop for e = env1 then (binding-env-parent e)
+            while e
+            do (setf (gethash e seen) t))
+      (loop for e = env2 then (binding-env-parent e)
+            while e
+            when (gethash e seen) do (return e)))))
+
+(defun block-entry-index-for-descendant (ancestor target)
+  "Earliest statement index in ANCESTOR that dominates TARGET."
+  (labels ((rec (blk)
+             (loop for st in (block-statements blk)
+                   for idx from 0 do
+                     (cond
+                       ((and (typep st 'block-statement)
+                             (eq st target))
+                        (return idx))
+                       ((typep st 'block-statement)
+                        (let ((hit (rec st)))
+                          (when hit (return idx))))
+                       ((typep st 'if-statement)
+                        (let ((hit (or (and (if-then-block st) (rec (if-then-block st)))
+                                       (and (if-else-block st) (rec (if-else-block st))))))
+                          (when hit (return idx))))))))
+    (rec ancestor)))
+
+(defun make-binding-env (block &key (table (make-hash-table :test #'eq)) parent)
+  "Construct a BINDING-ENV around TABLE (defaults to a fresh hash table), with optional PARENT and BLOCK."
+  (make-instance 'binding-env :table table :parent parent :block block))
+
+(defun make-child-env (block parent)
+  "Create a child environment chained to PARENT. BLOCK defaults to the parent's block."
+  (make-binding-env block :parent parent))
+
+(defun binding-env-add (env sym entry)
+  "Add binding SYM → ENTRY into ENV and return ENTRY."
+  (when (binding-env-lookup env sym)
+    (error "SSA violation: ~S already defined in env" sym))
+  (setf (gethash sym (%binding-env-table env)) entry)
+  entry)
+
+(defun binding-env-lookup (env sym)
+  "Walk ENV chain to find SYM. Returns (values entry env-found) or NIL."
+  (loop for e = env then (binding-env-parent e)
+        while e
+        for tab = (%binding-env-table e)
+        for hit = (gethash sym tab)
+        when hit do (return (values hit e))
+        finally (return (values nil nil))))
+
+(defun map-binding-env (fn env)
+  "Apply FN to each (key value env-found) across ENV and all ancestors."
+  (labels ((walk (e)
+             (when e
+               (walk (binding-env-parent e))
+               (maphash (lambda (k v) (funcall fn k v e))
+                        (%binding-env-table e)))))
+    (walk env)))
 
 (defclass product-descriptor ()
   ((factors
@@ -57,6 +141,10 @@ Assumes SSA: no variable is reassigned, and branch definitions do not join."))
     :initarg :stmt-index
     :reader product-descriptor-stmt-index
     :documentation "Statement index where this product occurs.")
+   (binding-env
+    :initarg :binding-env
+    :reader product-descriptor-binding-env
+    :documentation "Binding-env created by the block that contains the product")
    (target
     :initarg :target
     :initform nil
@@ -66,10 +154,14 @@ Assumes SSA: no variable is reassigned, and branch definitions do not join."))
 
 (defmethod print-object ((pd product-descriptor) stream)
   (print-unreadable-object (pd stream :type t)
-    (format stream "~S @~D~@[ tgt=~A~]"
-            (product-descriptor-factors pd)
-            (product-descriptor-stmt-index pd)
-            (product-descriptor-target pd))))
+    (let* ((binding-env (product-descriptor-binding-env pd))
+           (block (binding-env-block binding-env))
+           (block-desc (block-statement-description block)))
+      (format stream "~S @~D/block(~a)~@[ tgt=~A~]"
+              (product-descriptor-factors pd)
+              (product-descriptor-stmt-index pd)
+              block-desc
+              (product-descriptor-target pd)))))
 
 (defun counts-from-factors (factors)
   "Build a multiset (hash-table) of FACTORS keyed by EQUAL."
@@ -77,29 +169,14 @@ Assumes SSA: no variable is reassigned, and branch definitions do not join."))
     (dolist (f factors ht)
       (incf (gethash f ht 0)))))
 
-(defun copy-binding-env (env)
-  "Return a shallow copy of ENV (a BINDING-ENV), converting existing entries to outer-scope markers.
-Any ENV-ENTRY instances are copied as OUTER-ENV-ENTRY instances so consumers can
-distinguish values coming from an outer block."
+(defun copy-binding-env (env block)
+  "Create a child ENV chained to ENV, marking existing bindings as outer entries."
   (unless (typep env 'binding-env)
     (error "copy-binding-env expects a BINDING-ENV, got ~S" env))
-  (let* ((table (binding-env-table env))
-         (new-table (make-hash-table
-                     :test            (hash-table-test table)
-                     :size            (hash-table-size table)
-                     :rehash-size     (hash-table-rehash-size table)
-                     :rehash-threshold (hash-table-rehash-threshold table))))
-    (maphash (lambda (k v)
-               (let ((entry (cond
-                              ((typep v 'outer-env-entry) v)
-                              ((typep v 'env-entry)
-                               (make-instance 'outer-env-entry
-                                              :index (env-entry-index v)
-                                              :expr  (env-entry-expr v)))
-                              (t v))))
-                 (setf (gethash k new-table) entry)))
-             table)
-    (make-binding-env new-table)))
+  (let* ((parent env)
+         (child (make-child-env block parent)))
+    ;; We don't copy the table because we want it to interogate the parent environments
+    child))
 
 (defun make-env-entry (index &optional expr)
   "Construct an ENV-ENTRY instance."
@@ -283,6 +360,16 @@ Example:
 
 (defun make-block-stmt (&optional (statements nil))
   (make-instance 'block-statement :statements statements))
+
+(defun block-statement-description (block)
+  (let ((first-statement (first (block-statements block))))
+    (typecase first-statement
+      (assignment-statement
+       (format nil "=.~a" (stmt-target-name first-statement)))
+      (if-statement
+       (format nil "if(~a)" (if-condition first-statement)))
+      (t (format nil "~a" first-statement)))))
+
 
 ;;; ----------------------------------------------------------------------
 ;;; If statements
@@ -476,6 +563,7 @@ If the first argument after VERBOSE is an integer, it is treated as the
 required verbosity LEVEL (higher is more chatty) and the following argument
 is the format string. Otherwise LEVEL defaults to 1."
   (let ((*package* (find-package :expr-var))
+        (*print-pretty* nil)
         (level 1)
         (format-str fmt)
         (format-args args))
@@ -548,6 +636,21 @@ to *TRACE-OUTPUT* so it plays nicely with your existing tracing."
               (or (string= name "CSE_T" :start1 0 :end1 5)
                   (string= name "CSE_P" :start1 0 :end1 5))))))
 
+(defun make-cse-temp-symbol (pass-id index &key suffix (package (symbol-package 'stmt-ir::cse-t)))
+  "Construct a temp symbol CSE_P<PASS-ID>_T<INDEX>, optionally with a SUFFIX for uniqueness.
+SUFFIX can be T (auto-gensym), a symbol, string, or any printable object. PACKAGE defaults
+to the CSE temp package."
+  (let* ((suffix-str (cond
+                       ((null suffix) nil)
+                       ((eq suffix t) (symbol-name (gensym "G")))
+                       ((symbolp suffix) (symbol-name suffix))
+                       ((stringp suffix) suffix)
+                       (t (princ-to-string suffix))))
+         (name (if suffix-str
+                   (format nil "CSE_P~D_T~D_~A" pass-id index suffix-str)
+                   (format nil "CSE_P~D_T~D" pass-id index))))
+    (intern name package)))
+
 (defun factorable-atom-p (factor)
     "Return T if FACTOR is allowed to be part of a common subproduct."
   (or (symbolp factor)
@@ -592,6 +695,731 @@ This ignores non-temp variables (E, G_X1, X1, etc.)."
                     nil)))))
       (rec-block block)
       t)))
+
+
+
+(defun collect-scalar-targets-in-block (block)
+  "Return a list of all assignment target symbols in BLOCK (recursively)."
+  (labels ((rec (blk acc)
+             (dolist (cycle (stmt-ir:block-statements blk) acc)
+               (setf acc
+                     (etypecase cycle
+                       (stmt-ir:assignment-statement
+                        (let ((name (stmt-ir:stmt-target-name cycle)))
+                          (pushnew name acc :test #'eq)))
+                       (stmt-ir:block-statement
+                        (rec cycle acc))
+                       (stmt-ir:if-statement
+                        (let ((acc2 (rec (stmt-ir:if-then-block cycle) acc)))
+                          (if (stmt-ir:if-else-block cycle)
+                              (rec (stmt-ir:if-else-block cycle) acc2)
+                              acc2)))
+                       (t
+                        acc))))))
+    (rec block '())))
+
+
+
+(defun next-cse-temp-index-for-pass (block pass-id)
+  "Return the maximum temp index N such that a symbol named
+   CSE_P<pass-id>_T<N> appears as an assignment target in BLOCK.
+If none are found, return 0.
+
+We scan BLOCK recursively."
+  (let* ((prefix (format nil "CSE_P~D_T" pass-id))
+         (plen   (length prefix))
+         (max-index 0))
+    (labels ((scan-block (blk)
+               (dolist (cycle (block-statements blk))
+                 (etypecase cycle
+                   (assignment-statement
+                    (let ((name (stmt-target-name cycle)))
+                      (when (symbolp name)
+                        (let ((s (symbol-name name)))
+                          (when (and (>= (length s) plen)
+                                     (string= s prefix :end1 plen))
+                            (let ((n (ignore-errors
+                                      (parse-integer s :start plen))))
+                              (when (and (integerp n) (> n max-index))
+                                (setf max-index n))))))))
+                   (block-statement
+                    (scan-block cycle))
+                   (if-statement
+                    (scan-block (if-then-block cycle))
+                    (when (if-else-block cycle)
+                      (scan-block (if-else-block cycle))))
+                   (raw-c-statement nil)))))
+      (scan-block block))
+    max-index))
+
+;;; ----------------------------------------------------------------------
+;;; CSE factor walker context/accumulator
+;;; ----------------------------------------------------------------------
+
+(defclass cse-factor-accumulator ()
+  ((products
+    :initarg :products
+    :accessor cse-acc-products
+    :initform '()
+    :documentation "Collected product-descriptor objects for this pass.")
+   (env-product->sym
+    :initarg :env-product->sym
+    :accessor cse-acc-env-product->sym
+    :initform (make-hash-table :test #'equal)
+    :documentation "Map product sexpr -> existing temp symbol for reuse.")
+   (stmts
+    :initarg :stmts
+    :accessor cse-acc-stmts
+    :initform '()
+    :documentation "Threaded statements in program order during the walk.")))
+
+(defclass cse-factor-context (walk-context)
+  ((env :initarg :env :accessor cse-ctx-env)
+   (idx :initarg :idx :accessor cse-ctx-idx)
+   (pass-id :initarg :pass-id :reader cse-ctx-pass-id)
+   (min-uses :initarg :min-uses :reader cse-ctx-min-uses)
+   (min-factors :initarg :min-factors :reader cse-ctx-min-factors)
+   (min-size :initarg :min-size :reader cse-ctx-min-size)
+   (cse-only :initarg :cse-only :reader cse-ctx-cse-only)
+   (verbose :initarg :verbose :reader cse-ctx-verbose)
+   (outer-symbols :initarg :outer-symbols :reader cse-ctx-outer-symbols)
+   (acc :initarg :acc :accessor cse-ctx-acc)))
+
+(defun make-cse-factor-context (&key env idx pass-id min-uses min-factors min-size
+                                     cse-only verbose outer-symbols acc)
+  (make-instance 'cse-factor-context
+                 :env env
+                 :idx idx
+                 :pass-id pass-id
+                 :min-uses min-uses
+                 :min-factors min-factors
+                 :min-size min-size
+                 :cse-only cse-only
+                 :verbose verbose
+                 :outer-symbols outer-symbols
+                 :acc acc))
+
+(defmethod clone-context ((operation (eql :cse-factor-products)) (ctx cse-factor-context) block)
+  ;; Branch-local env/idx are copied; accumulator is shared so branches contribute
+  ;; to the same analysis.
+  (make-cse-factor-context
+   :env (copy-binding-env (cse-ctx-env ctx) block)
+   :idx -1
+   :pass-id (cse-ctx-pass-id ctx)
+   :min-uses (cse-ctx-min-uses ctx)
+   :min-factors (cse-ctx-min-factors ctx)
+   :min-size (cse-ctx-min-size ctx)
+   :cse-only (cse-ctx-cse-only ctx)
+   :verbose (cse-ctx-verbose ctx)
+   :outer-symbols (cse-ctx-outer-symbols ctx)
+   :acc (cse-ctx-acc ctx)))
+
+(defun %counts-from-factors (factors)
+  (let ((ht (make-hash-table :test #'equal)))
+    (dolist (f factors ht)
+      (incf (gethash f ht 0)))))
+
+(defun %record-products-from-expr (expr idx target acc min-factors env)
+  (labels ((rec (sx)
+             (when (and (consp sx) (eq (car sx) '*))
+               (let ((factors (cdr sx)))
+                 (when (>= (length factors) min-factors)
+                   (push (make-instance 'product-descriptor
+                                        :factors factors
+                                        :counts (%counts-from-factors factors)
+                                        :stmt-index idx
+                                        :binding-env env
+                                        :target target)
+                         (cse-acc-products acc)))))
+             (when (consp sx)
+               (dolist (arg (cdr sx))
+                 (rec arg)))))
+    (rec (expr-ir:expr->sexpr expr))
+    acc))
+
+(defmethod on-statement ((operation (eql :cse-factor-products)) (ctx cse-factor-context) st)
+  (etypecase st
+    (assignment-statement
+     (let* ((env (cse-ctx-env ctx))
+            (idx (incf (cse-ctx-idx ctx)))
+            (tgt (stmt-target-name st)))
+       (binding-env-add env tgt (make-env-entry idx (stmt-expression st)))
+       (%record-products-from-expr (stmt-expression st) idx tgt
+                                   (cse-ctx-acc ctx)
+                                   (cse-ctx-min-factors ctx)
+                                   env)
+       (push st (cse-acc-stmts (cse-ctx-acc ctx)))
+       (values st ctx)))
+    (raw-c-statement
+     (push st (cse-acc-stmts (cse-ctx-acc ctx)))
+     (values st ctx))
+    (if-statement
+     ;; Children handled separately in the main function; keep as-is here.
+     (push st (cse-acc-stmts (cse-ctx-acc ctx)))
+     (values st ctx))
+    (block-statement
+     (push st (cse-acc-stmts (cse-ctx-acc ctx)))
+     (values st ctx))
+    (t
+     (push st (cse-acc-stmts (cse-ctx-acc ctx)))
+     (values st ctx))))
+
+(defun collect-products-in-block (block def-env acc pass-id min-uses min-factors min-size cse-only outer-symbols verbose)
+  "Walk BLOCK with a shared accumulator ACC, updating DEF-ENV. Returns ACC."
+  (let ((ctx (make-cse-factor-context
+              :env def-env
+              :idx -1
+              :pass-id pass-id
+              :min-uses min-uses
+              :min-factors min-factors
+              :min-size min-size
+              :cse-only cse-only
+              :verbose verbose
+              :outer-symbols outer-symbols
+              :acc acc)))
+    (walk-block-with-context :cse-factor-products ctx block)
+    acc))
+
+(defun choose-best-factor (products min-factors min-size min-uses cse-only env-product->sym pass-id verbose)
+  "Score candidates and return (values best-cand best-score best-uses best-first-use)."
+  (labels ((multiset-intersection (counts1 counts2)
+             (let ((result '()))
+               (maphash
+                (lambda (k v1)
+                  (let ((v2 (gethash k counts2 0)))
+                    (when (> (min v1 v2) 0)
+                      (dotimes (i (min v1 v2))
+                        (push k result)))))
+                counts1)
+               (sort result #'string< :key (lambda (sexpr) (format nil "~S" sexpr)))))
+           (multiset-subset-p (cand-counts prod-counts)
+             (let ((ok t))
+               (maphash (lambda (k v)
+                          (unless (<= v (gethash k prod-counts 0))
+                            (setf ok nil)))
+                        cand-counts)
+               ok))
+           (counts-from-factors (factors)
+             (let ((ht (make-hash-table :test #'equal)))
+               (dolist (f factors ht)
+                 (incf (gethash f ht 0))))))
+    (let ((candidate-lists '()))
+      (let ((plist (coerce products 'vector))
+            (m     (length products)))
+        (loop for i from 0 below (1- m) do
+          (let* ((ppi (aref plist i))
+                 (ci  (product-descriptor-counts ppi)))
+            (loop for j from (1+ i) below m do
+              (let* ((pj (aref plist j))
+                     (cj (product-descriptor-counts pj))
+                     (common (multiset-intersection ci cj)))
+                (when (and (>= (length common) min-factors)
+                           (or (not cse-only)
+                               (every #'cse-temp-symbol-p common)))
+                  (push common candidate-lists)))))))
+      (setf candidate-lists (remove-duplicates candidate-lists :test #'equal))
+      (setf candidate-lists
+            (sort candidate-lists #'string<
+                  :key (lambda (cand) (format nil "~S" cand))))
+      (when (null candidate-lists)
+        (verbose-log verbose "~&[CSE-FACT pass ~D] no factor candidates found~%"
+                     pass-id)
+        (return-from choose-best-factor (values nil 0 0 nil)))
+      (verbose-log verbose "~&[CSE-FACT pass ~D] ~D candidates across ~D products~%"
+                   pass-id (length candidate-lists) (length products))
+      (verbose-log verbose 2 "~&[CSE-FACT pass ~D] candidates:~%  ~{~A~%  ~}"
+                   pass-id
+                   (mapcar (lambda (cand) (format nil "~S" cand)) candidate-lists))
+      (let ((best-cand nil)
+            (best-score 0)
+            (best-uses  0)
+            (best-first-use nil))
+        (dolist (cand candidate-lists)
+          (let* ((cand-counts (counts-from-factors cand))
+                 (prod-sexpr  (cons '* cand))
+                 (size        (sexpr-size prod-sexpr))
+                 (uses        0)
+                 (first-use   nil))
+            (cond
+              ((< size min-size)
+               (verbose-log verbose 2 "~&[CSE-FACT pass ~D] skip cand ~S (size ~D < min-size ~D)~%"
+                            pass-id cand size min-size))
+              (t
+               (dolist (prod products)
+                 (let ((pc (product-descriptor-counts prod)))
+                   (when (multiset-subset-p cand-counts pc)
+                     (incf uses)
+                     (let ((idx (product-descriptor-stmt-index prod)))
+                       (setf first-use (if first-use (min first-use idx) idx))))))
+               (let ((score (* (- uses 1) size)))
+                 (verbose-log verbose 2 "~&[CSE-FACT pass ~D] cand ~S size=~D uses=~D first-use=~A score=~D (min-uses=~D)~%"
+                              pass-id cand size uses first-use score min-uses)
+                 (when (>= uses min-uses)
+                   (cond
+                     ((> score best-score)
+                      (setf best-score score
+                            best-cand cand
+                            best-uses uses
+                            best-first-use first-use))
+                     ((and (= score best-score) best-cand
+                           (string< (format nil "~S" cand)
+                                    (format nil "~S" best-cand)))
+                      (setf best-cand cand
+                            best-uses uses
+                            best-first-use first-use)))))))))
+        (values best-cand best-score best-uses best-first-use)))))
+
+(defun rewrite-with-factor (stmts env-product->sym def-env all-defs best-cand best-first-use pass-id verbose)
+  "Insert/reuse temp for BEST-CAND and rewrite STMTs accordingly.
+Returns (values new-stmts changed-p)."
+  (let* ((n (length stmts))
+         (counts-from-factors (lambda (factors)
+                                (let ((ht (make-hash-table :test #'equal)))
+                                  (dolist (f factors ht)
+                                    (incf (gethash f ht 0))))))
+         (cand-counts (funcall counts-from-factors best-cand))
+         (start-index (next-cse-temp-index-for-pass (make-block-stmt stmts) pass-id))
+         (existing (gethash (cons '* best-cand) env-product->sym))
+         (temp (or existing (make-cse-temp-symbol pass-id (1+ start-index) :suffix t)))
+         (temp-expr (expr-ir:sexpr->expr-ir (cons '* best-cand)))
+         (vars-used (expr-ir:expr-free-vars temp-expr))
+         (deps-defined-indices
+           (loop for u in vars-used
+                 for entry = (binding-env-lookup def-env u)
+                 for di = (and entry (env-entry-index entry))
+                 when (and di (integerp di)) collect di))
+         (missing-dep (some (lambda (u)
+                              (and (member u all-defs :test #'eq)
+                                   (null (binding-env-lookup def-env u))))
+                            vars-used))
+         (dep-max (if deps-defined-indices (reduce #'max deps-defined-indices) -1))
+         (min-insert (max (1+ dep-max) 0))
+         (max-allowed (or best-first-use n)))
+    (when (and vars-used missing-dep)
+      (verbose-log verbose "~&[CSE-FACT pass ~D] skip ~S (missing deps in scope)~%"
+                   pass-id best-cand)
+      (return-from rewrite-with-factor (values stmts nil)))
+    (when (> min-insert max-allowed)
+      (verbose-log verbose "~&[CSE-FACT pass ~D] skip ~S (deps after first use: min-insert=~D max=~D)~%"
+                   pass-id best-cand min-insert max-allowed)
+      (return-from rewrite-with-factor (values stmts nil)))
+    (let* ((insert-idx (min min-insert max-allowed))
+           (temp-assign (and (not existing)
+                             (make-assignment-stmt temp temp-expr))))
+      (labels ((multiset-subset-p (cand-counts prod-counts)
+                 (let ((ok t))
+                   (maphash (lambda (k v)
+                              (unless (<= v (gethash k prod-counts 0))
+                                (setf ok nil)))
+                            cand-counts)
+                   ok))
+               (rewrite-sexpr (sexpr target)
+                 (cond
+                   ((and (consp sexpr) (eq (car sexpr) '*))
+                    (let* ((orig-factors (cdr sexpr))
+                           (prod-counts (funcall counts-from-factors orig-factors)))
+                      (if (multiset-subset-p cand-counts prod-counts)
+                          (let ((remaining '()))
+                            (maphash
+                             (lambda (k vc)
+                               (let* ((cc (gethash k cand-counts 0))
+                                      (rc (- vc cc)))
+                                 (when (> rc 0)
+                                   (dotimes (i rc) (push k remaining)))))
+                             prod-counts)
+                            (let ((new-remaining (mapcar (lambda (s) (rewrite-sexpr s target))
+                                                         remaining)))
+                              (cond
+                                ((null new-remaining)
+                                 (if (and existing target (eq target temp))
+                                     sexpr
+                                     temp))
+                                (t
+                                 (cons '* (cons (if (and existing target (eq target temp))
+                                                    sexpr
+                                                    temp)
+                                                new-remaining))))))
+                          (cons '* (mapcar (lambda (s) (rewrite-sexpr s target))
+                                           orig-factors)))))
+                   ((consp sexpr)
+                    (cons (car sexpr)
+                          (mapcar (lambda (s) (rewrite-sexpr s target)) (cdr sexpr))))
+                   (t sexpr)))
+               (rewrite-expr (expr target)
+                 (expr-ir:sexpr->expr-ir (rewrite-sexpr (expr-ir:expr->sexpr expr) target)))
+               (rewrite-stmt (cycle)
+                 (etypecase cycle
+                   (anchored-assignment-statement
+                    (make-anchored-assignment-stmt
+                     (stmt-target-name cycle)
+                     (rewrite-expr (stmt-expression cycle) (stmt-target-name cycle))))
+                   (assignment-statement
+                    (make-assignment-stmt
+                     (stmt-target-name cycle)
+                     (rewrite-expr (stmt-expression cycle) (stmt-target-name cycle))))
+                   (raw-c-statement
+                    (let ((expr (stmt-expression cycle)))
+                      (if expr
+                          (make-raw-c-statement (raw-c-generator cycle)
+                                                (rewrite-expr expr nil))
+                          cycle)))
+                   (if-statement cycle)
+                   (block-statement cycle)
+                   (t cycle))))
+        (let ((new-stmts '()))
+          (loop for idx from 0 below n do
+            (when (and temp-assign (= idx insert-idx))
+              (push temp-assign new-stmts))
+            (push (rewrite-stmt (nth idx stmts)) new-stmts))
+          (when (and temp-assign (= insert-idx n))
+            (push temp-assign new-stmts))
+          ;; record temp for reuse
+          (when (not existing)
+            (setf (gethash (cons '* best-cand) env-product->sym) temp)
+            (multiple-value-bind (present _) (binding-env-lookup def-env temp)
+              (declare (ignore _))
+              (unless present
+                (binding-env-add def-env temp (make-env-entry insert-idx temp-expr)))))
+          (values (nreverse new-stmts)
+                  (or temp-assign (not (eq new-stmts stmts)))))))))
+
+(defun cse-factor-products-in-block
+    (block &key (min-uses 2) (min-factors 2) (min-size 2) (pass-id 1)
+           (cse-only nil) (defined-env (make-binding-env block)) (outer-symbols nil)
+           (verbose *verbose-optimization*))
+  "Try to factor out common multiplicative sub-products across all
+product subexpressions in BLOCK (a BLOCK-STATEMENT).
+
+We treat each (* ...) node as a multiset of factors and:
+
+  - For each pair of products, compute the multiset intersection
+    of their factor lists to propose a candidate common sub-product.
+  - Score each candidate by SCORE = (uses-1) * size, where USES is
+    the number of product subexpressions that contain the candidate
+    as a sub-multiset, and SIZE is the SEXPR-SIZE of the product
+    of the candidate factors.
+  - Pick the best-scoring candidate above thresholds and introduce
+    a temp CSE_P<pass-id>_T<n> for it.
+  - Rewrite each product that contains the candidate factors to use
+    the temp times the remaining factors.
+
+If no useful candidate is found, return BLOCK unchanged (EQ).
+When VERBOSE is non-NIL (or an integer level), candidate selection decisions
+are logged to *TRACE-OUTPUT* (higher levels show more detail)."
+  (declare (optimize (debug 3)))
+  (unless (typep block 'block-statement)
+    (error "cse-factor-products-in-block: expected BLOCK-STATEMENT, got ~S" block))
+  (let* ((def-env (copy-binding-env defined-env block))
+         (all-defs (collect-scalar-targets-in-block block))
+         (acc (make-instance 'cse-factor-accumulator)))
+    ;; Seed outer-scope symbols (e.g., parameters/constants) so we don't treat them as missing deps.
+    (dolist (sym outer-symbols)
+      (unless (binding-env-lookup def-env sym)
+        (binding-env-add def-env sym
+                         (make-instance 'outer-env-entry :index -1 :expr nil))))
+    (verbose-log verbose "~&[CSE-FACT pass ~D] scanning block with ~D statements (cse-only? ~A)~%"
+                 pass-id (length (block-statements block)) cse-only)
+    ;; Walk once to collect products/stmts across this block.
+    (collect-products-in-block block def-env acc pass-id min-uses min-factors min-size cse-only outer-symbols verbose)
+    (let* ((stmts (nreverse (cse-acc-stmts acc)))
+           (n     (length stmts))
+           (env-product->sym (cse-acc-env-product->sym acc))
+           (products (nreverse (cse-acc-products acc))))
+      ;; Seed product list and reuse map from env entries.
+      (map-binding-env
+       (lambda (sym entry env-found)
+         (declare (ignore env-found))
+         (when (and (typep entry 'env-entry)
+                    (env-entry-expr entry))
+           (let* ((sx (expr-ir:expr->sexpr (env-entry-expr entry))))
+             (when (and (consp sx) (eq (car sx) '*))
+               (setf (gethash sx env-product->sym) sym)
+               (push (make-instance 'product-descriptor
+                                    :factors (cdr sx)
+                                    :counts  (counts-from-factors (cdr sx))
+                                    :stmt-index (env-entry-index entry)
+                                    :binding-env def-env
+                                    :target sym)
+                     products)))))
+       def-env)
+      ;; Collect all product subexpressions and their factor multisets.
+      (labels ((collect-sexpr (sexpr idx)
+                 (when (and (consp sexpr)
+                            (eq (car sexpr) '*))
+                   (let ((factors (cdr sexpr)))
+                     ;; Ignore trivial products with too few factors.
+                     (when (>= (length factors) min-factors)
+                       (let ((counts (make-hash-table :test #'equal)))
+                         (dolist (f factors)
+                           (incf (gethash f counts 0)))
+                         (push (make-instance 'product-descriptor
+                                              :factors factors
+                                              :counts counts
+                                              :stmt-index idx
+                                              :binding-env def-env
+                                              :target (stmt-target-name (nth idx stmts)))
+                               products)))))
+                 ;; Recurse into children
+                 (when (consp sexpr)
+                   (dolist (arg (cdr sexpr))
+                     (collect-sexpr arg idx))))
+               (collect-expr (expr idx)
+                 (collect-sexpr (expr-ir:expr->sexpr expr) idx))
+               (collect-stmt (cycle idx)
+                 (etypecase cycle
+                   (assignment-statement
+                    (collect-expr (stmt-expression cycle) idx))
+                   (if-statement
+                    ;; Do not collect product candidates from inside branches;
+                    ;; avoid hoisting across barriers.
+                    (collect-expr (if-condition cycle) idx))
+                   (block-statement
+                    ;; Skip nested blocks at this level for factoring.
+                    nil)
+                   (t nil))))
+        (loop for cycle in stmts
+              for idx from 0 do
+                (collect-stmt cycle idx))
+        ;; Make products defined in this block available for reuse in this pass,
+        ;; so repeated iterations recognize existing temps.
+        (dolist (prod products)
+          (let* ((tgt (product-descriptor-target prod))
+                 (factors (product-descriptor-factors prod))
+                 (sx (cons '* factors)))
+            (when tgt
+              (setf (gethash sx env-product->sym) tgt))))
+        (setf products (nreverse products))
+        (when (< (length products) 2)
+          (verbose-log verbose "~&[CSE-FACT pass ~D] not enough products (~D)~%"
+                       pass-id (length products))
+          ;; Nothing to factor.
+          (return-from cse-factor-products-in-block block))
+        ;; Build candidate factor multisets from all pairs of products.
+        (let ((candidate-lists '()))
+          (let ((plist (coerce products 'vector))
+                (m     (length products)))
+            (loop for i from 0 below (1- m) do
+              (let* ((ppi (aref plist i))
+                     (ci  (product-descriptor-counts ppi)))
+                (loop for j from (1+ i) below m do
+                  (let* ((pj (aref plist j))
+                         (cj (product-descriptor-counts pj))
+                         (common (let ((result '()))
+                                   (maphash
+                                    (lambda (k v1)
+                                      (let ((v2 (gethash k cj 0)))
+                                        (when (> (min v1 v2) 0)
+                                          (dotimes (ii (min v1 v2))
+                                            (push k result)))))
+                                    ci)
+                                   (sort result #'string< :key (lambda (sexpr) (format nil "~S" sexpr))))))
+                    (when (and (>= (length common) min-factors)
+                               (or (not cse-only)
+                                   (every #'cse-temp-symbol-p common)))
+                      (push common candidate-lists)))))))
+          (setf candidate-lists
+                (remove-duplicates candidate-lists :test #'equal))
+          ;; Deterministic iteration order to stabilize temp naming.
+          (setf candidate-lists
+                (sort candidate-lists #'string<
+                      :key (lambda (cand)
+                             (format nil "~S" cand))))
+          (when (null candidate-lists)
+            (verbose-log verbose "~&[CSE-FACT pass ~D] no factor candidates found~%"
+                         pass-id)
+            (return-from cse-factor-products-in-block block))
+          (verbose-log verbose "~&[CSE-FACT pass ~D] ~D candidates across ~D products~%"
+                       pass-id (length candidate-lists) (length products))
+          (verbose-log verbose 2 "~&[CSE-FACT pass ~D] candidates:~%  ~{~A~%  ~}"
+                       pass-id
+                       (mapcar (lambda (cand)
+                                 (format nil "~S" cand))
+                               candidate-lists))
+          ;; Score candidates and pick the best.
+          (loop
+            (multiple-value-bind (best-cand best-score best-uses best-first-use)
+                (choose-best-factor products min-factors min-size min-uses cse-only env-product->sym pass-id verbose)
+              (when (or (null best-cand)
+                        (< best-uses min-uses)
+                        (<= best-score 0))
+                (return block))
+              (verbose-log verbose "~&[CSE-FACT pass ~D] best candidate so far: ~S (score=~D uses=~D first-use=~A)~%"
+                           pass-id best-cand best-score best-uses best-first-use)
+              (multiple-value-bind (new-stmts changed)
+                  (rewrite-with-factor stmts env-product->sym def-env all-defs best-cand best-first-use pass-id verbose)
+                (declare (ignore changed))
+                (if (eq new-stmts stmts)
+                    (return block)
+                    (progn
+                      (setf stmts new-stmts)
+                      ;; Re-walk to collect products again after rewrite.
+                      (let* ((acc2 (make-instance 'cse-factor-accumulator)))
+                        (collect-products-in-block (make-block-stmt stmts) def-env acc2 pass-id min-uses min-factors min-size cse-only outer-symbols verbose)
+                        (setf env-product->sym (cse-acc-env-product->sym acc2))
+                        (setf products (nreverse (cse-acc-products acc2))))))))))))))
+
+;;; ----------------------------------------------------------------------
+;;; Walker contexts for CSE (collection + rewrite scaffolding)
+;;; ----------------------------------------------------------------------
+
+(defclass cse-collect-context (walk-context)
+  ((env :initarg :env :accessor cse-col-env)
+   (idx :initarg :idx :accessor cse-col-idx)
+   (counts :initarg :counts :accessor cse-col-counts)
+   (first-use :initarg :first-use :accessor cse-col-first-use)
+   (outer-symbols :initarg :outer-symbols :accessor cse-col-outer-symbols)))
+
+(defun make-cse-collect-context (&key env idx counts first-use outer-symbols)
+  (make-instance 'cse-collect-context
+                 :env env
+                 :idx idx
+                 :counts counts
+                 :first-use first-use
+                 :outer-symbols outer-symbols))
+
+(defmethod clone-context ((operation (eql :cse-collect)) (ctx cse-collect-context) block)
+  (make-cse-collect-context
+   :env (copy-binding-env (cse-col-env ctx) block)
+   :idx -1
+   :counts (cse-col-counts ctx)
+   :first-use (cse-col-first-use ctx)
+   :outer-symbols (cse-col-outer-symbols ctx)))
+
+(defun %cse-record-expr (expr idx counts first-use)
+  (labels ((rec (sx)
+             (when (consp sx)
+               (incf (gethash sx counts 0))
+               (unless (gethash sx first-use)
+                 (setf (gethash sx first-use) idx))
+               (dolist (arg (cdr sx))
+                 (rec arg)))))
+    (rec (expr-ir:expr->sexpr expr))))
+
+(defmethod on-statement ((operation (eql :cse-collect)) (ctx cse-collect-context) st)
+  (etypecase st
+    (assignment-statement
+     (let* ((env (cse-col-env ctx))
+            (idx (incf (cse-col-idx ctx)))
+            (tgt (stmt-target-name st)))
+       (binding-env-add env tgt (make-env-entry idx (stmt-expression st)))
+       (%cse-record-expr (stmt-expression st) idx (cse-col-counts ctx) (cse-col-first-use ctx))
+       (values st ctx)))
+    (raw-c-statement
+     (incf (cse-col-idx ctx))
+     (values st ctx))
+    (if-statement
+     (incf (cse-col-idx ctx))
+     (values st ctx))
+    (block-statement
+     (incf (cse-col-idx ctx))
+     (values st ctx))
+    (t
+     (incf (cse-col-idx ctx))
+     (values st ctx))))
+
+(defclass cse-rewrite-context (walk-context)
+  ((env :initarg :env :accessor cse-rw-env)
+   (idx :initarg :idx :accessor cse-rw-idx)
+   (sexpr->temp :initarg :sexpr->temp :accessor cse-rw-sexpr->temp)
+   (temp-insert :initarg :temp-insert :accessor cse-rw-temp-insert)
+   (counts-from-factors :initarg :counts-from-factors :accessor cse-rw-counts-from-factors)
+   (cand-counts :initarg :cand-counts :accessor cse-rw-cand-counts)
+   (temps-seen :initarg :temps-seen :accessor cse-rw-temps-seen)
+   (changed :initarg :changed :accessor cse-rw-changed)))
+
+(defun make-cse-rewrite-context (&key env idx sexpr->temp temp-insert counts-from-factors cand-counts temps-seen changed)
+  (make-instance 'cse-rewrite-context
+                 :env env
+                 :idx idx
+                 :sexpr->temp sexpr->temp
+                 :temp-insert temp-insert
+                 :counts-from-factors counts-from-factors
+                 :cand-counts cand-counts
+                 :temps-seen temps-seen
+                 :changed changed))
+
+(defmethod clone-context ((operation (eql :cse-rewrite)) (ctx cse-rewrite-context) block)
+  (make-cse-rewrite-context
+   :env (copy-binding-env (cse-rw-env ctx) block)
+   :idx -1
+   :sexpr->temp (cse-rw-sexpr->temp ctx)
+   :temp-insert (cse-rw-temp-insert ctx)
+   :counts-from-factors (cse-rw-counts-from-factors ctx)
+   :cand-counts (cse-rw-cand-counts ctx)
+   :temps-seen (cse-rw-temps-seen ctx)
+   :changed (cse-rw-changed ctx)))
+
+(defun %rewrite-cse-sexpr (sexpr sexpr->temp counts-from-factors)
+  (labels ((multiset-subset-p (cand-counts prod-counts)
+             (let ((ok t))
+               (maphash (lambda (k v)
+                          (unless (<= v (gethash k prod-counts 0))
+                            (setf ok nil)))
+                        cand-counts)
+               ok))
+           (rec (sx)
+             (cond
+               ((and (consp sx) (gethash sx sexpr->temp))
+                (gethash sx sexpr->temp))
+               ((and (consp sx) (eq (car sx) '*))
+                (let* ((orig (cdr sx))
+                       (prod-counts (funcall counts-from-factors orig))
+                       (replacement (gethash sx sexpr->temp)))
+                  (if replacement
+                      replacement
+                      (cons '* (mapcar #'rec orig)))))
+               ((consp sx)
+                (cons (car sx) (mapcar #'rec (cdr sx))))
+               (t sx))))
+    (rec sexpr)))
+
+(defmethod on-statement ((operation (eql :cse-rewrite)) (ctx cse-rewrite-context) st)
+  (etypecase st
+    (assignment-statement
+     (let* ((env (cse-rw-env ctx))
+            (idx (incf (cse-rw-idx ctx)))
+            (tgt (stmt-target-name st))
+            (sexpr (expr-ir:expr->sexpr (stmt-expression st)))
+            (rewritten (expr-ir:sexpr->expr-ir
+                        (%rewrite-cse-sexpr sexpr (cse-rw-sexpr->temp ctx) (cse-rw-counts-from-factors ctx))))
+            (new-st (if (eq rewritten (stmt-expression st)) st (make-assignment-stmt tgt rewritten))))
+       (binding-env-add env tgt (make-env-entry idx rewritten))
+       (when (not (eq new-st st)) (setf (car (cse-rw-changed ctx)) t))
+       (values new-st ctx)))
+    (raw-c-statement
+     (incf (cse-rw-idx ctx))
+     (values st ctx))
+    (if-statement
+     (incf (cse-rw-idx ctx))
+     (values st ctx))
+    (block-statement
+     (incf (cse-rw-idx ctx))
+     (values st ctx))
+    (t
+     (incf (cse-rw-idx ctx))
+     (values st ctx))))
+
+(defmethod rewrite-block ((operation (eql :cse-rewrite)) (ctx cse-rewrite-context) statements)
+  (let ((out '())
+        (idx -1))
+    (dolist (st statements)
+      (incf idx)
+      ;; insert temps scheduled before this statement
+      (let ((temps (reverse (gethash idx (cse-rw-temp-insert ctx)))))
+        (dolist (tt temps)
+          (push tt out)
+          (setf (car (cse-rw-changed ctx)) tt)))
+      (multiple-value-bind (new-st new-ctx)
+          (on-statement operation ctx st)
+        (declare (ignore new-ctx))
+        (push new-st out)))
+    ;; handle temps scheduled after last statement
+    (let ((temps (reverse (gethash (length statements) (cse-rw-temp-insert ctx)))))
+      (dolist (tt temps)
+        (push tt out)
+        (setf (car (cse-rw-changed ctx)) tt)))
+    (values (nreverse out) ctx)))
+
 
 
 
@@ -1143,915 +1971,111 @@ Return a hash-table mapping NAME -> CTYPE."
       (1+ (reduce #'+ (mapcar #'sexpr-size sexpr)))))
 
 
-(defun cse-block (block &key (min-uses 2) (min-size 5) (pass-id 1)
-                        (defined-env (make-binding-env)) (outer-symbols nil)
-                        (verbose *verbose-optimization*))
-  "Perform one CSE pass on BLOCK (a BLOCK-STATEMENT).
 
-Temps created in this pass are named CSE_P<pass-id>_T<n>. We ensure
-each temp is defined AFTER all CSE temps it uses and BEFORE its first use
-in this block. When VERBOSE is non-NIL, progress is reported to *TRACE-OUTPUT*.
-If VERBOSE is an integer, higher values (e.g. 2) enable more detailed logging."
+(defun cse-block (block &key (min-uses 2) (min-size 5) (pass-id 1)
+                        (outer-symbols nil)
+                        (verbose *verbose-optimization*))
+  "Walker-based CSE. Collect subexpression counts/first-use with a walker,
+then rewrite with temps using a walker."
   (declare (optimize (debug 3)))
+  (break "Catch the block")
   (unless (typep block 'block-statement)
     (error "cse-block: expected BLOCK-STATEMENT, got ~S" block))
-
-  ;; First, build env for this block (parent env + local defs), then recurse into child blocks/branches.
-  (let* ((stmts0 (block-statements block))
-         (def-index (copy-binding-env defined-env))
-         (def-table (binding-env-table def-index)))
-    ;; Seed outer-scope symbols (e.g., parameters/constants) so we don't treat them as missing deps.
-    (dolist (sym outer-symbols)
-      (unless (gethash sym def-table)
-        (setf (gethash sym def-table)
-              (make-instance 'outer-env-entry :index -1 :expr nil))))
-    (when (>= (verbose-level verbose) 2)
-      (let ((env-syms '()))
-        (maphash (lambda (k _v) (push k env-syms)) def-table)
-        (verbose-log verbose 2 "~&[CSE pass ~D] input block with ~D stmts; env syms: ~S~%"
-                     pass-id (length stmts0) (sort env-syms #'string< :key #'symbol-name)))
-      (debug-block block :label (format nil "cse-block pass ~D input" pass-id)))
-    (verbose-log verbose "~&[CSE pass ~D] scanning block with ~D statements~%"
-                 pass-id (length stmts0))
-    (loop for cycle in stmts0
-          for idx from 0 do
-            (when (typep cycle 'assignment-statement)
-              ;; store index + expr for reuse
-              (let ((tgt (stmt-target-name cycle)))
-                (when (gethash tgt def-table)
-                  (error "SSA violation: ~S already defined in env" tgt))
-                (setf (gethash tgt def-table)
-                      (make-env-entry idx (stmt-expression cycle))))))
-
-    (flet ((recur (st env)
-             (etypecase st
-               (if-statement
-                (make-if-stmt
-                 (if-condition st)
-                 (let ((tb (if-then-block st)))
-                   (and tb (cse-block tb :min-uses min-uses :min-size min-size
-                                         :pass-id pass-id :defined-env env :verbose verbose)))
-                 (let ((eb (if-else-block st)))
-                   (and eb (cse-block eb :min-uses min-uses :min-size min-size
-                                         :pass-id pass-id :defined-env env :verbose verbose)))))
-               (block-statement
-                (cse-block st :min-uses min-uses :min-size min-size
-                              :pass-id pass-id :defined-env env :verbose verbose))
-               (t st))))
-      (let* ((stmts (mapcar (lambda (s) (recur s def-index))
-                            stmts0))
-             (n     (length stmts))
-             (current-block (make-block-stmt stmts)))
-
-        ;; ------------------------------------------------------------
-        ;; Phase 1: collect subexpr counts + earliest use index per sexpr
-        ;; ------------------------------------------------------------
-        (let ((counts    (make-hash-table :test #'equal))
-              (first-use (make-hash-table :test #'equal)))
-          (labels ((accum-sexpr (sexpr idx)
-                     (incf (gethash sexpr counts 0))
-                     (let ((old (gethash sexpr first-use nil)))
-                       (when (or (null old) (< idx old))
-                         (setf (gethash sexpr first-use) idx)))
-                     (when (consp sexpr)
-                       (dolist (arg (cdr sexpr))
-                         (accum-sexpr arg idx))))
-                   (accum-expr (expr idx)
-                     (accum-sexpr (expr-ir:expr->sexpr expr) idx)))
-            ;; Seed counts with expressions already available from outer env entries.
-            (maphash
-             (lambda (_k entry)
-               (declare (ignore _k))
-               (let ((expr (and (typep entry 'env-entry)
-                                (env-entry-expr entry))))
-                 (when expr
-                   (accum-expr expr 0))))
-             (binding-env-table defined-env))
-            (loop for cycle in stmts
-                  for idx from 0 do
-                    (etypecase cycle
-                      (assignment-statement
-                       (accum-expr (stmt-expression cycle) idx))
-                      (if-statement
-                       ;; Only count condition at this level; branches are handled by recursion above.
-                       (accum-expr (if-condition cycle) idx))
-                      (block-statement
-                       ;; Already optimized via recursion.
-                       nil)
-                      (t nil))))
-
-          ;; ------------------------------------------------------------
-          ;; Phase 2: collect definition indices (for temps we depend on)
-          ;; ------------------------------------------------------------
-          (let* ((def-index (copy-binding-env defined-env))
-                 (def-table (binding-env-table def-index))
-                 (all-defs (collect-scalar-targets-in-block block))
-                 (env-sexpr->sym (make-hash-table :test #'equal)))
-            ;; Map known expressions to their symbols for reuse.
-            (maphash
-             (lambda (sym entry)
-               (when (and (typep entry 'env-entry)
-                          (env-entry-expr entry))
-                 (setf (gethash (expr-ir:expr->sexpr (env-entry-expr entry))
-                                env-sexpr->sym)
-                       sym)))
-             def-table)
-
-            ;; ------------------------------------------------------------
-            ;; Phase 3: choose CSE candidates
-            ;; ------------------------------------------------------------
-            (let ((candidates '()))
-              (maphash
-               (lambda (sexpr count)
-                 (when (and (>= count min-uses)
-                            (consp sexpr)
-                            (>= (sexpr-size sexpr) min-size))
-                   (push sexpr candidates)))
-               counts)
-
-              (when (null candidates)
-                (verbose-log verbose "~&[CSE pass ~D] no candidates (min-uses=~D min-size=~D)~%"
-                             pass-id min-uses min-size)
-                ;; no CSE change
-                (return-from cse-block current-block))
-              ;; Establish deterministic ordering of candidates so temp naming
-              ;; is stable across runs.
-              (setf candidates
-                    (sort candidates #'string<
-                          :key (lambda (sexpr)
-                                 (format nil "~S" sexpr))))
-
-              ;; ------------------------------------------------------------
-              ;; Phase 4: build temps, compute insertion indices
-              ;; ------------------------------------------------------------
-              (let ((sexpr->temp (make-hash-table :test #'equal))
-                    (temp-insert (make-hash-table :test #'eq))
-                    (temp-counter (next-cse-temp-index-for-pass block pass-id))
-                    (existing-temps (make-hash-table :test #'eq)))
-                (labels
-                    ((temp-name ()
-                       (incf temp-counter)
-                       (expr-ir:ev (format nil "CSE_P~D_T~D" pass-id temp-counter))))
-
-                  ;; For each candidate sexpr, decide temp symbol & insertion index.
-                  (dolist (sexpr candidates)
-                    (let* ((existing (gethash sexpr env-sexpr->sym))
-                           (temp (or existing (temp-name)))
-                           (uses    (expr-ir:expr-free-vars
-                                     (expr-ir:sexpr->expr-ir sexpr)))
-                           (first   (gethash sexpr first-use)) ; earliest use index of this sexpr
-                           ;; If an operand is defined somewhere in this block but has no
-                           ;; recorded definition in scope, skip. Unknown symbols (params/constants)
-                           ;; are treated as outer-scope and allowed.
-                           (blocked-p (some (lambda (u)
-                                              (and (member u all-defs :test #'eq)
-                                                   (null (gethash u def-table nil))))
-                                            uses))
-                           (dep-max (if uses
-                                        (loop with max-di = -1
-                                              for u in uses
-                                              for entry = (gethash u def-table nil)
-                                              for di = (and entry (env-entry-index entry))
-                                              when (and entry
-                                                        (not (typep entry 'outer-env-entry))
-                                                        (integerp di)) do
-                                                          (setf max-di (max max-di di))
-                                              finally (return max-di))
-                                        -1))
-                           (min-insert (max (1+ dep-max) 0))
-                           (max-allowed (or first n)))
-                      #+(or)(when (and (eq '* (first sexpr))
-                                       (<= 2 (loop for sub in (cdr sexpr)
-                                                   when (eq sub 'expr-var::invr2)
-                                                     sum 1)))
-                              (break "New check invr2*invr2"))
-                      ;; Skip if blocked by barrier scope or impossible placement.
-                      (if (and (not blocked-p)
-                               (<= min-insert max-allowed))
-                          (let ((insert-idx (min min-insert max-allowed)))
-                            (verbose-log verbose "~&[CSE pass ~D] select ~S -> ~A (count=~D size=~D insert=~D existing? ~A deps-max=~D first-use=~A)~%"
-                                         pass-id sexpr temp
-                                         (gethash sexpr counts) (sexpr-size sexpr)
-                                         insert-idx (and existing t) dep-max first)
-                            (setf (gethash sexpr sexpr->temp) temp)
-                            (unless existing
-                              (setf (gethash temp  temp-insert) insert-idx))
-                            (when existing
-                              (setf (gethash temp existing-temps) t)))
-                          (verbose-log verbose "~&[CSE pass ~D] skip ~S (blocked? ~A min-insert=~D max-allowed=~A)~%"
-                                       pass-id sexpr blocked-p min-insert max-allowed)))))
-
-              ;; --------------------------------------------------------
-              ;; Phase 5: rewrite original statements to use temps
-              ;; --------------------------------------------------------
-              (labels ((rewrite-sexpr (sexpr target)
-                         (let ((maybe-temp (gethash sexpr sexpr->temp)))
-                           (cond
-                             ((and maybe-temp
-                                   (gethash maybe-temp existing-temps)
-                                   target
-                                   (eq target maybe-temp))
-                              ;; Avoid turning a defining assignment into a self-assignment.
-                              sexpr)
-                             (maybe-temp maybe-temp)
-                             ((consp sexpr)
-                              (cons (car sexpr)
-                                    (mapcar (lambda (s) (rewrite-sexpr s target))
-                                            (cdr sexpr))))
-                             (t sexpr))))
-                       (rewrite-expr (expr target)
-                         (expr-ir:sexpr->expr-ir
-                          (rewrite-sexpr (expr-ir:expr->sexpr expr) target)))
-                       (rewrite-stmt (cycle)
-                         (etypecase cycle
-                           (anchored-assignment-statement
-                            (make-anchored-assignment-stmt
-                             (stmt-target-name cycle)
-                             (rewrite-expr (stmt-expression cycle)
-                                           (stmt-target-name cycle))))
-                           (assignment-statement
-                            (make-assignment-stmt
-                             (stmt-target-name cycle)
-                             (rewrite-expr (stmt-expression cycle)
-                                           (stmt-target-name cycle))))
-                           (if-statement
-                            (make-if-stmt
-                             (rewrite-expr (if-condition cycle) nil)
-                             (cse-block (if-then-block cycle)
-                                        :min-uses min-uses
-                                        :min-size min-size
-                                        :pass-id pass-id
-                                        :verbose verbose)
-                             (when (if-else-block cycle)
-                               (cse-block (if-else-block cycle)
-                                          :min-uses min-uses
-                                          :min-size min-size
-                                          :pass-id pass-id
-                                          :verbose verbose))))
-                           (block-statement
-                            (cse-block cycle
-                                       :min-uses min-uses
-                                       :min-size min-size
-                                       :pass-id pass-id
-                                       :verbose verbose))
-                           (t cycle))))
-
-                (let* ((rewritten-stmts
-                         (loop for cycle in stmts collect (rewrite-stmt cycle)))
-                       ;; temp assignments bucketed by insertion index
-                       (insert-buckets (make-array (1+ n)
-                                                   :initial-element nil)))
-                  ;; build temp assignments and bucket them
-                  (maphash
-                   (lambda (sexpr temp)
-                     (let ((idx (gethash temp temp-insert)))
-                       (when idx
-                         (let* ((expr (expr-ir:sexpr->expr-ir sexpr))
-                                (assign (make-assignment-stmt temp expr)))
-                           (push assign (aref insert-buckets idx))))))
-                   sexpr->temp)
-                  ;; now assemble final statement list
-                  (let ((new-stmts '()))
-                    (loop for idx from 0 below n do
-                      ;; temps scheduled *before* statement idx
-                      (dolist (a (nreverse (aref insert-buckets idx)))
-                        (push a new-stmts))
-                      ;; then the original statement idx
-                      (push (nth idx rewritten-stmts) new-stmts))
-                    ;; temps scheduled after last stmt
-                    (dolist (a (nreverse (aref insert-buckets n)))
-                      (push a new-stmts))
-                    (let ((result (make-block-stmt (nreverse new-stmts))))
-                      (verbose-log verbose "~&[CSE pass ~D] inserted ~D new temps~%"
-                                   pass-id (hash-table-count temp-insert))
-                      result))))))))))))
-
-
-
-
-(defun collect-scalar-targets-in-block (block)
-  "Return a list of all assignment target symbols in BLOCK (recursively)."
-  (labels ((rec (blk acc)
-             (dolist (cycle (stmt-ir:block-statements blk) acc)
-               (setf acc
-                     (etypecase cycle
-                       (stmt-ir:assignment-statement
-                        (let ((name (stmt-ir:stmt-target-name cycle)))
-                          (pushnew name acc :test #'eq)))
-                       (stmt-ir:block-statement
-                        (rec cycle acc))
-                       (stmt-ir:if-statement
-                        (let ((acc2 (rec (stmt-ir:if-then-block cycle) acc)))
-                          (if (stmt-ir:if-else-block cycle)
-                              (rec (stmt-ir:if-else-block cycle) acc2)
-                              acc2)))
-                       (t
-                       acc))))))
-    (rec block '())))
-
-
-
-
-(defun next-cse-temp-index-for-pass (block pass-id)
-  "Return the maximum temp index N such that a symbol named
-   CSE_P<pass-id>_T<N> appears as an assignment target in BLOCK.
-If none are found, return 0.
-
-We scan BLOCK recursively."
-  (let* ((prefix (format nil "CSE_P~D_T" pass-id))
-         (plen   (length prefix))
-         (max-index 0))
-    (labels ((scan-block (blk)
-               (dolist (cycle (block-statements blk))
-                 (etypecase cycle
-                   (assignment-statement
-                    (let ((name (stmt-target-name cycle)))
-                      (when (symbolp name)
-                        (let ((s (symbol-name name)))
-                          (when (and (>= (length s) plen)
-                                     (string= s prefix :end1 plen))
-                            (let ((n (ignore-errors
-                                      (parse-integer s :start plen))))
-                              (when (and (integerp n) (> n max-index))
-                                (setf max-index n))))))))
-                   (block-statement
-                    (scan-block cycle))
-                   (if-statement
-                    (scan-block (if-then-block cycle))
-                    (when (if-else-block cycle)
-                      (scan-block (if-else-block cycle))))
-                   (raw-c-statement nil)
-                   ))))
-      (scan-block block))
-    max-index))
-
-(defparameter *in-rewrite* nil)
-
-;;; ----------------------------------------------------------------------
-;;; CSE factor walker context/accumulator
-;;; ----------------------------------------------------------------------
-
-(defclass cse-factor-accumulator ()
-  ((products
-    :initarg :products
-    :accessor cse-acc-products
-    :initform '()
-    :documentation "Collected product-descriptor objects for this pass.")
-   (env-product->sym
-    :initarg :env-product->sym
-    :accessor cse-acc-env-product->sym
-    :initform (make-hash-table :test #'equal)
-    :documentation "Map product sexpr -> existing temp symbol for reuse.")
-   (stmts
-    :initarg :stmts
-    :accessor cse-acc-stmts
-    :initform '()
-    :documentation "Threaded statements in program order during the walk.")))
-
-(defclass cse-factor-context (walk-context)
-  ((env
-    :initarg :env
-    :accessor cse-ctx-env)
-   (idx
-    :initarg :idx
-    :accessor cse-ctx-idx)
-   (pass-id
-    :initarg :pass-id
-    :reader cse-ctx-pass-id)
-   (min-uses
-    :initarg :min-uses
-    :reader cse-ctx-min-uses)
-   (min-factors
-    :initarg :min-factors
-    :reader cse-ctx-min-factors)
-   (min-size
-    :initarg :min-size
-    :reader cse-ctx-min-size)
-   (cse-only
-    :initarg :cse-only
-    :reader cse-ctx-cse-only)
-   (verbose
-    :initarg :verbose
-    :reader cse-ctx-verbose)
-   (outer-symbols
-    :initarg :outer-symbols
-    :reader cse-ctx-outer-symbols)
-   (acc
-    :initarg :acc
-    :accessor cse-ctx-acc)))
-
-(defun make-cse-factor-context (&key env idx pass-id min-uses min-factors min-size
-                                     cse-only verbose outer-symbols acc)
-  (make-instance 'cse-factor-context
-                 :env env
-                 :idx idx
-                 :pass-id pass-id
-                 :min-uses min-uses
-                 :min-factors min-factors
-                 :min-size min-size
-                 :cse-only cse-only
-                 :verbose verbose
-                 :outer-symbols outer-symbols
-                 :acc acc))
-
-(defmethod clone-context ((operation (eql :cse-factor-products)) (ctx cse-factor-context))
-  ;; Branch-local env/idx are copied; accumulator is shared so branches contribute
-  ;; to the same analysis.
-  (make-cse-factor-context
-   :env (copy-binding-env (cse-ctx-env ctx))
-   :idx -1
-   :pass-id (cse-ctx-pass-id ctx)
-   :min-uses (cse-ctx-min-uses ctx)
-   :min-factors (cse-ctx-min-factors ctx)
-   :min-size (cse-ctx-min-size ctx)
-   :cse-only (cse-ctx-cse-only ctx)
-   :verbose (cse-ctx-verbose ctx)
-   :outer-symbols (cse-ctx-outer-symbols ctx)
-   :acc (cse-ctx-acc ctx)))
-
-(defun %counts-from-factors (factors)
-  (let ((ht (make-hash-table :test #'equal)))
-    (dolist (f factors ht)
-      (incf (gethash f ht 0)))))
-
-(defun %record-products-from-expr (expr idx target acc min-factors)
-  (labels ((rec (sx)
-             (when (and (consp sx) (eq (car sx) '*))
-               (let ((factors (cdr sx)))
-                 (when (>= (length factors) min-factors)
-                   (push (make-instance 'product-descriptor
-                                        :factors factors
-                                        :counts (%counts-from-factors factors)
-                                        :stmt-index idx
-                                        :target target)
-                         (cse-acc-products acc)))))
-             (when (consp sx)
-               (dolist (arg (cdr sx))
-                 (rec arg)))))
-    (rec (expr-ir:expr->sexpr expr))
-    acc))
-
-(defmethod on-statement ((operation (eql :cse-factor-products)) (ctx cse-factor-context) st)
-  (etypecase st
-    (assignment-statement
-     (let* ((env (cse-ctx-env ctx))
-            (def-table (binding-env-table env))
-            (idx (incf (cse-ctx-idx ctx)))
-            (tgt (stmt-target-name st)))
-       (when (gethash tgt def-table)
-         (error "SSA violation: ~S already defined in env" tgt))
-       (setf (gethash tgt def-table)
-             (make-env-entry idx (stmt-expression st)))
-       (%record-products-from-expr (stmt-expression st) idx tgt
-                                   (cse-ctx-acc ctx)
-                                   (cse-ctx-min-factors ctx))
-       (push st (cse-acc-stmts (cse-ctx-acc ctx)))
-       (values st ctx)))
-    (raw-c-statement
-     (push st (cse-acc-stmts (cse-ctx-acc ctx)))
-     (values st ctx))
-    (if-statement
-     ;; Children handled separately in the main function; keep as-is here.
-     (push st (cse-acc-stmts (cse-ctx-acc ctx)))
-     (values st ctx))
-    (block-statement
-     (push st (cse-acc-stmts (cse-ctx-acc ctx)))
-     (values st ctx))
-    (t
-     (push st (cse-acc-stmts (cse-ctx-acc ctx)))
-     (values st ctx))))
-
-(defun collect-products-in-block (block def-env acc pass-id min-uses min-factors min-size cse-only outer-symbols verbose)
-  "Walk BLOCK with a shared accumulator ACC, updating DEF-ENV. Returns ACC."
-  (let ((ctx (make-cse-factor-context
-              :env def-env
-              :idx -1
-              :pass-id pass-id
-              :min-uses min-uses
-              :min-factors min-factors
-              :min-size min-size
-              :cse-only cse-only
-              :verbose verbose
-              :outer-symbols outer-symbols
-              :acc acc)))
-    (walk-block-with-context :cse-factor-products ctx block)
-    acc))
-
-(defun choose-best-factor (products min-factors min-size min-uses cse-only env-product->sym pass-id verbose)
-  "Score candidates and return (values best-cand best-score best-uses best-first-use)."
-  (labels ((multiset-intersection (counts1 counts2)
-             (let ((result '()))
-               (maphash
-                (lambda (k v1)
-                  (let ((v2 (gethash k counts2 0)))
-                    (when (> (min v1 v2) 0)
-                      (dotimes (i (min v1 v2))
-                        (push k result)))))
-                counts1)
-               (sort result #'string< :key (lambda (sexpr) (format nil "~S" sexpr)))))
-           (multiset-subset-p (cand-counts prod-counts)
-             (let ((ok t))
-               (maphash (lambda (k v)
-                          (unless (<= v (gethash k prod-counts 0))
-                            (setf ok nil)))
-                        cand-counts)
-               ok))
+  (labels ((seed-outer-symbols! (env)
+             (dolist (sym outer-symbols)
+               (unless (binding-env-lookup env sym)
+                 (binding-env-add env sym
+                                  (make-instance 'outer-env-entry :index -1 :expr nil)))))
            (counts-from-factors (factors)
              (let ((ht (make-hash-table :test #'equal)))
                (dolist (f factors ht)
-                 (incf (gethash f ht 0))))))
-    (let ((candidate-lists '()))
-      (let ((plist (coerce products 'vector))
-            (m     (length products)))
-        (loop for i from 0 below (1- m) do
-          (let* ((ppi (aref plist i))
-                 (ci  (product-descriptor-counts ppi)))
-            (loop for j from (1+ i) below m do
-              (let* ((pj (aref plist j))
-                     (cj (product-descriptor-counts pj))
-                     (common (multiset-intersection ci cj)))
-                (when (and (>= (length common) min-factors)
-                           (or (not cse-only)
-                               (every #'cse-temp-symbol-p common)))
-                  (push common candidate-lists)))))))
-      (setf candidate-lists (remove-duplicates candidate-lists :test #'equal))
-      (setf candidate-lists
-            (sort candidate-lists #'string<
-                  :key (lambda (cand) (format nil "~S" cand))))
-      (when (null candidate-lists)
-        (verbose-log verbose "~&[CSE-FACT pass ~D] no factor candidates found~%"
-                     pass-id)
-        (return-from choose-best-factor (values nil 0 0 nil)))
-      (verbose-log verbose "~&[CSE-FACT pass ~D] ~D candidates across ~D products~%"
-                   pass-id (length candidate-lists) (length products))
-      (verbose-log verbose 2 "~&[CSE-FACT pass ~D] candidates:~%  ~{~A~%  ~}"
-                   pass-id
-                   (mapcar (lambda (cand) (format nil "~S" cand)) candidate-lists))
-      (let ((best-cand nil)
-            (best-score 0)
-            (best-uses  0)
-            (best-first-use nil))
-        (dolist (cand candidate-lists)
-          (let* ((cand-counts (counts-from-factors cand))
-                 (prod-sexpr  (cons '* cand))
-                 (size        (sexpr-size prod-sexpr))
-                 (uses        0)
-                 (first-use   nil))
-            (cond
-              ((< size min-size)
-               (verbose-log verbose 2 "~&[CSE-FACT pass ~D] skip cand ~S (size ~D < min-size ~D)~%"
-                            pass-id cand size min-size))
-              (t
-               (dolist (prod products)
-                 (let ((pc (product-descriptor-counts prod)))
-                   (when (multiset-subset-p cand-counts pc)
-                     (incf uses)
-                     (let ((idx (product-descriptor-stmt-index prod)))
-                       (setf first-use (if first-use (min first-use idx) idx))))))
-               (let ((score (* (- uses 1) size)))
-                 (verbose-log verbose 2 "~&[CSE-FACT pass ~D] cand ~S size=~D uses=~D first-use=~A score=~D (min-uses=~D)~%"
-                              pass-id cand size uses first-use score min-uses)
-                 (when (>= uses min-uses)
-                   (cond
-                     ((> score best-score)
-                      (setf best-score score
-                            best-cand cand
-                            best-uses uses
-                            best-first-use first-use))
-                     ((and (= score best-score) best-cand
-                           (string< (format nil "~S" cand)
-                                    (format nil "~S" best-cand)))
-                      (setf best-cand cand
-                            best-uses uses
-                            best-first-use first-use))))))))))
-        (values best-cand best-score best-uses best-first-use)))))
-
-(defun rewrite-with-factor (stmts env-product->sym def-env all-defs best-cand best-first-use pass-id verbose)
-  "Insert/reuse temp for BEST-CAND and rewrite STMTs accordingly.
-Returns (values new-stmts changed-p)."
-  (let* ((n (length stmts))
-         (counts-from-factors (lambda (factors)
-                                (let ((ht (make-hash-table :test #'equal)))
-                                  (dolist (f factors ht)
-                                    (incf (gethash f ht 0))))))
-         (cand-counts (funcall counts-from-factors best-cand))
-         (start-index (next-cse-temp-index-for-pass (make-block-stmt stmts) pass-id))
-         (existing (gethash (cons '* best-cand) env-product->sym))
-         (temp (or existing
-                   (intern (format nil "CSE_P~D_T~D" pass-id (1+ start-index))
-                           (symbol-package 'stmt-ir::cse-t))))
-         (temp-expr (expr-ir:sexpr->expr-ir (cons '* best-cand)))
-         (vars-used (expr-ir:expr-free-vars temp-expr))
-         (def-table (binding-env-table def-env))
-         (deps-defined-indices
-           (loop for u in vars-used
-                 for entry = (gethash u def-table nil)
-                 for di = (and entry (env-entry-index entry))
-                 when (and entry (not (typep entry 'outer-env-entry)) (integerp di))
-                   collect di))
-         (missing-dep (some (lambda (u)
-                              (and (member u all-defs :test #'eq)
-                                   (null (gethash u def-table nil))))
-                            vars-used))
-         (dep-max (if deps-defined-indices (reduce #'max deps-defined-indices) -1))
-         (min-insert (max (1+ dep-max) 0))
-         (max-allowed (or best-first-use n)))
-    (when (and vars-used missing-dep)
-      (verbose-log verbose "~&[CSE-FACT pass ~D] skip ~S (missing deps in scope)~%"
-                   pass-id best-cand)
-      (return-from rewrite-with-factor (values stmts products nil)))
-    (when (> min-insert max-allowed)
-      (verbose-log verbose "~&[CSE-FACT pass ~D] skip ~S (deps after first use: min-insert=~D max=~D)~%"
-                   pass-id best-cand min-insert max-allowed)
-      (return-from rewrite-with-factor (values stmts products nil)))
-    (let* ((insert-idx (min min-insert max-allowed))
-           (temp-assign (and (not existing)
-                             (make-assignment-stmt temp temp-expr))))
-      (labels ((multiset-subset-p (cand-counts prod-counts)
-                 (let ((ok t))
-                   (maphash (lambda (k v)
-                              (unless (<= v (gethash k prod-counts 0))
-                                (setf ok nil)))
-                            cand-counts)
-                   ok))
-             (rewrite-sexpr (sexpr target)
-               (cond
-                 ((and (consp sexpr) (eq (car sexpr) '*))
-                  (let* ((orig-factors (cdr sexpr))
-                         (prod-counts (funcall counts-from-factors orig-factors)))
-                    (if (multiset-subset-p cand-counts prod-counts)
-                        (let ((remaining '()))
-                          (maphash
-                           (lambda (k vc)
-                             (let* ((cc (gethash k cand-counts 0))
-                                    (rc (- vc cc)))
-                               (when (> rc 0)
-                                 (dotimes (i rc) (push k remaining)))))
-                           prod-counts)
-                          (let ((new-remaining (mapcar (lambda (s) (rewrite-sexpr s target))
-                                                       remaining)))
-                            (cond
-                              ((null new-remaining)
-                               (if (and existing target (eq target temp))
-                                   sexpr
-                                   temp))
-                              (t
-                               (cons '* (cons (if (and existing target (eq target temp))
-                                                  sexpr
-                                                  temp)
-                                              new-remaining))))))
-                        (cons '* (mapcar (lambda (s) (rewrite-sexpr s target))
-                                         orig-factors)))))
-                 ((consp sexpr)
-                  (cons (car sexpr)
-                        (mapcar (lambda (s) (rewrite-sexpr s target)) (cdr sexpr))))
-                 (t sexpr))))
-               (rewrite-expr (expr target)
-                 (expr-ir:sexpr->expr-ir (rewrite-sexpr (expr-ir:expr->sexpr expr) target)))
-               (rewrite-stmt (cycle)
-                 (etypecase cycle
-                   (anchored-assignment-statement
-                    (make-anchored-assignment-stmt
-                     (stmt-target-name cycle)
-                     (rewrite-expr (stmt-expression cycle) (stmt-target-name cycle))))
-                   (assignment-statement
-                    (make-assignment-stmt
-                     (stmt-target-name cycle)
-                     (rewrite-expr (stmt-expression cycle) (stmt-target-name cycle))))
-                   (raw-c-statement
-                    (let ((expr (stmt-expression cycle)))
-                      (if expr
-                          (make-raw-c-statement (raw-c-generator cycle)
-                                                (rewrite-expr expr nil))
-                          cycle)))
-                   (if-statement cycle)
-                   (block-statement cycle)
-                   (t cycle))))
-        (let ((new-stmts '()))
-          (loop for idx from 0 below n do
-            (when (and temp-assign (= idx insert-idx))
-              (push temp-assign new-stmts))
-            (push (rewrite-stmt (nth idx stmts)) new-stmts))
-          (when (and temp-assign (= insert-idx n))
-            (push temp-assign new-stmts))
-          ;; record temp for reuse
-          (setf (gethash temp def-table)
-                (make-env-entry (incf (binding-env-counter def-env)) (candidate-expr nil)))
-          (values (nreverse new-stmts) t))))))
-(defun cse-factor-products-in-block
-    (block &key (min-uses 2) (min-factors 2) (min-size 2) (pass-id 1)
-           (cse-only nil) (defined-env (make-binding-env)) (outer-symbols nil)
-           (verbose *verbose-optimization*))
-  "Try to factor out common multiplicative sub-products across all
-product subexpressions in BLOCK (a BLOCK-STATEMENT).
-
-We treat each (* ...) node as a multiset of factors and:
-
-  - For each pair of products, compute the multiset intersection
-    of their factor lists to propose a candidate common sub-product.
-  - Score each candidate by SCORE = (uses-1) * size, where USES is
-    the number of product subexpressions that contain the candidate
-    as a sub-multiset, and SIZE is the SEXPR-SIZE of the product
-    of the candidate factors.
-  - Pick the best-scoring candidate above thresholds and introduce
-    a temp CSE_P<pass-id>_T<n> for it.
-  - Rewrite each product that contains the candidate factors to use
-    the temp times the remaining factors.
-
-If no useful candidate is found, return BLOCK unchanged (EQ).
-When VERBOSE is non-NIL (or an integer level), candidate selection decisions
-are logged to *TRACE-OUTPUT* (higher levels show more detail)."
-  (declare (optimize (debug 3)))
-  (unless (typep block 'block-statement)
-    (error "cse-factor-products-in-block: expected BLOCK-STATEMENT, got ~S" block))
-
-  (let* ((def-env (copy-binding-env defined-env))
-         (def-table (binding-env-table def-env))
-         (all-defs (collect-scalar-targets-in-block block))
-         (acc (make-instance 'cse-factor-accumulator)))
-    ;; Seed outer-scope symbols (e.g., parameters/constants) so we don't treat them as missing deps.
-    (dolist (sym outer-symbols)
-      (unless (gethash sym def-table)
-        (setf (gethash sym def-table)
-              (make-instance 'outer-env-entry :index -1 :expr nil))))
-    (verbose-log verbose "~&[CSE-FACT pass ~D] scanning block with ~D statements (cse-only? ~A)~%"
-                 pass-id (length (block-statements block)) cse-only)
-    ;; Walk once to collect products/stmts across this block.
-    (let* ((ctx (make-cse-factor-context
-                 :env def-env
-                 :idx -1
-                 :pass-id pass-id
-                 :min-uses min-uses
-                 :min-factors min-factors
-                 :min-size min-size
-                 :cse-only cse-only
-                 :verbose verbose
-                 :outer-symbols outer-symbols
-                 :acc acc)))
-      (walk-block-with-context :cse-factor-products ctx block))
-    (let* ((stmts (nreverse (cse-acc-stmts acc)))
-           (n     (length stmts))
-           (env-product->sym (cse-acc-env-product->sym acc))
-           (products (nreverse (cse-acc-products acc))))
-
-        
-      ;; Seed product list and reuse map from env entries.
-      (maphash
-       (lambda (sym entry)
-         (when (and (typep entry 'env-entry)
-                    (env-entry-expr entry))
-           (let* ((sx (expr-ir:expr->sexpr (env-entry-expr entry))))
-             (when (and (consp sx) (eq (car sx) '*))
-               (setf (gethash sx env-product->sym) sym)
-               (push (make-instance 'product-descriptor
-                                    :factors (cdr sx)
-                                    :counts  (counts-from-factors (cdr sx))
-                                    :stmt-index (env-entry-index entry)
-                                    :target sym)
-                     products)))))
-       def-table)
-        ;; Collect all product subexpressions and their factor multisets.
-        (labels ((collect-sexpr (sexpr idx)
-                   (when (and (consp sexpr)
-                              (eq (car sexpr) '*))
-                     (let ((factors (cdr sexpr)))
-                       ;; Ignore trivial products with too few factors.
-                     (when (>= (length factors) min-factors)
-                       (let ((counts (make-hash-table :test #'equal)))
-                         (dolist (f factors)
-                           (incf (gethash f counts 0)))
-                         (push (make-instance 'product-descriptor
-                                              :factors factors
-                                               :counts counts
-                                               :stmt-index idx
-                                               :target (stmt-target-name (nth idx stmts)))
-                                 products))))
-                   ;; Recurse into children
-                   (when (consp sexpr)
-                     (dolist (arg (cdr sexpr))
-                       (collect-sexpr arg idx)))))
-               (collect-expr (expr idx)
-                 (collect-sexpr (expr-ir:expr->sexpr expr) idx))
-               (collect-stmt (cycle idx)
-                 (etypecase cycle
-                   (assignment-statement
-                    (collect-expr (stmt-expression cycle) idx))
-                   (if-statement
-                    ;; Do not collect product candidates from inside branches;
-                    ;; avoid hoisting across barriers.
-                    (collect-expr (if-condition cycle) idx))
-                   (block-statement
-                    ;; Skip nested blocks at this level for factoring.
-                    nil)
-                   (t nil))))
-          (loop for cycle in stmts
-                for idx from 0 do
-                  (collect-stmt cycle idx))
-
-          ;; Make products defined in this block available for reuse in this pass,
-          ;; so repeated iterations recognize existing temps.
-          (dolist (prod products)
-            (let* ((tgt (product-descriptor-target prod))
-                   (factors (product-descriptor-factors prod))
-                   (sx (cons '* factors)))
-              (when tgt
-                (setf (gethash sx env-product->sym) tgt))))
-
-          (setf products (nreverse products))
-
-        (when (< (length products) 2)
-          (verbose-log verbose "~&[CSE-FACT pass ~D] not enough products (~D)~%"
-                       pass-id (length products))
-          ;; Nothing to factor.
-          (return-from cse-factor-products-in-block current-block))
-
-        ;; Helper: multiset intersection and subset tests on hash tables.
-        (flet ((multiset-intersection (counts1 counts2)
-                 (let ((result '()))
-                   (maphash
-                    (lambda (k v1)
-                      (let ((v2 (gethash k counts2 0)))
-                        (when (> (min v1 v2) 0)
-                          (dotimes (i (min v1 v2))
-                            (push k result)))))
-                    counts1)
-                   ;; Canonicalize order for use as hash key / equality.
-                   (sort result #'string<
-                         :key (lambda (sexpr)
-                                (format nil "~S" sexpr)))))
-               (multiset-subset-p (cand-counts prod-counts)
-                 (let ((ok t))
-                   (maphash
-                    (lambda (k v)
-                      (unless (<= v (gethash k prod-counts 0))
-                        (setf ok nil)))
-                    cand-counts)
-                   ok))
-               (counts-from-factors (factors)
-                 (let ((ht (make-hash-table :test #'equal)))
-                   (dolist (f factors ht)
-                     (incf (gethash f ht 0))))))
-
-          ;; Build candidate factor multisets from all pairs of products.
-          (let ((candidate-lists '()))
-            (let ((plist (coerce products 'vector))
-                  (m     (length products)))
-              (loop for i from 0 below (1- m) do
-                (let* ((ppi (aref plist i))
-                       (ci  (product-descriptor-counts ppi)))
-                  (loop for j from (1+ i) below m do
-                    (let* ((pj (aref plist j))
-                           (cj (product-descriptor-counts pj))
-                           (common (multiset-intersection ci cj)))
-                      (when (and (>= (length common) min-factors)
-                                 (or (not cse-only)
-                                     (every #'cse-temp-symbol-p common)))
-                        (push common candidate-lists)))))))
-            (setf candidate-lists
-                  (remove-duplicates candidate-lists :test #'equal))
-            ;; Deterministic iteration order to stabilize temp naming.
-          (setf candidate-lists
-                (sort candidate-lists #'string<
-                      :key (lambda (cand)
-                             (format nil "~S" cand))))
-
-          (when (null candidate-lists)
-            (verbose-log verbose "~&[CSE-FACT pass ~D] no factor candidates found~%"
-                         pass-id)
-            (return-from cse-factor-products-in-block current-block))
-
-          (verbose-log verbose "~&[CSE-FACT pass ~D] ~D candidates across ~D products~%"
-                       pass-id (length candidate-lists) (length products))
-          (verbose-log verbose 2 "~&[CSE-FACT pass ~D] candidates:~%  ~{~A~%  ~}"
-                       pass-id
-                       (mapcar (lambda (cand)
-                                 (format nil "~S" cand))
-                               candidate-lists))
-
-            ;; Score candidates and pick the best.
-      (loop
-        ;; Pick best candidate
-        (multiple-value-bind (best-cand best-score best-uses best-first-use)
-            (choose-best-factor products min-factors min-size min-uses cse-only env-product->sym pass-id verbose)
-          (when (or (null best-cand)
-                    (< best-uses min-uses)
-                    (<= best-score 0))
-            (return (make-block-stmt stmts)))
-          (verbose-log verbose "~&[CSE-FACT pass ~D] best candidate so far: ~S (score=~D uses=~D first-use=~A)~%"
-                       pass-id best-cand best-score best-uses best-first-use)
-          (multiple-value-bind (new-stmts changed)
-              (rewrite-with-factor stmts env-product->sym def-env all-defs best-cand best-first-use pass-id verbose)
+                 (incf (gethash f ht 0)))))
+           (collect (blk)
+             (let* ((env (make-binding-env blk))
+                    (counts (make-hash-table :test #'equal))
+                    (first-use (make-hash-table :test #'equal))
+                    (ctx (make-cse-collect-context :env env :idx -1 :counts counts :first-use first-use :outer-symbols outer-symbols)))
+               (seed-outer-symbols! env)
+               (walk-block-with-context :cse-collect ctx blk)
+               (values env counts first-use)))
+           (choose-candidates (counts first-use env)
+             (declare (ignore env))
+             (let ((candidates '()))
+               (maphash
+                (lambda (sx count)
+                  (when (and (>= count min-uses)
+                             (consp sx)
+                             (>= (sexpr-size sx) min-size))
+                    (push sx candidates)))
+                counts)
+               (setf candidates (sort candidates #'string< :key (lambda (sx) (format nil "~S" sx))))
+               (values candidates first-use)))
+           (plan-temps (candidates counts first-use env)
+             (let ((sexpr->temp (make-hash-table :test #'equal))
+                   (temp-insert (make-hash-table :test #'eq))
+                   (temp-counter (next-cse-temp-index-for-pass block pass-id))
+                   (env-sexpr->sym (make-hash-table :test #'equal)))
+               ;; reuse existing temps in env when available
+               (map-binding-env (lambda (sym entry _)
+                                  (declare (ignore _))
+                                  (when (env-entry-expr entry)
+                                    (setf (gethash (expr-ir:expr->sexpr (env-entry-expr entry)) env-sexpr->sym) sym)))
+                                env)
+               (dolist (sx candidates)
+                 (let* ((existing (gethash sx env-sexpr->sym))
+                        (temp (or existing (make-cse-temp-symbol pass-id (incf temp-counter) :suffix t)))
+                        (uses (expr-ir:expr-free-vars (expr-ir:sexpr->expr-ir sx)))
+                        (first (gethash sx first-use))
+                        (dep-max (if uses
+                                     (loop with mx = -1
+                                           for u in uses
+                                           for entry = (binding-env-lookup env u)
+                                           for di = (and entry (env-entry-index entry))
+                                           when (and di (integerp di)) do (setf mx (max mx di))
+                                           finally (return mx))
+                                     -1))
+                        (min-insert (max (1+ dep-max) 0))
+                        (max-allowed (or first (length (block-statements block)))))
+                   (when (and (<= min-insert max-allowed) (>= (gethash sx counts) min-uses))
+                     (push (make-assignment-stmt temp (expr-ir:sexpr->expr-ir sx))
+                           (gethash min-insert temp-insert))
+                     (setf (gethash sx sexpr->temp) temp))))
+               (values sexpr->temp temp-insert)))
+           (rewrite (blk env sexpr->temp temp-insert)
+             (let* ((rw-env (make-binding-env blk)))
+               ;; Carry outer bindings forward but rebuild the block-local env
+               ;; so SSA checks run against the rewritten block instead of the
+               ;; collected one.
+               (map-binding-env (lambda (sym entry _)
+                                  (declare (ignore _))
+                                  (when (typep entry 'outer-env-entry)
+                                    (binding-env-add rw-env sym entry)))
+                                env)
+               (let* ((ctx (make-cse-rewrite-context
+                             :env rw-env :idx -1
+                             :sexpr->temp sexpr->temp
+                             :temp-insert temp-insert
+                             :counts-from-factors #'counts-from-factors
+                             :cand-counts nil
+                             :temps-seen (make-hash-table :test #'eq)
+                             :changed (list nil))))
+                 (multiple-value-bind (new-block ctx-out)
+                     (walk-block-with-context :cse-rewrite ctx blk)
+                   (declare (ignore ctx-out))
+                   (values new-block (car (cse-rw-changed ctx))))))))
+    (multiple-value-bind (env counts first-use) (collect block)
+      (multiple-value-bind (candidates first-use*) (choose-candidates counts first-use env)
+        (break "Look at the candidates")
+        (when (null candidates)
+          (verbose-log verbose "~&[CSE pass ~D] no candidates (min-uses=~D min-size=~D)~%" pass-id min-uses min-size)
+          (return-from cse-block block))
+        (multiple-value-bind (sexpr->temp temp-insert)
+            (plan-temps candidates counts first-use* env)
+          (break "Did plan-temps")
+          (multiple-value-bind (new-block changed)
+              (rewrite block env sexpr->temp temp-insert)
             (declare (ignore changed))
-            (if (eq new-stmts stmts)
-                (return (make-block-stmt stmts))
-                (progn
-                  (setf stmts new-stmts)
-                  ;; Re-walk to collect products again after rewrite.
-                  (let* ((acc2 (make-instance 'cse-factor-accumulator)))
-                    (collect-products-in-block (make-block-stmt stmts) def-env acc2 pass-id min-uses min-factors min-size cse-only outer-symbols verbose)
-                    (setf env-product->sym (cse-acc-env-product->sym acc2))
-                    (setf products (nreverse (cse-acc-products acc2))))))))))))
-
+            new-block))))))
 
 (defun cse-block-multi-optimization (counter block
                                      &key
@@ -2692,9 +2716,7 @@ Returns (values new-factors matched-p)."
       ;; 3. Build temp assignment for BEST-COMBO.
       (let* ((pass-id (next-pass-id pass-counter))
              (start-index (next-cse-temp-index-for-pass block pass-id))
-             (temp-name   (intern (format nil "CSE_P~D_T~D"
-                                          pass-id (1+ start-index))
-                                  (symbol-package 'stmt-ir::make-assignment-stmt)))
+             (temp-name   (make-cse-temp-symbol pass-id (1+ start-index) :suffix t))
 	     (temp-sexpr  (if (= (length best-combo) 1)
 	                      (car best-combo)
 	                      (cons '* best-combo)))
@@ -2725,7 +2747,7 @@ Returns (values new-factors matched-p)."
           (return-from factor-temp-param-products-optimization block))
         (when (> min-insert max-allowed)
           ;; Cannot place temp before its first use; skip factoring.
-          (verbose-log verbose "~&[FTPP pass ~D] skip combo ~S (min-insert=~D max=~D)~%"
+          (verbose-log verbose "~&[FTPP pass ~D] skip combo ~S (min-insert=~D max-allowed=~D)~%"
                        pass-id best-combo min-insert max-allowed)
           (return-from factor-temp-param-products-optimization block))
         (let* ((insert-idx  (min min-insert max-allowed))

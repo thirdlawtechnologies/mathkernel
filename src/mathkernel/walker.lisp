@@ -17,7 +17,7 @@
 ;;; ------------------------------------------------------------
 
 
-(defgeneric clone-context (operation ctx)
+(defgeneric clone-context (operation ctx block)
   (:documentation "Return a shallow/deep copy of CTX appropriate for branching, parameterized by OPERATION."))
 
 (defgeneric on-statement (operation ctx stmt)
@@ -29,7 +29,7 @@ Default behavior: pass STMT through unchanged and return CTX. OPERATION can be u
 Default folds ON-STATEMENT over STATEMENTS, threading CTX."))
 
 ;;; Default methods
-(defmethod clone-context ((operation t) (ctx walk-context))
+(defmethod clone-context ((operation t) (ctx walk-context) block)
   ctx)
 
 (defmethod on-statement ((operation t) (ctx walk-context) stmt)
@@ -66,8 +66,8 @@ For IF statements, the context is cloned for each branch and not merged."
            (let* ((cond (if-condition st))
                   (then-blk (if-then-block st))
                   (else-blk (if-else-block st))
-                  (then-ctx (clone-context operation cur-ctx))
-                  (else-ctx (clone-context operation cur-ctx)))
+                  (then-ctx (clone-context operation cur-ctx then-blk))
+                  (else-ctx (clone-context operation cur-ctx else-blk)))
              (multiple-value-bind (new-then then-ctx-out)
                  (and then-blk (walk-block-with-context operation then-ctx then-blk))
                (declare (ignore then-ctx-out))
