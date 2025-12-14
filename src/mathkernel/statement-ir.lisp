@@ -77,6 +77,12 @@ Environments can be chained via PARENT; lookups walk the chain."))
             while e
             when (gethash e seen) do (return e)))))
 
+(defun binding-env-youngest (env1 env2)
+  "Return the youngest environment"
+  (if (binding-env-descendent-p env1 env2)
+      env2
+      env1))
+
 (defun block-entry-index-for-descendant (ancestor target)
   "Earliest statement index in ANCESTOR that dominates TARGET."
   (labels ((rec (blk)
@@ -649,6 +655,8 @@ to the CSE temp package."
          (name (if suffix-str
                    (format nil "CSE_P~D_T~D_~A" pass-id index suffix-str)
                    (format nil "CSE_P~D_T~D" pass-id index))))
+    (when (string= "CSE_P1_T4_G228" name)
+      (break "Caught bad symbol"))
     (intern name package)))
 
 (defun factorable-atom-p (factor)
@@ -1269,15 +1277,17 @@ are logged to *TRACE-OUTPUT* (higher levels show more detail)."
    (counts :initarg :counts :accessor cse-col-counts)
    (first-use :initarg :first-use :accessor cse-col-first-use)
    (first-use-env :initarg :first-use-env :accessor cse-col-first-use-env)
+   (uses-envs :initarg :uses-envs :accessor cse-col-uses-envs)
    (outer-symbols :initarg :outer-symbols :accessor cse-col-outer-symbols)))
 
-(defun make-cse-collect-context (&key env idx counts first-use first-use-env outer-symbols)
+(defun make-cse-collect-context (&key env idx counts first-use first-use-env uses-envs outer-symbols)
   (make-instance 'cse-collect-context
                  :env env
                  :idx idx
                  :counts counts
                  :first-use first-use
                  :first-use-env first-use-env
+                 :uses-envs uses-envs
                  :outer-symbols outer-symbols))
 
 (defmethod clone-context ((operation (eql :cse-collect)) (ctx cse-collect-context) block)
@@ -1287,15 +1297,17 @@ are logged to *TRACE-OUTPUT* (higher levels show more detail)."
    :counts (cse-col-counts ctx)
    :first-use (cse-col-first-use ctx)
    :first-use-env (cse-col-first-use-env ctx)
+   :uses-envs (cse-col-uses-envs ctx)
    :outer-symbols (cse-col-outer-symbols ctx)))
 
-(defun %cse-record-expr (expr idx env counts first-use first-use-env)
+(defun %cse-record-expr (expr idx env counts first-use first-use-env uses-envs)
   (labels ((rec (sx)
              (when (consp sx)
                (incf (gethash sx counts 0))
                (unless (gethash sx first-use)
                  (setf (gethash sx first-use) idx)
                  (setf (gethash sx first-use-env) env))
+               (push env (gethash sx uses-envs))
                (dolist (arg (cdr sx))
                  (rec arg)))))
     (rec (expr-ir:expr->sexpr expr))))
@@ -1303,13 +1315,13 @@ are logged to *TRACE-OUTPUT* (higher levels show more detail)."
 (defmethod on-statement ((operation (eql :cse-collect)) (ctx cse-collect-context) st)
   (etypecase st
     (assignment-statement
-     (let* ((env (cse-col-env ctx))
-            (idx (incf (cse-col-idx ctx)))
-            (tgt (stmt-target-name st)))
-       (binding-env-add env tgt (make-env-entry idx (stmt-expression st)))
+      (let* ((env (cse-col-env ctx))
+             (idx (incf (cse-col-idx ctx)))
+             (tgt (stmt-target-name st)))
+        (binding-env-add env tgt (make-env-entry idx (stmt-expression st)))
        (%cse-record-expr (stmt-expression st) idx env
-                         (cse-col-counts ctx) (cse-col-first-use ctx) (cse-col-first-use-env ctx))
-       (values st ctx)))
+                         (cse-col-counts ctx) (cse-col-first-use ctx) (cse-col-first-use-env ctx) (cse-col-uses-envs ctx))
+        (values st ctx)))
     (raw-c-statement
      (incf (cse-col-idx ctx))
      (values st ctx))
@@ -1992,15 +2004,16 @@ then rewrite with temps using a walker."
                     (counts (make-hash-table :test #'equal))
                     (first-use (make-hash-table :test #'equal))
                     (first-use-env (make-hash-table :test #'equal))
-                    (ctx (make-cse-collect-context :env env :idx -1 :counts counts :first-use first-use :first-use-env first-use-env :outer-symbols outer-symbols)))
+                    (uses-envs (make-hash-table :test #'equal))
+                    (ctx (make-cse-collect-context :env env :idx -1 :counts counts :first-use first-use :first-use-env first-use-env :uses-envs uses-envs :outer-symbols outer-symbols)))
                (dolist (sym outer-symbols)
                  (unless (binding-env-lookup env sym)
                    (binding-env-add env sym
                                     (make-instance 'outer-env-entry :index -1 :expr nil))))
                (walk-block-with-context :cse-collect ctx blk)
-               (values env counts first-use first-use-env)))
-           (choose-candidates (counts first-use first-use-env)
-             (declare (ignore first-use-env))
+               (values env counts first-use first-use-env uses-envs)))
+           (choose-candidates (counts first-use first-use-env uses-envs)
+             (declare (ignore first-use-env uses-envs))
              (let ((candidates '()))
                (maphash
                 (lambda (sx count)
@@ -2010,8 +2023,8 @@ then rewrite with temps using a walker."
                     (push sx candidates)))
                 counts)
                (setf candidates (sort candidates #'string< :key (lambda (sx) (format nil "~S" sx))))
-               (values candidates first-use first-use-env)))
-           (plan-temps (candidates counts first-use first-use-env env)
+               (values candidates first-use first-use-env uses-envs)))
+           (plan-temps (candidates counts first-use first-use-env uses-envs env)
              (let ((sexpr->temp (make-hash-table :test #'equal))
                    (temp-insert (make-hash-table :test #'eq))
                    (temp-counter (next-cse-temp-index-for-pass block pass-id))
@@ -2024,14 +2037,19 @@ then rewrite with temps using a walker."
                (dolist (sx candidates)
                  (let* ((use-idx (gethash sx first-use))
                         (use-env (or (gethash sx first-use-env) env))
+                        (use-envs-list (or (gethash sx uses-envs) (list use-env)))
                         (existing (gethash sx env-sexpr->sym))
                         (temp (or existing (make-cse-temp-symbol pass-id (incf temp-counter) :suffix t)))
                         (uses (expr-ir:expr-free-vars (expr-ir:sexpr->expr-ir sx)))
                         (dep-envs (loop for u in uses
-                                        for (_entry env-found) = (multiple-value-list (binding-env-lookup env u))
-                                        when env-found collect env-found))
-                        (insert-env (or (reduce #'binding-env-lca dep-envs :initial-value use-env)
-                                        use-env))
+                                        for (_entry env-found) = (multiple-value-list (binding-env-lookup use-env u))
+                                        if env-found
+                                          collect env-found
+                                        else
+                                          do (error "Could not find ~s in binding-env ~s or one of its ancestors"
+                                                    u use-env)))
+                        (all-use-envs (or dep-envs (gethash sx uses-env)))
+                        (insert-env (reduce #'binding-env-lca all-use-envs :initial-value use-env))
                         (insert-block (or (binding-env-block insert-env) block))
                         (dep-max (if uses
                                      (loop with mx = -1
@@ -2049,7 +2067,7 @@ then rewrite with temps using a walker."
                                           (make-hash-table :test #'eq)))))
                    (when (and (<= min-insert max-allowed) (>= (gethash sx counts) min-uses))
                      (push (make-assignment-stmt temp (expr-ir:sexpr->expr-ir sx))
-                            (gethash min-insert bucket))
+                           (gethash min-insert bucket))
                      (setf (gethash sx sexpr->temp) temp))))
                (break "Check sexpr->temp and temp-insert")
                (values sexpr->temp temp-insert)))
@@ -2072,14 +2090,13 @@ then rewrite with temps using a walker."
                      (walk-block-with-context :cse-rewrite ctx blk)
                    (declare (ignore ctx-out))
                    (values new-block (car (cse-rw-changed ctx))))))))
-    (multiple-value-bind (env counts first-use first-use-env) (collect block)
-      (multiple-value-bind (candidates first-use* first-use-env*) (choose-candidates counts first-use first-use-env)
+    (multiple-value-bind (env counts first-use first-use-env uses-envs) (collect block)
+      (multiple-value-bind (candidates first-use* first-use-env* uses-envs*) (choose-candidates counts first-use first-use-env uses-envs)
         (when (null candidates)
           (verbose-log verbose "~&[CSE pass ~D] no candidates (min-uses=~D min-size=~D)~%" pass-id min-uses min-size)
           (return-from cse-block block))
-        (break "Check first-use-env*")
         (multiple-value-bind (sexpr->temp temp-insert)
-            (plan-temps candidates counts first-use* first-use-env* env)
+            (plan-temps candidates counts first-use* first-use-env* uses-envs* env)
           (multiple-value-bind (new-block changed)
               (rewrite block env sexpr->temp temp-insert)
             (declare (ignore changed))
