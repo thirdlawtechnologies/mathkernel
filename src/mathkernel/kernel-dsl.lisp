@@ -2017,6 +2017,15 @@ energy-only kernels where D! requests are unnecessary."
 ;;; ------------------------------------------------------------
 
 
+(defun binding-params (params coord-vars)
+  (declare (optimize (debug 3)))
+  (let ((res (loop for param in params
+                   for svar = (symbol-name (second param))
+                   for var = (expr-ir:ev svar)
+                   until (string= svar "I3X1" :end1 (min (length svar) (length "I3X1")))
+                   collect var)))
+    (append res coord-vars)))
+
 
 (defun make-kernel-from-block
     (&key group name pipeline layout coord-vars coord-load-stmts base-block params
@@ -2032,6 +2041,7 @@ energy-only kernels where D! requests are unnecessary."
     (let* ((energy-var        (expr-ir:ev 'energy))
            (manual-deriv-spec (normalize-derivatives-spec derivatives))
            (compute-mode      (or compute-mode :energy))
+           (binding-params (binding-params params coord-vars))
            (base-block-filtered (filter-block-for-mode base-block compute-mode))
            (base-block*       (progn
                                 (format t "[KERNEL ~a] 2. expand-derivative-requests: user base-block -> base-block*~%" name)
@@ -2065,7 +2075,7 @@ energy-only kernels where D! requests are unnecessary."
             (let ((grad-block (stmt-ir:make-block-stmt current-stmts)))
               (multiple-value-bind (grad-opt results total-before total-after)
                   (stmt-ir:run-optimization-pipeline
-                   pass-counter pipeline grad-block
+                   pass-counter pipeline grad-block binding-params
                    :name (the-name "e-grad")
                    :log-stream *trace-output*)
                 (declare (ignore results total-before total-after))
@@ -2081,7 +2091,7 @@ energy-only kernels where D! requests are unnecessary."
             (let ((hess-block (stmt-ir:make-block-stmt current-stmts)))
               (multiple-value-bind (hess-opt results total-before total-after)
                   (stmt-ir:run-optimization-pipeline
-                   pass-counter pipeline hess-block
+                   pass-counter pipeline hess-block binding-params
                    :name (the-name "e-g-hess")
                    :log-stream *trace-output*)
                 (declare (ignore results total-before total-after))
@@ -2104,7 +2114,7 @@ energy-only kernels where D! requests are unnecessary."
                    (if post-eg-h-pipeline*
                        (multiple-value-bind (post-block results total-before total-after)
                            (stmt-ir:run-optimization-pipeline
-                            pass-counter post-eg-h-pipeline* eg-h-block
+                            pass-counter post-eg-h-pipeline* eg-h-block binding-params
                             :name (the-name "post-eg-h")
                             :log-stream *trace-output*)
                          (declare (ignore results total-before total-after))

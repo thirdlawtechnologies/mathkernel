@@ -847,7 +847,9 @@ CSE temps are defined before use and not redefined."
          (cse-block (stmt-ir:cse-block-multi block
                                              :max-passes 3
                                              :min-uses 2
-                                             :min-size 3)))
+                                             :min-size 3
+                                             :binding-params '(expr-var::x1 expr-var::y1 expr-var::z1
+                                                               expr-var::x2 expr-var::y2 expr-var::z2))))
     (multiple-value-bind (ok err)
         (run-check-cse-temp-order cse-block
                                   'test-cse-temp-order-distance-squared-duplication)

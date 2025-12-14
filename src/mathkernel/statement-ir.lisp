@@ -77,9 +77,9 @@ Environments can be chained via PARENT; lookups walk the chain."))
             while e
             when (gethash e seen) do (return e)))))
 
-(defun binding-env-youngest (env1 env2)
+(defun binding-env-later (env1 env2)
   "Return the youngest environment"
-  (if (binding-env-descendent-p env1 env2)
+  (if (binding-env-descendant-p env1 env2)
       env2
       env1))
 
@@ -655,8 +655,6 @@ to the CSE temp package."
          (name (if suffix-str
                    (format nil "CSE_P~D_T~D_~A" pass-id index suffix-str)
                    (format nil "CSE_P~D_T~D" pass-id index))))
-    (when (string= "CSE_P1_T4_G228" name)
-      (break "Caught bad symbol"))
     (intern name package)))
 
 (defun factorable-atom-p (factor)
@@ -1010,6 +1008,7 @@ Returns (values new-stmts changed-p)."
     (when (> min-insert max-allowed)
       (verbose-log verbose "~&[CSE-FACT pass ~D] skip ~S (deps after first use: min-insert=~D max=~D)~%"
                    pass-id best-cand min-insert max-allowed)
+      (break "Check what is going on - why can't we insert kkkkk")
       (return-from rewrite-with-factor (values stmts nil)))
     (let* ((insert-idx (min min-insert max-allowed))
            (temp-assign (and (not existing)
@@ -1092,8 +1091,9 @@ Returns (values new-stmts changed-p)."
                   (or temp-assign (not (eq new-stmts stmts)))))))))
 
 (defun cse-factor-products-in-block
-    (block &key (min-uses 2) (min-factors 2) (min-size 2) (pass-id 1)
-           (cse-only nil) (defined-env (make-binding-env block)) (outer-symbols nil)
+    (block &optional binding-params &key (min-uses 2) (min-factors 2) (min-size 2) (pass-id 1)
+           (cse-only nil) (defined-env (make-binding-env block))
+           (outer-symbols nil)
            (verbose *verbose-optimization*))
   "Try to factor out common multiplicative sub-products across all
 product subexpressions in BLOCK (a BLOCK-STATEMENT).
@@ -1115,21 +1115,21 @@ If no useful candidate is found, return BLOCK unchanged (EQ).
 When VERBOSE is non-NIL (or an integer level), candidate selection decisions
 are logged to *TRACE-OUTPUT* (higher levels show more detail)."
   (declare (optimize (debug 3)))
-  (break "Check the incoming block")
   (unless (typep block 'block-statement)
     (error "cse-factor-products-in-block: expected BLOCK-STATEMENT, got ~S" block))
-  (let* ((def-env (copy-binding-env defined-env block))
+  (let* ((outer-symbols (or outer-symbols binding-params))
+         (def-env (copy-binding-env defined-env block))
          (all-defs (collect-scalar-targets-in-block block))
          (acc (make-instance 'cse-factor-accumulator)))
     ;; Seed outer-scope symbols (e.g., parameters/constants) so we don't treat them as missing deps.
-    (dolist (sym outer-symbols)
+    (dolist (sym binding-params)
       (unless (binding-env-lookup def-env sym)
         (binding-env-add def-env sym
                          (make-instance 'outer-env-entry :index -1 :expr nil))))
     (verbose-log verbose "~&[CSE-FACT pass ~D] scanning block with ~D statements (cse-only? ~A)~%"
                  pass-id (length (block-statements block)) cse-only)
     ;; Walk once to collect products/stmts across this block.
-    (collect-products-in-block block def-env acc pass-id min-uses min-factors min-size cse-only outer-symbols verbose)
+    (collect-products-in-block block def-env acc pass-id min-uses min-factors min-size cse-only binding-params verbose)
     (let* ((stmts (nreverse (cse-acc-stmts acc)))
            (n     (length stmts))
            (env-product->sym (cse-acc-env-product->sym acc))
@@ -1263,7 +1263,7 @@ are logged to *TRACE-OUTPUT* (higher levels show more detail)."
                       (setf stmts new-stmts)
                       ;; Re-walk to collect products again after rewrite.
                       (let* ((acc2 (make-instance 'cse-factor-accumulator)))
-                        (collect-products-in-block (make-block-stmt stmts) def-env acc2 pass-id min-uses min-factors min-size cse-only outer-symbols verbose)
+                        (collect-products-in-block (make-block-stmt stmts) def-env acc2 pass-id min-uses min-factors min-size cse-only binding-params verbose)
                         (setf env-product->sym (cse-acc-env-product->sym acc2))
                         (setf products (nreverse (cse-acc-products acc2))))))))))))))
 
@@ -1991,7 +1991,7 @@ Return a hash-table mapping NAME -> CTYPE."
 
 
 
-(defun cse-block (block &key (min-uses 2) (min-size 5) (pass-id 1)
+(defun cse-block (block &optional binding-params &key (min-uses 2) (min-size 5) (pass-id 1)
                         (outer-symbols nil)
                         (verbose *verbose-optimization*))
   "Walker-based CSE. Collect subexpression counts/first-use with a walker,
@@ -1999,6 +1999,7 @@ then rewrite with temps using a walker."
   (declare (optimize (debug 3)))
   (unless (typep block 'block-statement)
     (error "cse-block: expected BLOCK-STATEMENT, got ~S" block))
+  (let ((outer-symbols (or outer-symbols binding-params)))
   (labels ((collect (blk)
              (let* ((env (make-binding-env blk))
                     (counts (make-hash-table :test #'equal))
@@ -2048,8 +2049,18 @@ then rewrite with temps using a walker."
                                         else
                                           do (error "Could not find ~s in binding-env ~s or one of its ancestors"
                                                     u use-env)))
-                        (all-use-envs (or dep-envs (gethash sx uses-env)))
-                        (insert-env (reduce #'binding-env-lca all-use-envs :initial-value use-env))
+                        (all-use-envs (or dep-envs (gethash sx uses-envs)))
+                        ;; Use the latest, lowest, deepest environment in all-use-envs to insert the temporary.
+                        ;; If we do anything that would use a shallower environment then the temp will be inserted too early.
+                        ;; We are using binding-env-deeper to sink the temps as deep as we need to
+                        ;;   do not use LCA, that would hoist to an outer block where a use variable will be undefined.
+                        (insert-env (let ((deep-env (reduce #'binding-env-later all-use-envs :initial-value use-env)))
+                                      ;; A guard to make sure the environment is the deep enough
+                                      (loop for use in uses
+                                            for (_entry env-found) = (multiple-value-list (binding-env-lookup deep-env use))
+                                            unless env-found
+                                              do (error "For uses ~s  deep-env is ~s and does not dominate ~s" uses deep-env use))
+                                      deep-env))
                         (insert-block (or (binding-env-block insert-env) block))
                         (dep-max (if uses
                                      (loop with mx = -1
@@ -2069,7 +2080,6 @@ then rewrite with temps using a walker."
                      (push (make-assignment-stmt temp (expr-ir:sexpr->expr-ir sx))
                            (gethash min-insert bucket))
                      (setf (gethash sx sexpr->temp) temp))))
-               (break "Check sexpr->temp and temp-insert")
                (values sexpr->temp temp-insert)))
            (rewrite (blk env sexpr->temp temp-insert)
              (let* ((rw-env (make-binding-env blk)))
@@ -2101,9 +2111,9 @@ then rewrite with temps using a walker."
               (rewrite block env sexpr->temp temp-insert)
             (declare (ignore changed))
             (check-cse-temp-order new-block)
-            new-block))))))
+            new-block)))))))
 
-(defun cse-block-multi-optimization (counter block
+(defun cse-block-multi-optimization (counter block &optional binding-params
                                      &key
                                        (max-passes 5)
                                        (min-uses 2)
@@ -2119,7 +2129,8 @@ more detail."
   (declare (optimize (debug 3)))
   (unless (typep block 'block-statement)
     (error "cse-block-multi: expected BLOCK-STATEMENT, got ~S" block))
-  (let ((current-block block))
+  (let* ((outer-symbols (or outer-symbols binding-params))
+         (current-block block))
     (loop for ii from 1 upto max-passes do
       (let* ((pass-id (next-pass-id counter))
              (pass pass-id)
@@ -2127,7 +2138,7 @@ more detail."
                (collect-scalar-targets-in-block current-block))
              ;; 1. Standard subtree CSE
              (after-cse
-               (cse-block current-block
+               (cse-block current-block binding-params
                           :min-uses min-uses
                           :min-size min-size
                           :pass-id  pass-id
@@ -2138,7 +2149,7 @@ more detail."
                (let ((current after-cse))
                        (loop for iter from 1 to 10 do
                          (let ((next (cse-factor-products-in-block
-                                      current
+                                      current binding-params
                                       :min-uses   min-uses
                                       :min-factors 2
                                       ;; Allow small products like invr2*invr2 to be reused.
@@ -2160,7 +2171,7 @@ more detail."
                  (loop for iter from 1 to 10 do
                    (let ((next
                            (cse-factor-products-in-block
-                            current
+                            current binding-params
                             :min-uses    2
                             :min-factors 3 ; require at least 3 factors, like your example
                             :min-size    1 ; allow smallish expressions
@@ -2177,7 +2188,7 @@ more detail."
                  current))
              ;; 4. Collapse trivial aliases introduced by factoring.
              (after-copy
-               (let ((cp (copy-propagate-optimization pass-id next-block :verbose verbose)))
+               (let ((cp (copy-propagate-optimization pass-id next-block binding-params :verbose verbose)))
                  (when verbose
                    (verbose-log verbose "~&[CSE pass ~D] copy-propagate after factoring~%" pass-id))
                  cp))
@@ -2224,7 +2235,7 @@ more detail."
 ;;; Copy propagation / dead trivial copies on blocks
 ;;; ------------------------------------------------------------
 
-(defun copy-propagate-optimization (pass-counter block &key (verbose *verbose-optimization*))
+(defun copy-propagate-optimization (pass-counter block &optional binding-params &key (verbose *verbose-optimization*))
   "Eliminate trivial copies in BLOCK of the form:
      t = u;
    where the RHS is just a variable (symbol).
@@ -2238,7 +2249,7 @@ We:
       * inside IF branches, we keep the copy (so that definitions
         remain explicit across control-flow joins) and do not
         rely on branch-local aliasing outside the branch."
-  (declare (ignore pass-counter))
+  (declare (ignore pass-counter binding-params))
   (verbose-log verbose "~&[COPY-PROP] scanning block with ~D statements~%"
                (length (block-statements block)))
   (labels
@@ -2465,11 +2476,11 @@ turning them into pure env aliases."
       new-block)))
 
 
-(defun factor-sums-optimization (pass-counter block &key (min-uses 2) (min-factors 1) (min-size 4)
+(defun factor-sums-optimization (pass-counter block &optional binding-params &key (min-uses 2) (min-factors 1) (min-size 4)
                                                (verbose *verbose-optimization*))
   "Return a new BLOCK-STATEMENT where each assignment RHS has had
 EXPR-IR:FACTOR-SUM-OF-PRODUCTS applied."
-  (declare (ignore pass-counter))
+  (declare (ignore pass-counter binding-params))
   (verbose-log verbose "~&[FACTOR-SUMS] rewriting block (min-uses=~D min-factors=~D min-size=~D)~%"
                min-uses min-factors min-size)
   (labels ((rewrite-expr (expr)
@@ -2576,10 +2587,11 @@ Returns (values new-factors matched-p)."
 
 
 
-(defun factor-temp-param-products-optimization (pass-counter block &key (min-uses 2)
+(defun factor-temp-param-products-optimization (pass-counter block &optional binding-params &key (min-uses 2)
                                                                      (min-factors 2)
                                                                      (max-factors 3)
                                                                      (verbose *verbose-optimization*))
+  (declare (ignore binding-params))
   (unless (typep block 'block-statement)
     (error "factor-temp-param-products-optimization: expected BLOCK-STATEMENT, got ~S"
            block))
@@ -2592,20 +2604,20 @@ Returns (values new-factors matched-p)."
                  (let ((cond (if-condition st))
                     (tb   (if-then-block st))
                     (eb   (if-else-block st)))
-              (make-if-stmt
-               cond
-               (and tb (factor-temp-param-products-optimization pass-counter tb
-                                                                :min-uses min-uses
-                                                                :min-factors min-factors
-                                                                :max-factors max-factors
-                                                                :verbose verbose))
-               (and eb (factor-temp-param-products-optimization pass-counter eb
-                                                                :min-uses min-uses
-                                                                :min-factors min-factors
-                                                                :max-factors max-factors
-                                                                :verbose verbose)))))
+               (make-if-stmt
+                cond
+                (and tb (factor-temp-param-products-optimization pass-counter tb binding-params
+                                                                 :min-uses min-uses
+                                                                 :min-factors min-factors
+                                                                 :max-factors max-factors
+                                                                 :verbose verbose))
+                (and eb (factor-temp-param-products-optimization pass-counter eb binding-params
+                                                                 :min-uses min-uses
+                                                                 :min-factors min-factors
+                                                                 :max-factors max-factors
+                                                                 :verbose verbose)))))
              (block-statement
-              (factor-temp-param-products-optimization pass-counter st
+              (factor-temp-param-products-optimization pass-counter st binding-params
                                                        :min-uses min-uses
                                                        :min-factors min-factors
                                                        :max-factors max-factors
@@ -2849,10 +2861,10 @@ Returns (values new-factors matched-p)."
                 result)))))))))
 
 
-(defun normalize-signs-optimization (pass-counter block &key (verbose *verbose-optimization*))
+(defun normalize-signs-optimization (pass-counter block &optional binding-params &key (verbose *verbose-optimization*))
   "Return a new BLOCK-STATEMENT where each assignment RHS expression
 has had EXPR-IR:NORMALIZE-SIGNS-EXPR applied."
-  (declare (ignore pass-counter))
+  (declare (ignore pass-counter binding-params))
   (verbose-log verbose "~&[NORMALIZE-SIGNS] rewriting block~%")
   (labels ((rewrite-expr (expr)
              (expr-ir:normalize-signs-expr expr))
@@ -3011,10 +3023,10 @@ equal to the target) are ignored."
 
 
 
-(defun linear-canonicalization-optimization (pass-counter block &key (verbose *verbose-optimization*))
+(defun linear-canonicalization-optimization (pass-counter block &optional binding-params &key (verbose *verbose-optimization*))
   "Walk BLOCK and linear-canonicalize every expression, to help factoring and CSE.
 Only linear subexpressions are changed; non-linear ones are left as-is."
-  (declare (ignore pass-counter))
+  (declare (ignore pass-counter binding-params))
   (verbose-log verbose "~&[LIN-CANON] canonicalizing linear subexpressions~%")
   (labels
       ((rewrite-expr (expr)
@@ -3153,7 +3165,7 @@ Only linear subexpressions are changed; non-linear ones are left as-is."
 
 
 
-(defun run-optimization (pass-counter opt block &key name (measure #'block-complexity)
+(defun run-optimization (pass-counter opt block binding-params &key name (measure #'block-complexity)
                              (log-stream nil) verbose)
   "Apply OPT to BLOCK, compute complexity before/after, and return:
    values (new-block before-complexity after-complexity accepted-p).
@@ -3169,7 +3181,7 @@ If MIN-IMPROVEMENT on OPT is > 0, we only accept the new block if
          (pos-args  (optimization-positional-args opt))
          (kw-args   (optimization-keyword-args opt))
          (before    (funcall measure block))
-         (new-block (apply fn pass-counter block (append pos-args kw-args (list :verbose verbose))))
+         (new-block (apply fn pass-counter block binding-params (append pos-args kw-args (list :verbose verbose))))
          (after     (funcall measure new-block))
          (impr      (- before after))
          (threshold (optimization-min-improvement opt))
@@ -3224,7 +3236,7 @@ If MIN-IMPROVEMENT on OPT is > 0, we only accept the new block if
             accepted)))
 
 
-(defun run-optimization-pipeline (pass-counter pipeline block
+(defun run-optimization-pipeline (pass-counter pipeline block binding-params
                                   &key name (measure nil) (log-stream nil)
                                     (cycles 10))
   "Run PIPELINE on BLOCK. Returns:
@@ -3247,7 +3259,7 @@ RESULTS-LIST is a list of plists:
                (dolist (opt (optimization-pipeline-optimizations pipeline))
                  (when (optimization-enabled-p opt)
                    (multiple-value-bind (new-block before after accepted)
-                       (run-optimization pass-counter opt current
+                       (run-optimization pass-counter opt current binding-params
                                          :name cur-name
                                          :measure measure :log-stream log-stream)
                      (push (list :opt-name (format nil "~a ~a" cur-name (optimization-name opt))
@@ -3319,7 +3331,7 @@ EXPR -> TARGET, provided it passes GOOD-ALIAS-RHS-P."
       (when (good-alias-rhs-p sx target)
         (setf (gethash sx env) target)))))
 
-(defun alias-assigned-exprs-optimization (pass-counter block &key (verbose *verbose-optimization*))
+(defun alias-assigned-exprs-optimization (pass-counter block &optional binding-params &key (verbose *verbose-optimization*))
   "General aliasing optimization.
 
 For every assignment
@@ -3333,7 +3345,7 @@ to the variable T.
 - Aliases flow forward within a block.
 - Aliases are visible inside THEN/ELSE blocks if defined before the IF.
 - Aliases defined inside a branch do not leak out to the parent block."
-  (declare (ignore pass-counter))
+  (declare (ignore pass-counter binding-params))
   (verbose-log verbose "~&[ALIAS-ASSIGN] scanning block for reusable RHS aliases~%")
   (labels
       ((process-block (blk env)
