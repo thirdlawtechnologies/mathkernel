@@ -657,7 +657,7 @@ mode."
             (energy (inject-ctx-energy-var ctx)))
        (setf (inject-ctx-seen ctx) seen)
        (if (eq (stmt-ir:stmt-target-name st) energy)
-           (let* ((blk (stmt-ir:make-block-stmt seen))
+           (let* ((blk (stmt-ir:make-block-stmt seen :label :lost-label-in-inject-hessians))
                   (hess-stmts (make-hessian-assignments-from-block
                                blk
                                energy
@@ -838,11 +838,13 @@ Optional :MODES restricts when the statement is kept:
            (expr-ir:parse-expr ,expr-string))
     :modes (normalize-modes ',modes)))
 
-(defmacro stmt-block (&body forms)
+(defmacro stmt-block (label &body forms)
   "Construct a STMT-IR block-statement from FORMS.
 Each FORM should evaluate to a statement object (e.g. from =.)."
   `(stmt-ir:make-block-stmt
-    (list ,@forms)))
+    (list ,@forms)
+    :label ',label
+    ))
 
 (defun mode-level (mode)
   (ecase mode
@@ -888,7 +890,8 @@ Bare statements (not annotated-stmt) are treated as :energy."
                                 new)))
                        (t
                         (push kept new))))))
-               (stmt-ir:make-block-stmt (nreverse new)))))
+               (stmt-ir:make-block-stmt (nreverse new)
+                                        :label (stmt-ir:block-label blk)))))
     (walk block)))
 
 ;;; ------------------------------------------------------------
@@ -1182,7 +1185,8 @@ calling KernelGradientAcc(i_base, offset, g_x1); otherwise return NIL."
 
         (t
          (push st new-stmts))))
-    (stmt-ir:make-block-stmt (reverse new-stmts))))
+    (stmt-ir:make-block-stmt (reverse new-stmts)
+                             :label (stmt-ir:block-label block))))
 
 
 
@@ -1660,7 +1664,8 @@ known to execute before this BLOCK (e.g. assignments in enclosing blocks)."
 
         (t
          (push st new-stmts))))
-    (stmt-ir:make-block-stmt (nreverse new-stmts))))
+    (stmt-ir:make-block-stmt (nreverse new-stmts)
+                             :label (stmt-ir:block-label block))))
 
 (defun expand-derivative-requests (block)
   "Top-level entry: expand all derivative requests (D TARGET BASE)
@@ -1718,7 +1723,8 @@ energy-only kernels where D! requests are unnecessary."
                         (push st new-stmts))))
                    (t
                     (push st new-stmts))))
-               (stmt-ir:make-block-stmt (nreverse new-stmts)))))
+               (stmt-ir:make-block-stmt (nreverse new-stmts)
+                                        :label (stmt-ir:block-label blk)))))
     (let ((drop-names (collect block)))
       (strip block drop-names))))
 
@@ -1759,7 +1765,8 @@ energy-only kernels where D! requests are unnecessary."
          (block-with-coords
            (if coord-load
                (stmt-ir:make-block-stmt
-                (append coord-load (list core-block)))
+                (append coord-load (list core-block))
+                :label (stmt-ir:block-label core-block))
                core-block))
          ;; turn energy/grad/hess assignments into KernelGradientAcc/KernelDiagHessAcc/... macros
          (transformed
@@ -2065,14 +2072,18 @@ energy-only kernels where D! requests are unnecessary."
         ;;   3) insert Hessians right after energy assignments (path-sensitive)
         ;;   4) optimize E+G+H
         (let* ((current-stmts (copy-list (stmt-ir:block-statements base-block*)))
-               (current-block (stmt-ir:make-block-stmt current-stmts)))
+               (current-block (stmt-ir:make-block-stmt current-stmts :label (stmt-ir:block-label base-block*)))
+               ;; Track the most recent labeled block explicitly.
+               (current-label (stmt-ir:block-label current-block))
+               ;; Initialize hess-block binding for later use.
+               (hess-block nil))
           (when compute-grad
             (setf current-block
                   (inject-gradients-after-energy
                    current-block coord-vars energy-var #'general-grad-name))
             (setf current-stmts (copy-list (stmt-ir:block-statements current-block))))
           (when pipeline
-            (let ((grad-block (stmt-ir:make-block-stmt current-stmts)))
+            (let ((grad-block (stmt-ir:make-block-stmt current-stmts :label current-label)))
               (multiple-value-bind (grad-opt results total-before total-after)
                   (stmt-ir:run-optimization-pipeline
                    pass-counter pipeline grad-block binding-params
@@ -2080,31 +2091,38 @@ energy-only kernels where D! requests are unnecessary."
                    :log-stream *trace-output*)
                 (declare (ignore results total-before total-after))
                 (setf current-stmts
-                      (copy-list (stmt-ir:block-statements grad-opt))))))
+                      (copy-list (stmt-ir:block-statements grad-opt)))
+                (setf current-label (stmt-ir:block-label grad-opt))
+                (setf current-block grad-opt))))
           (when compute-hess
-            (let* ((hess-block (stmt-ir:make-block-stmt current-stmts))
+            (let* ((local-hess-block (stmt-ir:make-block-stmt current-stmts :label current-label))
                    (with-h (inject-hessians-after-energy
-                            hess-block coord-vars energy-var #'general-hess-name
+                            local-hess-block coord-vars energy-var #'general-hess-name
                             manual-deriv-spec)))
-              (setf current-stmts (copy-list (stmt-ir:block-statements with-h)))))
+              (setf current-stmts (copy-list (stmt-ir:block-statements with-h)))
+              (setf current-label (stmt-ir:block-label with-h))
+              (setf hess-block with-h)))
           (when pipeline
-            (let ((hess-block (stmt-ir:make-block-stmt current-stmts)))
+            (let ((local-hess-block (stmt-ir:make-block-stmt current-stmts :label current-label)))
               (multiple-value-bind (hess-opt results total-before total-after)
                   (stmt-ir:run-optimization-pipeline
-                   pass-counter pipeline hess-block binding-params
+                   pass-counter pipeline local-hess-block binding-params
                    :name (the-name "e-g-hess")
                    :log-stream *trace-output*)
                 (declare (ignore results total-before total-after))
                 (setf current-stmts
-                      (copy-list (stmt-ir:block-statements hess-opt))))))
+                      (copy-list (stmt-ir:block-statements hess-opt)))
+                (setf current-label (stmt-ir:block-label hess-opt))
+                (setf hess-block hess-opt))))
           (let* ((core-block
-                   (let ((blk (stmt-ir:make-block-stmt current-stmts)))
+                   (let ((blk (stmt-ir:make-block-stmt current-stmts :label current-label)))
                      (stmt-ir:check-def-before-use-in-block blk :errorp t)
                      blk))
                  (block-with-coords
                    (if coord-load-stmts
                        (stmt-ir:make-block-stmt
-                        (append coord-load-stmts (list core-block)))
+                        (append coord-load-stmts (list core-block))
+                        :label (stmt-ir:block-label core-block))
                        core-block))
                  (eg-h-block
                    (transform-eg-h-block

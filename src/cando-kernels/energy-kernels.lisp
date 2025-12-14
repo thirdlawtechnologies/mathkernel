@@ -88,14 +88,14 @@
        (x2 y2 z2 i3x2))))
 
     (:body
-     (stmt-block
+     (stmt-block :!base
        (=. dx "x1 - x2")
        (=. dy "y1 - y2")
        (=. dz "z1 - z2")
        (=. r2 "dx*dx + dy*dy + dz*dz")
        (stmt-ir:make-if-stmt
         (expr-ir:parse-expr "r2 < r_cut2")
-        (stmt-block
+        (stmt-block :!in-cut
           (=. invr  "r2^-0.5")          ; one pow/sqrt
           (=. r     "r2*invr")          ; reuse, no extra sqrt
           (=. invr2 "invr*invr")
@@ -112,11 +112,11 @@
               :modes (:hessian))
           (stmt-ir:make-if-stmt
            (expr-ir:parse-expr "r2 < r_switch2")
-           (stmt-block
+           (stmt-block :!in-switch
              (=. energy "e_base")
              (=. dE_dr   "dE_base_dr" :modes (:gradient :hessian))
              (=. d2E_dr2 "d2E_base_dr2" :modes (:hessian)))
-           (stmt-block
+           (stmt-block :!in-skin
              (=. drs "r - r_switch")
              (=. t1 "drs*inv_range")
              (=. t2 "t1*t1")
@@ -132,51 +132,7 @@
              (=. dE_dr   "(s*dE_base_dr) + (ds_dr*e_base)" :modes (:gradient :hessian))
              (=. d2E_dr2 "(s*d2E_base_dr2) + (2.0*ds_dr*dE_base_dr) + (d2s_dr2*e_base)" :modes (:hessian)))))))
 
-
-
-     #+(or)(stmt-block
-             ;; geometry
-             (=. dx "x1 - x2")
-             (=. dy "y1 - y2")
-             (=. dz "z1 - z2")
-             (=. r2 "dx*dx + dy*dy + dz*dz")
-
-             (stmt-ir:make-if-stmt
-              (expr-ir:parse-expr "r2 < r_cut2")
-              (stmt-block
-                ;; base pieces
-                (=. r "r2^(1/2)")
-                (=. invr  "r^-1")
-                (=. invr2 "invr*invr")
-                (=. invr3 "invr*invr2")
-                (=. invr6 "invr2*invr2*invr2")
-                (=. e_lj   "A*invr6*invr6 - B*invr6")
-                (=. e_coul "qq*invr2/dd")
-                (=. e_base "e_lj + e_coul")
-
-                (stmt-ir:make-if-stmt
-                 (expr-ir:parse-expr "r2 < r_switch2")
-                 (stmt-block
-                   (=. energy "e_base"))
-                 (stmt-block
-                   (=. drs       "r - r_switch")
-                   (=. inv_range "1.0 / (r_cut - r_switch)")
-                   (=. t  "drs*inv_range")
-                   (=. t2 "t*t")
-                   (=. t3 "t2*t")
-                   (=. t4 "t2*t2")
-                   (=. t5 "t3*t2")
-                   ;; S(t) = 1 - 10 t^3 + 15 t^4 - 6 t^5
-                   (=. s "1.0 - 10.0*t3 + 15.0*t4 - 6.0*t5")
-                   ;; dS/dt, d²S/dt²
-                   #+(or)(=. ds_dt   "-30.0*t2 + 60.0*t3 - 30.0*t4" :modes (:gradient :hessian))
-                   #+(or)(=. d2s_dt2 "-60.0*t + 180.0*t2 - 120.0*t3" :modes (:hessian))
-                   ;; dS/dr, d²S/dr²
-                   #+(or)(=. ds_dr   "ds_dt*inv_range" :modes (:gradient :hessian))
-                   #+(or)(=. d2s_dr2 "d2s_dt2*inv_range*inv_range" :modes (:hessian))
-
-                   ;; E(r) = S(r)*E_base(r)
-                   (=. energy "s*e_base")))))))
+     )
 
     (:derivatives
      (:mode :manual
@@ -281,7 +237,7 @@
        (x2 y2 z2 i3x2))))
 
     (:body
-     (stmt-block
+     (stmt-block :!base
        (=. dx "x2 - x1")
        (=. dy "y2 - y1")
        (=. dz "z2 - z1")
@@ -321,7 +277,7 @@
        (x3 y3 z3 i3x3))))
 
     (:body
-     (stmt-block
+     (stmt-block :!base
        ;; bond vectors about atom 2
        (=. vx1 "x1 - x2")
        (=. vy1 "y1 - y2")
@@ -347,8 +303,6 @@
        ;; E(theta) = kt * (theta - t0)^2  (kt includes the 1/2 if desired)
        (=. energy "kt*dtheta*dtheta")))
     )
-;;; Give me a macro that lets me insert raw C-code into the stmt-block
-
 
   (build-multiple-kernels (kernels "dihedral" (:energy :gradient :hessian))
     (:pipeline *pipeline*)
@@ -383,7 +337,7 @@
        (x4 y4 z4 i3x4))))
 
     (:body
-     (stmt-block
+     (stmt-block :!base
        ;; bond vectors
        (=. v1x "x2 - x1")
        (=. v1y "y2 - y1")
@@ -477,7 +431,7 @@
        (x2 y2 z2 i3x2))))
 
     (:body
-     (stmt-block
+     (stmt-block :!base
        (=. dx "x1 - x2")
        (=. dy "y1 - y2")
        (=. dz "z1 - z2")
@@ -577,14 +531,14 @@
        (x2 y2 z2 i3x2))))
 
     (:body
-     (stmt-block
+     (stmt-block :!base
        (=. dx "x1 - x2")
        (=. dy "y1 - y2")
        (=. dz "z1 - z2")
        (=. r2 "dx*dx + dy*dy + dz*dz")
        (stmt-ir:make-if-stmt
         (expr-ir:parse-expr "r2 < r_cut2")
-        (stmt-block
+        (stmt-block :!cut
           (=. invr  "r2^-0.5")          ; one pow/sqrt
           (=. r     "r2*invr")          ; reuse, no extra sqrt
           (=. invr2 "invr*invr")
@@ -601,11 +555,11 @@
               :modes (:hessian))
           (stmt-ir:make-if-stmt
            (expr-ir:parse-expr "r2 < r_switch2")
-           (stmt-block
+           (stmt-block :!switch
              (=. energy "e_base")
              (=. dE_dr   "dE_base_dr" :modes (:gradient :hessian))
              (=. d2E_dr2 "d2E_base_dr2" :modes (:hessian)))
-           (stmt-block
+           (stmt-block :!skin
              (=. drs "r - r_switch")
              (=. t1 "drs*inv_range")
              (=. t2 "t1*t1")
@@ -621,51 +575,7 @@
              (=. dE_dr   "(s*dE_base_dr) + (ds_dr*e_base)" :modes (:gradient :hessian))
              (=. d2E_dr2 "(s*d2E_base_dr2) + (2.0*ds_dr*dE_base_dr) + (d2s_dr2*e_base)" :modes (:hessian)))))))
 
-
-
-     #+(or)(stmt-block
-             ;; geometry
-             (=. dx "x1 - x2")
-             (=. dy "y1 - y2")
-             (=. dz "z1 - z2")
-             (=. r2 "dx*dx + dy*dy + dz*dz")
-
-             (stmt-ir:make-if-stmt
-              (expr-ir:parse-expr "r2 < r_cut2")
-              (stmt-block
-                ;; base pieces
-                (=. r "r2^(1/2)")
-                (=. invr  "r^-1")
-                (=. invr2 "invr*invr")
-                (=. invr3 "invr*invr2")
-                (=. invr6 "invr2*invr2*invr2")
-                (=. e_lj   "A*invr6*invr6 - B*invr6")
-                (=. e_coul "qq*invr2/dd")
-                (=. e_base "e_lj + e_coul")
-
-                (stmt-ir:make-if-stmt
-                 (expr-ir:parse-expr "r2 < r_switch2")
-                 (stmt-block
-                   (=. energy "e_base"))
-                 (stmt-block
-                   (=. drs       "r - r_switch")
-                   (=. inv_range "1.0 / (r_cut - r_switch)")
-                   (=. t1  "drs*inv_range")
-                   (=. t2 "t*t")
-                   (=. t3 "t2*t")
-                   (=. t4 "t2*t2")
-                   (=. t5 "t3*t2")
-                   ;; S(t) = 1 - 10 t^3 + 15 t^4 - 6 t^5
-                   (=. s "1.0 - 10.0*t3 + 15.0*t4 - 6.0*t5")
-                   ;; dS/dt, d²S/dt²
-                   #+(or)(=. ds_dt   "-30.0*t2 + 60.0*t3 - 30.0*t4" :modes (:gradient :hessian))
-                   #+(or)(=. d2s_dt2 "-60.0*t + 180.0*t2 - 120.0*t3" :modes (:hessian))
-                   ;; dS/dr, d²S/dr²
-                   #+(or)(=. ds_dr   "ds_dt*inv_range" :modes (:gradient :hessian))
-                   #+(or)(=. d2s_dr2 "d2s_dt2*inv_range*inv_range" :modes (:hessian))
-
-                   ;; E(r) = S(r)*E_base(r)
-                   (=. energy "s*e_base")))))))
+     )
 
     (:derivatives
      (:mode :manual
@@ -786,7 +696,7 @@
 
     ;; Kernel body
     (:body
-     (stmt-block
+     (stmt-block :!base
        ;; r13 = r1 - r3
        (=. dx13 "x1 - x3")
        (=. dy13 "y1 - y3")
@@ -839,7 +749,7 @@
      (coords-from-position
       ((x1 y1 z1 i3x1))))
     (:body
-     (stmt-block
+     (stmt-block :!base
        (=. dx "x1 - xa")
        (=. dy "y1 - ya")
        (=. dz "z1 - za")
@@ -939,7 +849,7 @@
       :geometry-check :warn))
 
     (:body
-     (stmt-block
+     (stmt-block :!base
        ;; Bond vectors
        (=. dx12 "x2 - x1")
        (=. dy12 "y2 - y1")

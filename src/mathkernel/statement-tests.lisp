@@ -37,6 +37,10 @@
      ,@body
      (format t "  OK~%")))
 
+;; Helper for building assignment statements in tests.
+(defun make-assign (sym expr)
+  (make-assignment-stmt sym expr))
+
 (defun run-all ()
   "Run expression tests followed by statement tests. Returns T only if both pass."
   (and (expr-ir.tests:run-expression-tests)
@@ -89,6 +93,7 @@
                  test-angle-like-pipeline_factor_temp_param
                  test-factor-temp-param-products_triple_t1_t18_t6
                  test-factor-temp-param-products_triple_t1_t18_t6_with_minus
+                 test-cse-factor-no-dom-redefine
                  )))
     (dolist (fn tests)
       (handler-case
@@ -135,6 +140,31 @@
   "Compare two expression IR nodes by alpha-equal prefix S-expressions."
   (sexpr-alpha-equal (expr->sexpr a)
                      (expr->sexpr b)))
+
+;;; ----------------------------------------------------------------------
+;;; Regression: factor planner must not plan duplicate temps on dominated paths
+;;; ----------------------------------------------------------------------
+
+(deftest test-cse-factor-no-dom-redefine
+  "Ensure factor planning detects duplicate temp definitions on dominated paths."
+  (let* ((outer '(EXPR-VAR::A EXPR-VAR::B))
+         ;; Build a block where the same temp would be considered twice on a single path.
+         ;; Both assignments use the same sexpr so reuse would try to pick the same temp name.
+         (tgt 'EXPR-VAR::CSE_P1_T1_G999)
+         (expr (expr-ir:sexpr->expr-ir '(* EXPR-VAR::A EXPR-VAR::B)))
+         (dom-assign (make-assign tgt expr))
+         (sub-assign (make-assign tgt expr))
+         (sub-block (make-block-stmt (list sub-assign) :label :sub))
+         (base-block (make-block-stmt (list dom-assign sub-block) :label :base)))
+    ;; The preflight in cse-factor-products-in-block should catch this duplicate along one path.
+    (multiple-value-bind (ok err)
+        (ignore-errors (stmt-ir:cse-factor-products-in-block base-block outer))
+      (assert-true (null ok)
+                   'test-cse-factor-no-dom-redefine
+                   "expected duplicate temp detection, but pass succeeded")
+      (assert-true err
+                   'test-cse-factor-no-dom-redefine
+                   "expected an error object for duplicate temp detection"))))
 
 ;;; ----------------------------------------------------------------------
 ;;; 1. Single-assignment differentiation: foo = x^2 + 1

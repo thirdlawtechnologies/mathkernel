@@ -229,7 +229,9 @@
   #:raw-c-generator
   #:make-anchored-assignment-stmt
   #:anchored-assignment-statement
-  #:*verbose-optimization*))
+  #:*verbose-optimization*
+  #:block-label
+  #:cse-factor-products-in-block))
 
 (defpackage :stmt-ir.tests
   (:use :cl :expr-ir :stmt-ir)
