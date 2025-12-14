@@ -1107,6 +1107,7 @@ If no useful candidate is found, return BLOCK unchanged (EQ).
 When VERBOSE is non-NIL (or an integer level), candidate selection decisions
 are logged to *TRACE-OUTPUT* (higher levels show more detail)."
   (declare (optimize (debug 3)))
+  (break "Check the incoming block")
   (unless (typep block 'block-statement)
     (error "cse-factor-products-in-block: expected BLOCK-STATEMENT, got ~S" block))
   (let* ((def-env (copy-binding-env defined-env block))
@@ -2050,6 +2051,7 @@ then rewrite with temps using a walker."
                      (push (make-assignment-stmt temp (expr-ir:sexpr->expr-ir sx))
                             (gethash min-insert bucket))
                      (setf (gethash sx sexpr->temp) temp))))
+               (break "Check sexpr->temp and temp-insert")
                (values sexpr->temp temp-insert)))
            (rewrite (blk env sexpr->temp temp-insert)
              (let* ((rw-env (make-binding-env blk)))
@@ -2075,11 +2077,13 @@ then rewrite with temps using a walker."
         (when (null candidates)
           (verbose-log verbose "~&[CSE pass ~D] no candidates (min-uses=~D min-size=~D)~%" pass-id min-uses min-size)
           (return-from cse-block block))
+        (break "Check first-use-env*")
         (multiple-value-bind (sexpr->temp temp-insert)
             (plan-temps candidates counts first-use* first-use-env* env)
           (multiple-value-bind (new-block changed)
               (rewrite block env sexpr->temp temp-insert)
             (declare (ignore changed))
+            (check-cse-temp-order new-block)
             new-block))))))
 
 (defun cse-block-multi-optimization (counter block
