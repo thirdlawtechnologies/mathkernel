@@ -106,9 +106,9 @@
           (=. e_coul "qq*invr2*invdd")
           (=. e_base "e_lj + e_coul")
           ;; base radial derivatives
-          (=. dE_base_dr   "(-12.0*A*invr6*invr6*invr) + (6.0*B*invr6*invr) + (-2.0*qq*invr3/dd)"
+          (=. dE_base_dr   "(-12.0*A*invr6*invr6*invr) + (6.0*B*invr6*invr) + (-2.0*qq*invr3*invdd)"
               :modes (:gradient :hessian))
-          (=. d2E_base_dr2 "(156.0*A*invr6*invr6*invr2) + (-42.0*B*invr6*invr2) + (6.0*qq*invr2*invr2/dd)"
+          (=. d2E_base_dr2 "(156.0*A*invr6*invr6*invr2) + (-42.0*B*invr6*invr2) + (6.0*qq*invr2*invr2*invdd)"
               :modes (:hessian))
           (stmt-ir:make-if-stmt
            (expr-ir:parse-expr "r2 < r_switch2")
@@ -190,26 +190,27 @@
   )
 
 
-(test-nonbond-dd)
-
-
-
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-(warn "!!!!!!!!!!!!!!!! Not building any kernels !!!!!!!!!!!!!!!!!")
-
 #+(or)
+(progn
+  (warn "!!!!!!!!!!!!!!!! Not building any kernels !!!!!!!!!!!!!!!!!")
+  (test-nonbond-dd))
+
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
 (progn
 
 
 ;;; Run all the tests
-  (stmt-ir.tests:run-all)
+  #+(or)(stmt-ir.tests:run-all)
 
 
   (build-multiple-kernels (kernels "stretch" (:hessian :gradient :energy))
@@ -549,9 +550,9 @@
           (=. e_coul "qq*invr2*invdd")
           (=. e_base "e_lj + e_coul")
           ;; base radial derivatives
-          (=. dE_base_dr   "(-12.0*A*invr6*invr6*invr) + (6.0*B*invr6*invr) + (-2.0*qq*invr3/dd)"
+          (=. dE_base_dr   "(-12.0*A*invr6*invr6*invr) + (6.0*B*invr6*invr) + (-2.0*qq*invr3*invdd)"
               :modes (:gradient :hessian))
-          (=. d2E_base_dr2 "(156.0*A*invr6*invr6*invr2) + (-42.0*B*invr6*invr2) + (6.0*qq*invr2*invr2/dd)"
+          (=. d2E_base_dr2 "(156.0*A*invr6*invr6*invr2) + (-42.0*B*invr6*invr2) + (6.0*qq*invr2*invr2*invdd)"
               :modes (:hessian))
           (stmt-ir:make-if-stmt
            (expr-ir:parse-expr "r2 < r_switch2")

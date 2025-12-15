@@ -1784,7 +1784,7 @@ energy-only kernels where D! requests are unnecessary."
          (_ (stmt-ir:check-def-before-use-in-block transformed
                                                    :already-defined initial-defined))
          ;; ensure assignments are ordered so definitions precede uses
-         (ordered (stmt-ir:reorder-block-def-before-use transformed))
+         (ordered transformed) ;;;(stmt-ir:reorder-block-def-before-use transformed))
          (locals (infer-kernel-locals ordered params coord-vars)))
     (stmt-ir:make-c-function
      (kernel-name kernel)

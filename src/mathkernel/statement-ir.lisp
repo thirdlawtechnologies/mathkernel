@@ -120,8 +120,11 @@ Environments can be chained via PARENT; lookups walk the chain."))
     (let ((res (rec ancestor)))
       res)))
 
-(defun make-binding-env (block &key (table (make-hash-table :test #'eq)) parent)
+(defun make-binding-env (block &key (table (make-hash-table :test #'eq)) parent binding-params)
   "Construct a BINDING-ENV around TABLE (defaults to a fresh hash table), with optional PARENT and BLOCK."
+  (when binding-params
+    (dolist (sym binding-params)
+      (setf (gethash sym table) (make-instance 'outer-env-entry :index -1 :expr nil))))
   (make-instance 'binding-env :table table :parent parent :block block))
 
 (defun make-child-env (block parent)
@@ -277,6 +280,9 @@ Environments can be chained via PARENT; lookups walk the chain."))
 
 (defun make-assignment-stmt (target-name expression &optional target-indices)
   "Convenience constructor for a normal assignment-statement."
+  (when (and (typep expression 'variable-expression)
+             (eq target-name (expr-ir:variable-name expression)))
+    (error "Assigning ~s to itself ~s" expression target-name))
   (let* ((target-name (expr-ir:ev target-name))
          (class (if (anchored-target-name-p target-name)
                     'anchored-assignment-statement
@@ -391,7 +397,7 @@ Example:
    "A sequence of statements. Emitted as a C compound statement {...}."))
 
 (defun make-block-stmt (statements &key label)
-  (unless label
+  #+(or)(unless label
       (break "Missing label. Check where we are and propagate label"))
   (make-instance 'block-statement :statements statements :label label))
 
@@ -579,7 +585,7 @@ passed through EXPR-IR:SIMPLIFY-EXPR."
     (error "simplify-block: expected BLOCK-STATEMENT, got ~S" block))
   (let* ((stmts (block-statements block))
          (s-stmts (mapcar #'simplify-statement stmts)))
-    (make-block-stmt s-stmts)))
+    (make-block-stmt s-stmts :label (block-label block))))
 
 ;;; ------------------------------------------------------------
 ;;; Debugging assistance
@@ -696,8 +702,8 @@ SUFFIX can be T (auto-gensym), a symbol, string, or any printable object."
          (name (if suffix-str
                    (format nil "CSE_P~D_T~D_~A" pass-id index suffix-str)
                    (format nil "CSE_P~D_T~D" pass-id index))))
-    (when (string= "CSE_P2_T1_G319" name)
-      (break "Caught problem symbol"))
+    #+(or)(when (string= "CSE_P1_T61_G285" name)
+      (break "Caught problem symbol ~s" name))
     (intern name :expr-var)))
 
 (defun factorable-atom-p (factor)
@@ -1650,7 +1656,8 @@ Returns (values new-factors matched-p)."
                          (stmt-target-indices stmt)))
                        (block-statement
                         (make-block-stmt
-                         (mapcar #'rewrite-stmt (block-statements stmt))))
+                         (mapcar #'rewrite-stmt (block-statements stmt))
+                         :label (block-label stmt)))
                        (if-statement
                        (let* ((new-cond (rewrite-expr (if-condition stmt)))
                               (then-b  (if-then-block stmt))
@@ -1658,11 +1665,13 @@ Returns (values new-factors matched-p)."
                               (new-then (when then-b
                                           (make-block-stmt
                                            (mapcar #'rewrite-stmt
-                                                   (block-statements then-b)))))
+                                                   (block-statements then-b))
+                                           :label (block-label then-b))))
                               (new-else (when else-b
                                           (make-block-stmt
                                            (mapcar #'rewrite-stmt
-                                                   (block-statements else-b))))))
+                                                   (block-statements else-b))
+                                           :label (block-label else-b)))))
                          (make-if-stmt new-cond new-then new-else)))
                        (t stmt))))
             (let ((new-stmts '()))
@@ -1670,7 +1679,7 @@ Returns (values new-factors matched-p)."
                 (when (= idx insert-idx)
                   (push temp-assign new-stmts))
                 (push (rewrite-stmt (nth idx stmts)) new-stmts))
-              (let ((result (make-block-stmt (nreverse new-stmts))))
+              (let ((result (make-block-stmt (nreverse new-stmts) :label (block-label block))))
                 (verbose-log verbose "~&[FTPP pass ~D] factored combo ~S into temp ~S~%"
                              pass-id best-combo temp-name)
                 result)))))))))
@@ -1757,12 +1766,8 @@ equal to the target) are ignored."
                    (idx (stmt-target-indices cycle))
                    (trivial-alias (and (symbolp rhs)
                                        (eq rhs target))))
-              (if trivial-alias
-                  (progn
-                    (break "Found a trivial-alias")
-                    0)
                   (+ (comp-expr rhs)
-                     (reduce #'+ (mapcar #'comp-expr idx) :initial-value 0)))))
+                     (reduce #'+ (mapcar #'comp-expr idx) :initial-value 0))))
            (block-statement
             (reduce #'+ (mapcar #'comp-stmt (block-statements cycle)) :initial-value 0))
            (if-statement
@@ -2176,7 +2181,8 @@ to the variable T.
 
                (t
                 (push st new-stmts))))
-           (values (make-block-stmt (nreverse new-stmts)) env))))
+           (values (make-block-stmt (nreverse new-stmts)
+                                    :label (block-label blk)) env))))
     (multiple-value-bind (new-block env-out)
         (process-block block (make-hash-table :test #'equal))
       (declare (ignore env-out))

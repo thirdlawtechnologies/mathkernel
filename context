@@ -1,0 +1,43 @@
+• We’re on branch throwaway/walker-grad-hess with several refactors:
+
+- Walker-based gradient/Hessian injection integrated into make-kernel-from-block (inject-*-after-energy now return proper blocks).
+- CSE factorization (cse-factor-products-in-block) now uses a class-based walker context/accumulator and is refactored into helpers:
+- collect-products-in-block (walker collection),
+- choose-best-factor (candidate scoring),
+- rewrite-with-factor is currently broken - it needs to be updated to use new binder-env blocks and the walker (temp insertion/rewrite),
+- main loop re-collects after each rewrite.
+- Helper classes added: cse-factor-accumulator, cse-factor-context.
+
+
+- Walker scaffold added: src/mathkernel/walker.lisp defines a generic block walker.
+- Base class: walk-context (empty; extend as needed).
+- Generics (args: operation, context):
+- clone-context: clone per branch. Default returns ctx.
+- on-statement: per-stmt hook; returns (values new-stmt new-ctx). Default passes through.
+- rewrite-block: block-level hook; returns (values new-statements new-ctx). Default folds on-statement, threading ctx; accepts
+list or single statement returns, drops on nil.
+- walk-block-with-context (operation ctx block): pre-order call to rewrite-block, then descends into child blocks/ifs; contexts are
+cloned per branch via clone-context; no merging. Returns (new-block, final-ctx).
+- Exported in packages.lisp; mathkernel.asd includes walker. No existing code uses it yet.
+- Two-pass plan guidance:
+- With branching-only (no joins), use a shared accumulator in the context to make analysis reusable for rewrite.
+- In clone-context, deep-copy branch-local slots but keep the shared table pointer so branches write into the same accumulator.
+- Key accumulated data by block/statement/path. Pass 1 (:analyze) records data; Pass 2 (:rewrite) reads it to transform.
+- If you need post-order analysis, either specialize rewrite-block to recurse into children before aggregating, or run a separate
+traversal. Default walker is pre-order.
+- Optimization/debug context (from earlier work):
+- *verbose-optimization* exists and is used as default for verbose keyword args.
+- Complexity metric ignores trivial alias assignments; run-optimization was adjusted to rerun :cse-full with verbose=2 when Δ<0 and
+dump before/after.
+- Factor loops and copy-propagate after factoring were temporarily disabled with #+(or) for debugging; cse-factor-products can be
+iterated.
+- A copy-deriv-env helper was added (exported).
+- build-deriv-env-for-block-propagate now threads/clones derivative env through ifs (still hash-table; merges are simple).
+- Open themes:
+- Branch-only structure means no env joins; a walker with a shared accumulator suits future passes (grad/hessian insertion, CSE
+analysis).
+- Future passes should decide pre- vs post-order or two-pass depending on whether child info is needed.
+
+
+
+

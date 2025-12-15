@@ -100,17 +100,41 @@
    :temps-seen (cse-rw-temps-seen ctx)
    :changed (cse-rw-changed ctx)))
 
-(defun %rewrite-cse-sexpr (sexpr sexpr->temp counts-from-factors)
+(defun temp-available-p (ctx temp idx)
+  (binding-env-lookup (cse-rw-env ctx) temp)
+
+  #+(or)(or (binding-env-lookup (cse-rw-env ctx) temp)
+      (let* ((bucket (temp-inserts-lookup (cse-rw-temp-insert ctx)
+                                          (binding-env-block (cse-rw-env ctx)))))
+        (when bucket
+          (maphash
+           (lambda (ins-idx stmts)
+             (declare (optimize (debug 3)))
+             (break "Check in temp-available-p ins-idx ~d  idx ~d" ins-idx idx)
+             (when (and (< ins-idx idx)
+                        (let ((lst (if (listp stmts) stmts (list stmts))))
+                          (some (lambda (s) (eq (stmt-target-name s) temp)) lst)))
+               (return-from temp-available-p t)))
+           (%block-temp-inserts-table bucket))
+          nil))))
+
+(defun %rewrite-cse-sexpr (sexpr sexpr->temp counts-from-factors avail-fn)
+  (declare (optimize (debug 3)))
   (labels ((rec (sx)
              (cond
                ((and (consp sx) (gethash sx sexpr->temp))
-                (gethash sx sexpr->temp))
+                (let ((tt (gethash sx sexpr->temp)))
+                  (if (funcall avail-fn tt)
+                      tt
+                      sx)))
                ((and (consp sx) (eq (car sx) '*))
                 (let* ((orig (cdr sx))
                        (prod-counts (funcall counts-from-factors orig))
                        (replacement (gethash sx sexpr->temp)))
                   (if replacement
-                      replacement
+                      (if (funcall avail-fn replacement)
+                          replacement
+                          (cons '* (mapcar #'rec orig)))
                       (cons '* (mapcar #'rec orig)))))
                ((consp sx)
                 (cons (car sx) (mapcar #'rec (cdr sx))))
@@ -118,16 +142,28 @@
     (rec sexpr)))
 
 (defmethod on-statement ((operation (eql :cse-rewrite)) (ctx cse-rewrite-context) st)
+  (declare (optimize (debug 3)))
   (etypecase st
     (assignment-statement
      (let* ((env (cse-rw-env ctx))
             (idx (incf (cse-rw-idx ctx)))
             (tgt (stmt-target-name st))
-            (sexpr (expr-ir:expr->sexpr (stmt-expression st)))
-            (rewritten (expr-ir:sexpr->expr-ir
-                        (%rewrite-cse-sexpr sexpr (cse-rw-sexpr->temp ctx) (cse-rw-counts-from-factors ctx))))
+            (expr (stmt-expression st))
+            (sexpr (expr-ir:expr->sexpr expr))
+            (sexpr->temp (cse-rw-sexpr->temp ctx))
+            (counts-from-factors (cse-rw-counts-from-factors ctx))
+            (rewritten-sexpr (%rewrite-cse-sexpr sexpr
+                                                 sexpr->temp
+                                                 counts-from-factors
+                                                 (lambda (tt)
+                                                   (temp-available-p ctx tt (cse-rw-idx ctx)))))
+            (rewritten (expr-ir:sexpr->expr-ir rewritten-sexpr))
             (new-st (if (eq rewritten (stmt-expression st)) st (make-assignment-stmt tgt rewritten))))
+       (format t "    --> env: ~s~%" env)
        (binding-env-add env tgt (make-env-entry idx rewritten))
+       (format t "stmt: ~s~%" st)
+       (format t "  rewrite: ~s~%" new-st)
+       (format t "    <-- env: ~s~%" env)
        (when (not (eq new-st st)) (setf (car (cse-rw-changed ctx)) t))
        (values new-st ctx)))
     (raw-c-statement
@@ -144,29 +180,33 @@
      (values st ctx))))
 
 (defmethod rewrite-block ((operation (eql :cse-rewrite)) (ctx cse-rewrite-context) statements)
+  (declare (optimize (debug 3)))
   (let* ((out '())
          (idx -1)
          (bucket (temp-inserts-lookup (cse-rw-temp-insert ctx)
                                       (binding-env-block (cse-rw-env ctx)))))
-    (dolist (st statements)
-      (incf idx)
-      (let* ((temps (and bucket (block-temp-inserts-lookup bucket idx)))
+    (flet ((handle-stmt (stmt &key changed)
+             (multiple-value-bind (new-st new-ctx)
+                 (on-statement operation ctx stmt)
+               (setf ctx new-ctx)
+               (push new-st out)
+               (when changed (setf (car (cse-rw-changed ctx)) t)))))
+      ;; Handle statements
+      (dolist (st statements)
+        (incf idx)
+        (let* ((temps (and bucket (block-temp-inserts-lookup bucket idx)))
+               (temps (if (listp temps) temps (and temps (list temps)))))
+          (when temps
+            (dolist (tt (reverse temps))
+              (handle-stmt tt :changed t))))
+        (handle-stmt st :changed nil))
+      ;; append temps that need to go on the end
+      (let* ((temps (and bucket (block-temp-inserts-lookup bucket (length statements))))
              (temps (if (listp temps) temps (and temps (list temps)))))
         (when temps
           (dolist (tt (reverse temps))
-            (push tt out)
-            (setf (car (cse-rw-changed ctx)) tt))))
-      (multiple-value-bind (new-st new-ctx)
-          (on-statement operation ctx st)
-        (declare (ignore new-ctx))
-        (push new-st out)))
-    (let* ((temps (and bucket (block-temp-inserts-lookup bucket (length statements))))
-           (temps (if (listp temps) temps (and temps (list temps)))))
-      (when temps
-        (dolist (tt (reverse temps))
-          (push tt out)
-          (setf (car (cse-rw-changed ctx)) tt))))
-    (values (nreverse out) ctx)))
+            (handle-stmt tt :changed t))))
+      (values (nreverse out) ctx))))
 
 
 (defun debug-cse-temp-trace (block &key (label "cse"))
@@ -236,16 +276,12 @@ then rewrite with temps using a walker."
     (error "cse-block: expected BLOCK-STATEMENT, got ~S" block))
   (let ((outer-symbols (or outer-symbols binding-params)))
     (labels ((collect (blk)
-               (let* ((env (make-binding-env blk))
+               (let* ((env (make-binding-env blk :binding-params outer-symbols))
                       (counts (make-hash-table :test #'equal))
                       (first-use (make-hash-table :test #'equal))
                       (first-use-env (make-hash-table :test #'equal))
                       (uses-envs (make-hash-table :test #'equal))
                       (ctx (make-cse-collect-context :env env :idx -1 :counts counts :first-use first-use :first-use-env first-use-env :uses-envs uses-envs :outer-symbols outer-symbols)))
-                 (dolist (sym outer-symbols)
-                   (unless (binding-env-lookup env sym)
-                     (binding-env-add env sym
-                                      (make-instance 'outer-env-entry :index -1 :expr nil))))
                  (walk-block-with-context :cse-collect ctx blk)
                  (values env counts first-use first-use-env uses-envs)))
              (choose-candidates (counts first-use first-use-env uses-envs)
@@ -314,8 +350,6 @@ then rewrite with temps using a walker."
                        (block-temp-insert-add temp-inserts bucket min-insert
                                               (cons (make-assignment-stmt temp (expr-ir:sexpr->expr-ir sx))
                                                     existing))
-                       (when (eq temp 'expr-var::cse_p2_t1_g319)
-                         (break "Check temp-inserts"))
                        (setf (gethash sx sexpr->temp) temp))))
                  (values sexpr->temp temp-inserts)))
              (rewrite (blk env sexpr->temp temp-inserts)
@@ -334,6 +368,7 @@ then rewrite with temps using a walker."
                               :cand-counts nil
                               :temps-seen (make-hash-table :test #'eq)
                               :changed (list nil))))
+                   (break "Check ctx env")
                    (multiple-value-bind (new-block ctx-out)
                        (walk-block-with-context :cse-rewrite ctx blk)
                      (declare (ignore ctx-out))
@@ -347,7 +382,8 @@ then rewrite with temps using a walker."
           (multiple-value-bind (sexpr->temp temp-inserts)
               (plan-temps candidates counts first-use* first-use-env* uses-envs* env)
             (multiple-value-bind (new-block changed)
-                (rewrite block env sexpr->temp temp-inserts)
+                (let ((new-env (make-binding-env block :binding-params binding-params)))
+                  (rewrite block new-env sexpr->temp temp-inserts))
               (declare (ignore changed))
               (check-block-integrity new-block)
               new-block)))))))
@@ -444,7 +480,6 @@ a pass makes no changes."
         (setf current-block next-block)))
     current-block))
 
-#+(or)
 (defun cse-block-multi (block binding-params &key (max-passes 5) (min-uses 2) (min-size 5)
                               (outer-symbols nil)
                               (verbose *verbose-optimization*))

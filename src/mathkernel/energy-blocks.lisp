@@ -70,7 +70,7 @@ EXPR-IR:SIMPLIFY-EXPR before being wrapped in an assignment."
     ;; Energy assignment, if requested
     (when energy-target
       (let ((e-expr (%maybe-simplify energy-expr simplify)))
-        (push (make-assignment-stmt (expr-ir:ev energy-target) e-expr nil nil) stmts)))
+        (push (make-assignment-stmt (expr-ir:ev energy-target) e-expr nil) stmts)))
     ;; Gradient components
     (dolist (v coord-vars)
       (let* ((dexpr (expr-ir:differentiate-expr energy-expr v))
@@ -133,7 +133,7 @@ EXPR-IR:SIMPLIFY-EXPR before being wrapped in assignments."
     ;; Energy assignment
     (when energy-target
       (let ((e-expr (%maybe-simplify energy-expr simplify)))
-        (push (make-assignment-stmt (expr-ir:ev energy-target) e-expr nil nil) stmts)))
+        (push (make-assignment-stmt (expr-ir:ev energy-target) e-expr nil) stmts)))
     ;; Gradient assignments, cache exprs
     (dolist (v coord-vars)
       (let* ((dexpr (expr-ir:differentiate-expr energy-expr v))

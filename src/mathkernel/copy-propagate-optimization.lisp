@@ -64,14 +64,10 @@
        (cond
          ((and (symbolp sx) (not (eq sx tgt)))
           (let ((root (cp-find-root sx env)))
-            (if (cp-inside-if ctx)
-                (progn
-                  (remhash tgt env)
-                  (values (make-assignment-stmt tgt new-expr (stmt-target-indices st))
-                          ctx))
-                (progn
-                  (setf (gethash tgt env) root)
-                  (values nil ctx)))))
+            (progn
+              (setf (gethash tgt env) root)
+              (values nil ctx))
+            ))
          (t
           (remhash tgt env)
          (let ((new-st (if (eq new-expr (stmt-expression st))
