@@ -379,8 +379,8 @@
                               (cons use uses))))
                 (setf (gethash insert-block block->data)
                       (cons insert-env (list use))))))
-        ;; Consolidate dominated insert-blocks: if one block dominates another, merge uses into
-        ;; the dominator and drop the dominated entry so we don't schedule duplicate temps.
+        ;; Consolidate only ancestor/descendant duplicates; leave siblings separate so each branch
+        ;; gets its own temp definition.
         (let ((blocks (loop for b being the hash-keys of block->data collect b)))
           (dolist (b1 blocks)
             (dolist (b2 blocks)
@@ -475,7 +475,7 @@
             new-block
             block)))))
 
-(defun cse-factor-products-in-block (block &optional binding-params
+(defun cse-factor-products-in-block (block binding-params
                                       &key (min-uses 2) (min-factors 2) (min-size 2) (pass-id 1)
                                       (cse-only nil) (defined-env (make-binding-env block))
                                       (outer-symbols nil)
