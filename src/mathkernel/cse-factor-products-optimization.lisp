@@ -232,7 +232,8 @@
                                                                    (factor-temp-available-p ctx tt (cse-fr-idx ctx)))))
                                  (nexpr (expr-ir:sexpr->expr-ir rewrite)))
                             nexpr)))
-            (new-st (if (eq new-expr expr) st (make-assignment-stmt tgt new-expr))))
+            (new-st (if (eq new-expr expr) st (make-assignment-stmt tgt new-expr :preserve-anchor-of st
+                                                                    :target-indices (stmt-target-indices st)))))
        (binding-env-add env tgt (make-env-entry idx new-expr))
        (when (not (eq new-st st))
          (setf (car (cse-fr-changed ctx)) t))
@@ -354,24 +355,6 @@
         (return-from %select-factor-candidate nil))
       (values best-cand best-uses best-cand-counts))))
 
-(defun %compute-temp-for-candidate (cand cand-sexpr products env-product->sym block pass-id)
-  (let* ((temp-expr (expr-ir:sexpr->expr-ir cand-sexpr))
-         (vars (expr-ir:expr-free-vars temp-expr))
-         (start-index (next-cse-temp-index-for-pass block pass-id))
-         (existing-temp (gethash cand-sexpr env-product->sym))
-         (temp (or (and existing-temp
-                        ;; Only reuse existing temp if it is visible from all uses.
-                        (every (lambda (use)
-                                 (multiple-value-bind (_ env-found)
-                                     (binding-env-lookup (product-descriptor-binding-env use)
-                                                         existing-temp)
-                                   (declare (ignore _))
-                                   env-found))
-                               products)
-                        existing-temp)
-                   (make-cse-temp-symbol pass-id (1+ start-index) :suffix t))))
-    (values temp temp-expr vars)))
-
 (defun %build-insert-map (uses vars block pass-id)
   (let ((block->data (make-hash-table :test #'eq)))
     (dolist (use uses)
@@ -472,19 +455,26 @@
 (defun plan-factor-temp (products env-product->sym def-env block
                          &key min-uses min-factors min-size pass-id cse-only verbose)
   "Choose a factor candidate and plan temp insertion. Returns
-(values temp temp-expr cand-counts temp-inserts) or NIL if no change."
+(values make-assign temp temp-expr cand-counts temp-inserts) or NIL if no change."
   (declare (optimize (debug 3)))
   (multiple-value-bind (best-cand best-uses best-cand-counts)
       (%select-factor-candidate products min-uses min-factors min-size cse-only verbose pass-id)
     (unless best-cand
       (return-from plan-factor-temp nil))
-    (let* ((cand-sexpr (cons '* best-cand)))
-      (multiple-value-bind (temp temp-expr vars)
-          (%compute-temp-for-candidate best-cand cand-sexpr products env-product->sym block pass-id)
-        (let* ((block->data (%build-insert-map best-uses vars block pass-id))
-               (temp-inserts (%emit-temp-inserts block->data temp temp-expr vars block)))
-          (setf (gethash cand-sexpr env-product->sym) temp)
-          (values temp temp-expr best-cand-counts temp-inserts))))))
+    (let* ((cand-sexpr (cons '* best-cand))
+           (temp-expr (expr-ir:sexpr->expr-ir cand-sexpr))
+           (vars (expr-ir:expr-free-vars temp-expr))
+           (start-index (next-cse-temp-index-for-pass block pass-id))
+           (existing-temp (gethash cand-sexpr env-product->sym)))
+      (if existing-temp
+          (progn
+            (setf (gethash cand-sexpr env-product->sym) existing-temp)
+            nil)
+          (let* ((temp (make-cse-temp-symbol pass-id (1+ start-index) :suffix t))
+                 (block->data (%build-insert-map best-uses vars block pass-id))
+                 (temp-inserts (%emit-temp-inserts block->data temp temp-expr vars block)))
+            (setf (gethash cand-sexpr env-product->sym) temp)
+            (values t temp temp-expr best-cand-counts temp-inserts))))))
 
 (defun rewrite-factor-block (block def-env temp temp-expr cand-counts temp-inserts)
   (declare (optimize (debug 3)))
@@ -578,7 +568,7 @@ infrastructure."
         (verbose-log verbose "~&[CSE-FACT pass ~D] not enough products (~D)~%"
                      pass-id (length products))
         (return-from cse-factor-products-in-block block))
-      (multiple-value-bind (temp temp-expr cand-counts temp-inserts)
+      (multiple-value-bind (make-assign temp temp-expr cand-counts temp-inserts)
           (plan-factor-temp products env-product->sym def-env block
                             :min-uses min-uses
                             :min-factors min-factors
@@ -586,7 +576,7 @@ infrastructure."
                             :pass-id pass-id
                             :cse-only cse-only
                             :verbose verbose)
-        (let ((new-block (if (null temp)
+        (let ((new-block (if (null make-assign)
                              block
                              (rewrite-factor-block block def-env temp temp-expr cand-counts temp-inserts))))
           (check-block-integrity new-block)

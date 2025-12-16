@@ -55,7 +55,7 @@
 (defparameter kernels nil)
 
 (defun test-nonbond-dd ()
-  (build-multiple-kernels (kernels "nonbond_dd_cutoff" (:gradient)) ;; :energy :hessian))
+  (build-multiple-kernels (kernels "nonbond_dd_cutoff" (:hessian)) ;; :gradient)) ;; :energy :hessian))
     (:pipeline *pipeline*)
 
     (:params ((double A)       ;; LJ A coefficient  (A / r^12)
@@ -113,7 +113,7 @@
           (stmt-ir:make-if-stmt
            (expr-ir:parse-expr "r2 < r_switch2")
            (stmt-block :!in-switch
-             (=. energy "e_base")
+             (=! energy "e_base")
              (=. dE_dr   "dE_base_dr" :modes (:gradient :hessian))
              (=. d2E_dr2 "d2E_base_dr2" :modes (:hessian)))
            (stmt-block :!in-skin
@@ -128,7 +128,7 @@
              (=. d2s_dt2 "(-60.0*t1 + 180.0*t2 - 120.0*t3)" :modes (:hessian))
              (=. ds_dr "ds_dt1*inv_range" :modes (:gradient :hessian))
              (=. d2s_dr2 "d2s_dt2*inv_range*inv_range" :modes (:hessian))
-             (=. energy "s*e_base")
+             (=! energy "s*e_base")
              (=. dE_dr   "(s*dE_base_dr) + (ds_dr*e_base)" :modes (:gradient :hessian))
              (=. d2E_dr2 "(s*d2E_base_dr2) + (2.0*ds_dr*dE_base_dr) + (d2s_dr2*e_base)" :modes (:hessian)))))))
 
@@ -190,7 +190,6 @@
   )
 
 
-#+(or)
 (progn
   (warn "!!!!!!!!!!!!!!!! Not building any kernels !!!!!!!!!!!!!!!!!")
   (test-nonbond-dd))
@@ -205,13 +204,12 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-
+#+(or)
 (progn
 
 
 ;;; Run all the tests
   #+(or)(stmt-ir.tests:run-all)
-
 
   (build-multiple-kernels (kernels "stretch" (:hessian :gradient :energy))
     (:pipeline *pipeline*)
@@ -246,7 +244,7 @@
        (=. r  "sqrt(r2)")
        (=. dr "r - r0")
        ;; E(r) = kb * (r - r0)^2
-       (=. energy "kb*dr*dr")))
+       (=! energy "kb*dr*dr")))
     )
 
 
@@ -302,7 +300,7 @@
        (=. dtheta    "theta - t0")
 
        ;; E(theta) = kt * (theta - t0)^2  (kt includes the 1/2 if desired)
-       (=. energy "kt*dtheta*dtheta")))
+       (=! energy "kt*dtheta*dtheta")))
     )
 
   (build-multiple-kernels (kernels "dihedral" (:energy :gradient :hessian))
@@ -383,7 +381,7 @@
        (=. cos_nphi  "cos(nphi)")
        (=. cos_angle "cos_nphi*cosPhase + sin_nphi*sinPhase") ;; cos(nphi - phase)
        (=. sin_angle "sin_nphi*cosPhase - cos_nphi*sinPhase") ;; sin(nphi - phase)
-       (=. energy "V*(1.0 + cos_angle)")))
+       (=! energy "V*(1.0 + cos_angle)")))
 
     (:derivatives
      (:mode :manual
@@ -445,7 +443,7 @@
        ;; E(r) = A/r^12 - B/r^6 + qq/r
        (=. e_lj   "A*invr6*invr6 - B*invr6")
        (=. e_coul "qq*invr")
-       (=. energy "e_lj + e_coul")))
+       (=! energy "e_lj + e_coul")))
 
     (:derivatives
      (:mode :manual
@@ -557,14 +555,14 @@
           (stmt-ir:make-if-stmt
            (expr-ir:parse-expr "r2 < r_switch2")
            (stmt-block :!switch
-             (=. energy "e_base")
+             (=! energy "e_base")
              (=. dE_dr   "dE_base_dr" :modes (:gradient :hessian))
              (=. d2E_dr2 "d2E_base_dr2" :modes (:hessian)))
            (stmt-block :!skin
              (=. drs "r - r_switch")
              (=. t1 "drs*inv_range")
              (=. t2 "t1*t1")
-             (=. t3 "t2*t")
+             (=. t3 "t2*t1")
              (=. t4 "t2*t2")
              (=. t5 "t3*t2")
              (=. s "1.0 - 10.0*t3 + 15.0*t4 - 6.0*t5")
@@ -572,7 +570,7 @@
              (=. d2s_dt2 "(-60.0*t1 + 180.0*t2 - 120.0*t3)" :modes (:hessian))
              (=. ds_dr "ds_dt*inv_range" :modes (:gradient :hessian))
              (=. d2s_dr2 "d2s_dt2*inv_range*inv_range" :modes (:hessian))
-             (=. energy "s*e_base")
+             (=! energy "s*e_base")
              (=. dE_dr   "(s*dE_base_dr) + (ds_dr*e_base)" :modes (:gradient :hessian))
              (=. d2E_dr2 "(s*d2E_base_dr2) + (2.0*ds_dr*dE_base_dr) + (d2s_dr2*e_base)" :modes (:hessian)))))))
 
@@ -735,7 +733,7 @@
        (=. Q "V/denom")
 
        ;; Energy: E = K * (CO + Q)^3
-       (=. ENERGY "K * (CO + Q)^3")
+       (=! ENERGY "K * (CO + Q)^3")
 
        ;; Accumulate E/G/H at this point
        )))
@@ -755,7 +753,7 @@
        (=. dy "y1 - ya")
        (=. dz "z1 - za")
        (=. r2 "dx*dx + dy*dy + dz*dz")
-       (=. energy "ka * r2")
+       (=! energy "ka * r2")
        ))
     (:params ((double ka)
               (double xa)
@@ -903,7 +901,7 @@
        (=. deltaPhiModFn "deltaPhi")
 
        ;; Harmonic restraint energy
-       (=. ENERGY "kdh*deltaPhiModFn*deltaPhiModFn")
+       (=! ENERGY "kdh*deltaPhiModFn*deltaPhiModFn")
 
        )))
 

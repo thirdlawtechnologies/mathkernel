@@ -231,7 +231,9 @@
   #:anchored-assignment-statement
   #:*verbose-optimization*
   #:block-label
-  #:cse-factor-products-in-block))
+  #:cse-factor-products-in-block
+  #:check-block-integrity
+  #:rewrite-block))
 
 (defpackage :stmt-ir.tests
   (:use :cl :expr-ir :stmt-ir)
@@ -264,7 +266,8 @@
    #:with-kernels
    #:build-kernel
    #:emit-c-tests
-   #:with-trace-output))
+   #:with-trace-output
+   #:=!))
 
 ;;;; Symbols go in this package
 (defpackage :mathkernel-user

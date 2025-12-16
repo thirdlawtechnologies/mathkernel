@@ -101,6 +101,7 @@
    :changed (cse-rw-changed ctx)))
 
 (defun temp-available-p (ctx temp idx)
+  (declare (ignorable idx))
   (binding-env-lookup (cse-rw-env ctx) temp)
 
   #+(or)(or (binding-env-lookup (cse-rw-env ctx) temp)
@@ -131,6 +132,7 @@
                 (let* ((orig (cdr sx))
                        (prod-counts (funcall counts-from-factors orig))
                        (replacement (gethash sx sexpr->temp)))
+                  (declare (ignore prod-counts))
                   (if replacement
                       (if (funcall avail-fn replacement)
                           replacement
@@ -158,12 +160,11 @@
                                                  (lambda (tt)
                                                    (temp-available-p ctx tt (cse-rw-idx ctx)))))
             (rewritten (expr-ir:sexpr->expr-ir rewritten-sexpr))
-            (new-st (if (eq rewritten (stmt-expression st)) st (make-assignment-stmt tgt rewritten))))
-       (format t "    --> env: ~s~%" env)
+            (new-st (if (eq rewritten (stmt-expression st)) st (make-assignment-stmt tgt rewritten
+                                                                                     :preserve-anchor-of st
+                                                                                     :target-indices (stmt-target-indices st))))
+            )
        (binding-env-add env tgt (make-env-entry idx rewritten))
-       (format t "stmt: ~s~%" st)
-       (format t "  rewrite: ~s~%" new-st)
-       (format t "    <-- env: ~s~%" env)
        (when (not (eq new-st st)) (setf (car (cse-rw-changed ctx)) t))
        (values new-st ctx)))
     (raw-c-statement
@@ -266,6 +267,113 @@ and where they are used. This is only for debugging."
 ;;; CSE optimizations (walker-based)
 ;;; ----------------------------------------------------------------------
 
+(defun %collect (blk outer-symbols)
+  (let* ((env (make-binding-env blk :binding-params outer-symbols))
+         (counts (make-hash-table :test #'equal))
+         (first-use (make-hash-table :test #'equal))
+         (first-use-env (make-hash-table :test #'equal))
+         (uses-envs (make-hash-table :test #'equal))
+         (ctx (make-cse-collect-context :env env :idx -1 :counts counts :first-use first-use :first-use-env first-use-env :uses-envs uses-envs :outer-symbols outer-symbols)))
+    (walk-block-with-context :cse-collect ctx blk)
+    (values env counts first-use first-use-env uses-envs)))
+
+
+(defun %choose-candidates (counts first-use first-use-env uses-envs &key min-uses min-size)
+  (let ((candidates '()))
+    (maphash
+     (lambda (sx count)
+       (when (and (>= count min-uses)
+                  (consp sx)
+                  (>= (sexpr-size sx) min-size))
+         (push sx candidates)))
+     counts)
+    (setf candidates (sort candidates #'string< :key (lambda (sx) (format nil "~S" sx))))
+    (values candidates first-use first-use-env uses-envs)))
+
+(defun %plan-temp (block pass-id candidates counts first-use first-use-env uses-envs env min-uses)
+  (declare (optimize (debug 3)))
+  (let ((sexpr->temp (make-hash-table :test #'equal))
+        (temp-inserts (make-temp-inserts))
+        (temp-counter (next-cse-temp-index-for-pass block pass-id))
+        (env-sexpr->sym (make-hash-table :test #'equal)))
+    (map-binding-env (lambda (sym entry _)
+                       (declare (ignore _))
+                       (when (env-entry-expr entry)
+                         (setf (gethash (expr-ir:expr->sexpr (env-entry-expr entry)) env-sexpr->sym) sym)))
+                     env)
+    (dolist (sx candidates)
+      (let* ((use-idx (gethash sx first-use))
+             (use-env (or (gethash sx first-use-env) env))
+             (use-envs-list (or (gethash sx uses-envs) (list use-env)))
+             (existing (gethash sx env-sexpr->sym)))
+        ;; Ignore sx that are already assigned to a var
+        (if existing
+            (progn
+              (setf (gethash sx sexpr->temp) existing))
+            (let* ((temp (make-cse-temp-symbol pass-id (incf temp-counter) :suffix t))
+                   (uses (expr-ir:expr-free-vars (expr-ir:sexpr->expr-ir sx)))
+                   (dep-envs (loop for u in uses
+                                   for (_entry env-found) = (multiple-value-list (binding-env-lookup use-env u))
+                                   if env-found
+                                     collect env-found
+                                   else
+                                     do (error "Could not find ~s in binding-env ~s or one of its ancestors"
+                                               u use-env)))
+                   (all-use-envs (or dep-envs (gethash sx uses-envs)))
+                   (insert-env (let ((deep-env (reduce #'binding-env-later all-use-envs :initial-value use-env)))
+                                 (loop for use in uses
+                                       for (_entry env-found) = (multiple-value-list (binding-env-lookup deep-env use))
+                                       unless env-found
+                                         do (error "For uses ~s  deep-env is ~s and does not dominate ~s" uses deep-env use))
+                                 deep-env))
+                   (insert-block (or (binding-env-block insert-env) block))
+                   (dep-max (if uses
+                                (loop with mx = -1
+                                      for u in uses
+                                      for (entry env-found) = (multiple-value-list (binding-env-lookup insert-env u))
+                                      for di = (and entry (env-entry-index entry))
+                                      when (and env-found (eq env-found insert-env) (integerp di)) do (setf mx (max mx di))
+                                        finally (return mx))
+                                -1))
+                   (min-insert (max (1+ dep-max) 0))
+                   (max-allowed (or (and (eq insert-env use-env) use-idx)
+                                    (length (block-statements insert-block))))
+                   (bucket (or (temp-inserts-lookup temp-inserts insert-block)
+                               (let ((b (make-block-temp-inserts)))
+                                 (temp-insert-add temp-inserts insert-block b)
+                                 b)))
+                   (existing (block-temp-inserts-lookup bucket min-insert)))
+              (declare (ignore use-envs-list))
+              (when (and (<= min-insert max-allowed) (>= (gethash sx counts) min-uses))
+                (block-temp-insert-add temp-inserts bucket min-insert
+                                       (cons (make-assignment-stmt temp (expr-ir:sexpr->expr-ir sx))
+                                             existing))
+                (setf (gethash sx sexpr->temp) temp))))))
+    (values sexpr->temp temp-inserts)))
+
+(defun %rewrite (blk env sexpr->temp temp-inserts)
+  (declare (optimize (debug 3)))
+  (let* ((rw-env (make-binding-env blk)))
+    (map-binding-env (lambda (sym entry _)
+                       (declare (ignore _))
+                       (when (typep entry 'outer-env-entry)
+                         (binding-env-add rw-env sym entry)))
+                     env)
+    (let* ((ctx (make-cse-rewrite-context
+                 :env rw-env :idx -1
+                 :sexpr->temp sexpr->temp
+                 :temp-insert temp-inserts
+                 :counts-from-factors #'counts-from-factors
+                 :cand-counts nil
+                 :temps-seen (make-hash-table :test #'eq)
+                 :changed (list nil))))
+      (multiple-value-bind (new-block ctx-out)
+          (walk-block-with-context :cse-rewrite ctx blk)
+        (declare (ignore ctx-out))
+        (check-block-integrity new-block)
+        (values new-block (car (cse-rw-changed ctx)))))))
+
+
 (defun cse-block (block binding-params &key (min-uses 2) (min-size 5) (pass-id 1)
                         (outer-symbols nil)
                         (verbose *verbose-optimization*))
@@ -275,115 +383,17 @@ then rewrite with temps using a walker."
   (unless (typep block 'block-statement)
     (error "cse-block: expected BLOCK-STATEMENT, got ~S" block))
   (let ((outer-symbols (or outer-symbols binding-params)))
-    (labels ((collect (blk)
-               (let* ((env (make-binding-env blk :binding-params outer-symbols))
-                      (counts (make-hash-table :test #'equal))
-                      (first-use (make-hash-table :test #'equal))
-                      (first-use-env (make-hash-table :test #'equal))
-                      (uses-envs (make-hash-table :test #'equal))
-                      (ctx (make-cse-collect-context :env env :idx -1 :counts counts :first-use first-use :first-use-env first-use-env :uses-envs uses-envs :outer-symbols outer-symbols)))
-                 (walk-block-with-context :cse-collect ctx blk)
-                 (values env counts first-use first-use-env uses-envs)))
-             (choose-candidates (counts first-use first-use-env uses-envs)
-               (declare (ignore first-use-env uses-envs))
-               (let ((candidates '()))
-                 (maphash
-                  (lambda (sx count)
-                    (when (and (>= count min-uses)
-                               (consp sx)
-                               (>= (sexpr-size sx) min-size))
-                      (push sx candidates)))
-                  counts)
-                 (setf candidates (sort candidates #'string< :key (lambda (sx) (format nil "~S" sx))))
-                 (values candidates first-use first-use-env uses-envs)))
-            (plan-temps (candidates counts first-use first-use-env uses-envs env)
-              (declare (optimize (debug 3)))
-              (let ((sexpr->temp (make-hash-table :test #'equal))
-                    (temp-inserts (make-temp-inserts))
-                    (temp-counter (next-cse-temp-index-for-pass block pass-id))
-                    (env-sexpr->sym (make-hash-table :test #'equal)))
-                 (map-binding-env (lambda (sym entry _)
-                                    (declare (ignore _))
-                                    (when (env-entry-expr entry)
-                                      (setf (gethash (expr-ir:expr->sexpr (env-entry-expr entry)) env-sexpr->sym) sym)))
-                                  env)
-                 (dolist (sx candidates)
-                   (let* ((use-idx (gethash sx first-use))
-                          (use-env (or (gethash sx first-use-env) env))
-                          (use-envs-list (or (gethash sx uses-envs) (list use-env)))
-                          (existing (gethash sx env-sexpr->sym))
-                          (temp (or existing (make-cse-temp-symbol pass-id (incf temp-counter) :suffix t)))
-                          (uses (expr-ir:expr-free-vars (expr-ir:sexpr->expr-ir sx)))
-                          (dep-envs (loop for u in uses
-                                          for (_entry env-found) = (multiple-value-list (binding-env-lookup use-env u))
-                                          if env-found
-                                            collect env-found
-                                          else
-                                            do (error "Could not find ~s in binding-env ~s or one of its ancestors"
-                                                      u use-env)))
-                          (all-use-envs (or dep-envs (gethash sx uses-envs)))
-                          (insert-env (let ((deep-env (reduce #'binding-env-later all-use-envs :initial-value use-env)))
-                                        (loop for use in uses
-                                              for (_entry env-found) = (multiple-value-list (binding-env-lookup deep-env use))
-                                              unless env-found
-                                                do (error "For uses ~s  deep-env is ~s and does not dominate ~s" uses deep-env use))
-                                        deep-env))
-                          (insert-block (or (binding-env-block insert-env) block))
-                          (dep-max (if uses
-                                       (loop with mx = -1
-                                             for u in uses
-                                             for (entry env-found) = (multiple-value-list (binding-env-lookup insert-env u))
-                                             for di = (and entry (env-entry-index entry))
-                                             when (and env-found (eq env-found insert-env) (integerp di)) do (setf mx (max mx di))
-                                             finally (return mx))
-                                       -1))
-                          (min-insert (max (1+ dep-max) 0))
-                          (max-allowed (or (and (eq insert-env use-env) use-idx)
-                                           (length (block-statements insert-block))))
-                          (bucket (or (temp-inserts-lookup temp-inserts insert-block)
-                                      (let ((b (make-block-temp-inserts)))
-                                        (temp-insert-add temp-inserts insert-block b)
-                                        b)))
-                          (existing (block-temp-inserts-lookup bucket min-insert)))
-                     (declare (ignore use-envs-list))
-                     (when (and (<= min-insert max-allowed) (>= (gethash sx counts) min-uses))
-                       (block-temp-insert-add temp-inserts bucket min-insert
-                                              (cons (make-assignment-stmt temp (expr-ir:sexpr->expr-ir sx))
-                                                    existing))
-                       (setf (gethash sx sexpr->temp) temp))))
-                 (values sexpr->temp temp-inserts)))
-             (rewrite (blk env sexpr->temp temp-inserts)
-               (declare (optimize (debug 3)))
-               (let* ((rw-env (make-binding-env blk)))
-                 (map-binding-env (lambda (sym entry _)
-                                    (declare (ignore _))
-                                    (when (typep entry 'outer-env-entry)
-                                      (binding-env-add rw-env sym entry)))
-                                  env)
-                 (let* ((ctx (make-cse-rewrite-context
-                              :env rw-env :idx -1
-                              :sexpr->temp sexpr->temp
-                              :temp-insert temp-inserts
-                              :counts-from-factors #'counts-from-factors
-                              :cand-counts nil
-                              :temps-seen (make-hash-table :test #'eq)
-                              :changed (list nil))))
-                   (break "Check ctx env")
-                   (multiple-value-bind (new-block ctx-out)
-                       (walk-block-with-context :cse-rewrite ctx blk)
-                     (declare (ignore ctx-out))
-                     (check-block-integrity new-block)
-                     (values new-block (car (cse-rw-changed ctx))))))))
-      (multiple-value-bind (env counts first-use first-use-env uses-envs) (collect block)
-        (multiple-value-bind (candidates first-use* first-use-env* uses-envs*) (choose-candidates counts first-use first-use-env uses-envs)
+    (labels ()
+      (multiple-value-bind (env counts first-use first-use-env uses-envs) (%collect block outer-symbols)
+        (multiple-value-bind (candidates first-use* first-use-env* uses-envs*) (%choose-candidates counts first-use first-use-env uses-envs :min-size min-size :min-uses min-uses)
           (when (null candidates)
             (verbose-log verbose "~&[CSE pass ~D] no candidates (min-uses=~D min-size=~D)~%" pass-id min-uses min-size)
             (return-from cse-block block))
           (multiple-value-bind (sexpr->temp temp-inserts)
-              (plan-temps candidates counts first-use* first-use-env* uses-envs* env)
+              (%plan-temp block pass-id candidates counts first-use* first-use-env* uses-envs* env min-uses)
             (multiple-value-bind (new-block changed)
                 (let ((new-env (make-binding-env block :binding-params binding-params)))
-                  (rewrite block new-env sexpr->temp temp-inserts))
+                  (%rewrite block new-env sexpr->temp temp-inserts))
               (declare (ignore changed))
               (check-block-integrity new-block)
               new-block)))))))
@@ -412,9 +422,12 @@ a pass makes no changes."
                           :pass-id  pass-id
                           :outer-symbols outer-symbols
                           :verbose verbose))
-            ;; Catch duplicate CSE temps before factoring
-            (ignore (check-block-integrity after-cse :label (format nil "after-cse-~D" pass-id)))
-             (after-prod 
+             ;; Catch duplicate CSE temps before factoring
+             (dummy (check-block-integrity after-cse :label (format nil "after-cse-~D" pass-id)))
+             (after-prod
+               #+(or)(progn
+                 (warn "Skipping cse-factor-products-in-block")
+                 after-cse)
                (let ((current after-cse))
                  (loop for iter from 1 to 10 do
                    (let ((next (cse-factor-products-in-block
@@ -434,6 +447,9 @@ a pass makes no changes."
                  (check-block-integrity current)
                  current))
              (next-block
+               #+(or)(progn
+                 (warn "Skipping second cse-factor-products-in-block")
+                 after-prod)
                (let ((current after-prod))
                  (loop for iter from 1 to 10 do
                    (let ((next
@@ -461,6 +477,7 @@ a pass makes no changes."
                  cp))
              (next-block after-copy)
              (after-symbol-list (collect-scalar-targets-in-block next-block)))
+        (declare (ignore dummy))
         (when *debug*
           (handler-case
               (check-block-integrity next-block

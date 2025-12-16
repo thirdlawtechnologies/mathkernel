@@ -590,7 +590,11 @@ mode."
     :reader hess-inject-ctx-hess-target-fn)
    (manual-deriv-spec
     :initarg :manual-deriv-spec
-    :reader hess-inject-ctx-manual-deriv-spec)))
+    :reader hess-inject-ctx-manual-deriv-spec)
+   (pending-hess
+    :initarg :pending-hess
+    :accessor hess-inject-ctx-pending
+    :initform '())))
 
 (defun make-grad-inject-context (&key coord-vars energy-var grad-target-fn)
   (make-instance 'grad-inject-context
@@ -624,7 +628,8 @@ mode."
                  :coord-vars (inject-ctx-coord-vars ctx)
                  :energy-var (inject-ctx-energy-var ctx)
                  :hess-target-fn (hess-inject-ctx-hess-target-fn ctx)
-                 :manual-deriv-spec (hess-inject-ctx-manual-deriv-spec ctx)))
+                 :manual-deriv-spec (hess-inject-ctx-manual-deriv-spec ctx)
+                 :pending-hess (copy-list (hess-inject-ctx-pending ctx))))
 
 (defmethod stmt-ir:on-statement ((op (eql :inject-gradients))
                                  (ctx grad-inject-context)
@@ -664,7 +669,10 @@ mode."
                                (inject-ctx-coord-vars ctx)
                                (hess-inject-ctx-hess-target-fn ctx)
                                (hess-inject-ctx-manual-deriv-spec ctx))))
-             (values (nconc (list st) hess-stmts) ctx))
+             ;; Defer insertion: enqueue Hessians to append at block end.
+             (setf (hess-inject-ctx-pending ctx)
+                   (nconc (hess-inject-ctx-pending ctx) hess-stmts))
+             (values st ctx))
            (values st ctx))))
     (t
      (values st ctx))))
@@ -834,6 +842,19 @@ Optional :MODES restricts when the statement is kept:
   :energy (default), :gradient, :hessian. Higher modes include lower ones."
   `(make-annotated-stmt
     :stmt (stmt-ir:make-assignment-stmt
+           ',(let ((vv (expr-ir:ev var)))
+               (when (eq vv 'expr-var::energy)
+                 (error "Use =! when assigning to ENERGY"))
+               vv)
+           (expr-ir:parse-expr ,expr-string))
+    :modes (normalize-modes ',modes)))
+
+(defmacro =! (var expr-string &key modes)
+  "Create an assignment statement VAR := parse(EXPR-STRING).
+Optional :MODES restricts when the statement is kept:
+  :energy (default), :gradient, :hessian. Higher modes include lower ones."
+  `(make-annotated-stmt
+    :stmt (stmt-ir:make-anchored-assignment-stmt
            ',(expr-ir:ev var)
            (expr-ir:parse-expr ,expr-string))
     :modes (normalize-modes ',modes)))
@@ -1300,6 +1321,19 @@ Otherwise, fall back to pure AD on ENERGY-VAR wrt each coordinate."
                        (push stmt grad-assignments))))))))))
     result
     ))
+
+
+;; Append any pending Hessian assignments at the end of the current block
+(defmethod stmt-ir:rewrite-block ((op (eql :inject-hessians))
+                                  (ctx hess-inject-context)
+                                  statements)
+  (multiple-value-bind (out cur)
+      (call-next-method)
+    (let ((pending (hess-inject-ctx-pending cur)))
+      (when pending
+        (setf out (nconc out pending))
+        (setf (hess-inject-ctx-pending cur) nil)))
+    (values out cur)))
 
 
 ;;; ---------------------------------------------
@@ -2033,7 +2067,6 @@ energy-only kernels where D! requests are unnecessary."
                    collect var)))
     (append res coord-vars)))
 
-
 (defun make-kernel-from-block
     (&key group name pipeline layout coord-vars coord-load-stmts base-block params
        compute-mode compute-energy compute-grad compute-hess derivatives
@@ -2084,6 +2117,7 @@ energy-only kernels where D! requests are unnecessary."
             (setf current-stmts (copy-list (stmt-ir:block-statements current-block))))
           (when pipeline
             (let ((grad-block (stmt-ir:make-block-stmt current-stmts :label current-label)))
+              (stmt-ir:check-block-integrity grad-block)
               (multiple-value-bind (grad-opt results total-before total-after)
                   (stmt-ir:run-optimization-pipeline
                    pass-counter pipeline grad-block binding-params
@@ -2096,14 +2130,16 @@ energy-only kernels where D! requests are unnecessary."
                 (setf current-block grad-opt))))
           (when compute-hess
             (let* ((local-hess-block (stmt-ir:make-block-stmt current-stmts :label current-label))
-                   (with-h (inject-hessians-after-energy
+                   f (with-h (inject-hessians-after-energy
                             local-hess-block coord-vars energy-var #'general-hess-name
                             manual-deriv-spec)))
+              (stmt-ir:check-block-integrity with-h)
               (setf current-stmts (copy-list (stmt-ir:block-statements with-h)))
               (setf current-label (stmt-ir:block-label with-h))
               (setf hess-block with-h)))
           (when pipeline
             (let ((local-hess-block (stmt-ir:make-block-stmt current-stmts :label current-label)))
+              (stmt-ir:check-block-integrity local-hess-block)
               (multiple-value-bind (hess-opt results total-before total-after)
                   (stmt-ir:run-optimization-pipeline
                    pass-counter pipeline local-hess-block binding-params

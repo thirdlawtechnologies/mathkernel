@@ -47,8 +47,12 @@
     ((null sym)
      (error "We cannot have a NIL variable name"))
     ((stringp sym)
+     (when (string-equal sym "t")
+       (warn "Don't use t as a variable - use t1 or something else"))
      (intern sym :expr-var))
     ((symbolp sym)
+     (when (string-equal (string sym) "t")
+       (warn "Don't use t as a variable - use t1 or something else"))
      (if (eq (symbol-package sym) (find-package :expr-var))
          sym
          (intern (symbol-name sym) :expr-var)))

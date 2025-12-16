@@ -66,32 +66,39 @@
           (let ((root (cp-find-root sx env)))
             (progn
               (setf (gethash tgt env) root)
-              (values nil ctx))
-            ))
-         (t
-          (remhash tgt env)
-         (let ((new-st (if (eq new-expr (stmt-expression st))
-                           st
-                           (make-assignment-stmt tgt new-expr (stmt-target-indices st)))))
-            (values new-st ctx))))))
-    (raw-c-statement
-     (let* ((idx (incf (cp-idx ctx)))
-            (expr (stmt-expression st)))
-       (declare (ignore idx))
-       (if expr
-           (values (make-raw-c-statement (raw-c-generator st)
-                                         (cp-rewrite-expr expr (cp-env ctx)))
-                   ctx)
-           (values st ctx))))
-    (if-statement
-     (incf (cp-idx ctx))
-     (values st ctx))
-    (block-statement
-     (incf (cp-idx ctx))
-     (values st ctx))
-    (t
-     (incf (cp-idx ctx))
-     (values st ctx))))
+              (if (or
+                   (eq tgt 'expr-var::energy)
+                   (eq tgt 'expr-var::de_dr)
+                   (eq tgt 'expr-var::d2e_dr2))
+                  (progn
+                    (warn "Was about to drop ~s but we special cased it" tgt)
+                    (values st ctx))
+                  (values nil ctx))
+              )))
+          (t
+           (remhash tgt env)
+           (let ((new-st (if (eq new-expr (stmt-expression st))
+                             st
+                             (make-assignment-stmt tgt new-expr :target-indices (stmt-target-indices st)))))
+             (values new-st ctx))))))
+     (raw-c-statement
+      (let* ((idx (incf (cp-idx ctx)))
+             (expr (stmt-expression st)))
+        (declare (ignore idx))
+        (if expr
+            (values (make-raw-c-statement (raw-c-generator st)
+                                          (cp-rewrite-expr expr (cp-env ctx)))
+                    ctx)
+            (values st ctx))))
+     (if-statement
+      (incf (cp-idx ctx))
+      (values st ctx))
+     (block-statement
+      (incf (cp-idx ctx))
+      (values st ctx))
+     (t
+      (incf (cp-idx ctx))
+      (values st ctx))))
 
 (defmethod rewrite-block ((op (eql :copy-prop)) (ctx cp-context) statements)
   (let ((out '())
