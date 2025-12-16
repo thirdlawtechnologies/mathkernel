@@ -257,18 +257,10 @@ Environments can be chained via PARENT; lookups walk the chain."))
     :initarg :target-name
     :accessor stmt-target-name
     :documentation
-    "Base C identifier for the assignment target (symbol or string).")
-   (target-indices
-    :initarg :target-indices
-    :initform nil
-    :accessor stmt-target-indices
-    :documentation
-    "List of index expressions (expression IR nodes) for array subscripts.
-     NIL means scalar variable (no indices)."))
+    "Base C identifier for the assignment target (symbol or string)."))
   (:documentation
    "Assignment: target = expression;
-    The actual C LHS rendering is defined in the code generator using
-    TARGET-NAME and TARGET-INDICES."))
+    The actual C LHS rendering is defined in the code generator using TARGET-NAME."))
 
 (defun anchored-target-name-p (target-name)
   "Return T if TARGET-NAME is a gradient/Hessian variable (G_/H_*)."
@@ -278,7 +270,7 @@ Environments can be chained via PARENT; lookups walk the chain."))
          (or (string= target-str "H_" :end1 2)
              (string= target-str "G_" :end1 2)))))
 
-(defun make-assignment-stmt (target-name expression &key target-indices preserve-anchor-of)
+(defun make-assignment-stmt (target-name expression &key preserve-anchor-of)
   "Convenience constructor for a normal assignment-statement."
   (when (and (typep expression 'variable-expression)
              (eq target-name (expr-ir:variable-name expression)))
@@ -290,19 +282,17 @@ Environments can be chained via PARENT; lookups walk the chain."))
                     'assignment-statement)))
     (make-instance class
                    :target-name target-name
-                   :target-indices target-indices
                    :expression expression)))
 
 (defclass anchored-assignment-statement (assignment-statement)
   ()
   (:documentation "Assignment whose target name must not be altered/aliased."))
 
-(defun make-anchored-assignment-stmt (target-name expression &optional target-indices)
+(defun make-anchored-assignment-stmt (target-name expression)
   "Constructor for an anchored-assignment-statement (target must not be aliased)."
   (let ((target-name (expr-ir:ev target-name)))
     (make-instance 'anchored-assignment-statement
                    :target-name target-name
-                   :target-indices target-indices
                    :expression expression)))
 
 (defmethod print-object ((obj assignment-statement) stream)
@@ -412,16 +402,18 @@ Example:
       (t (format nil "~a" first-statement)))))
 
 (defmethod print-object ((statement block-statement) stream)
-  (if t
-      (let ((*print-pretty* nil)
-            (*package* (find-package :expr-var)))
-        (print-unreadable-object (statement stream :type t)
-          (handler-case
-              (debug-stmt statement stream 0)
-            (error (err)
-              (format stream "bad stmt")))))
-      (print-unreadable-object (statement stream :type t)
-        (format stream "~s" (block-label statement)))))
+  ;; long form for debugging
+  (let ((*print-pretty* nil)
+        (*package* (find-package :expr-var)))
+    (print-unreadable-object (statement stream :type t)
+      (handler-case
+          (debug-stmt statement stream 0)
+        (error (err)
+          (format stream "bad stmt")))))
+  ;; short form
+  #+(or)
+  (print-unreadable-object (statement stream :type t)
+    (format stream "~s" (block-label statement))))
 
 ;;; ----------------------------------------------------------------------
 ;;; If statements
@@ -536,19 +528,14 @@ passed through EXPR-IR:SIMPLIFY-EXPR."
     ;; Assignment: simplify RHS and indices
     (anchored-assignment-statement
      (let* ((name    (stmt-target-name stmt))
-            (indices (stmt-target-indices stmt))
             (rhs     (stmt-expression stmt))
-            (s-indices (mapcar #'expr-ir:simplify-expr indices))
             (s-rhs     (expr-ir:simplify-expr rhs)))
-       (make-anchored-assignment-stmt name s-rhs s-indices)))
+       (make-anchored-assignment-stmt name s-rhs)))
     (assignment-statement
      (let* ((name    (stmt-target-name stmt))
-            (indices (stmt-target-indices stmt))
             (rhs     (stmt-expression stmt))
-            (s-indices (mapcar #'expr-ir:simplify-expr indices))
             (s-rhs     (expr-ir:simplify-expr rhs)))
-       (make-assignment-stmt name s-rhs :target-indices s-indices)))
-
+       (make-assignment-stmt name s-rhs)))
     ;; Raw C: leave as-is
     (raw-c-statement
      stmt)
@@ -667,14 +654,10 @@ to *TRACE-OUTPUT* so it plays nicely with your existing tracing."
 
       (assignment-statement
        (let ((target  (stmt-target-name stmt))
-             (indices (stmt-target-indices stmt))
              (expr    (stmt-expression stmt)))
          (indent!)
-         (if indices
              (let ((*package* (find-package :expr-var)))
-               (format stream "~A~S := ~s~%" target indices (expr-ir:expr->sexpr expr)))
-             (let ((*package* (find-package :expr-var)))
-               (format stream "~A := ~s~%" target (expr-ir:expr->sexpr expr))))))
+               (format stream "~A := ~s~%" target (expr-ir:expr->sexpr expr)))))
 
       ;; Fallback: print any other statement with READ-able syntax.
       (t
@@ -1312,12 +1295,12 @@ EXPR-IR:FACTOR-SUM-OF-PRODUCTS applied."
               (make-anchored-assignment-stmt
                (stmt-target-name cycle)
                (rewrite-expr (stmt-expression cycle))
-               (stmt-target-indices cycle)))
+               ))
              (assignment-statement
               (make-assignment-stmt
                (stmt-target-name cycle)
                (rewrite-expr (stmt-expression cycle))
-               :target-indices (stmt-target-indices cycle)))
+               ))
              (raw-c-statement
               (let ((expr (stmt-expression cycle)))
                 (if expr
@@ -1649,12 +1632,12 @@ Returns (values new-factors matched-p)."
                         (make-anchored-assignment-stmt
                          (stmt-target-name stmt)
                          (rewrite-expr (stmt-expression stmt))
-                         (stmt-target-indices stmt)))
+                         ))
                        (assignment-statement
                         (make-assignment-stmt
                          (stmt-target-name stmt)
                          (rewrite-expr (stmt-expression stmt))
-                         :target-indices (stmt-target-indices stmt)))
+                         ))
                        (block-statement
                         (make-block-stmt
                          (mapcar #'rewrite-stmt (block-statements stmt))
@@ -1699,12 +1682,12 @@ has had EXPR-IR:NORMALIZE-SIGNS-EXPR applied."
                 (make-anchored-assignment-stmt
                  (stmt-target-name cycle)
                  (rewrite-expr (stmt-expression cycle))
-                 (stmt-target-indices cycle)))
+                 ))
                (assignment-statement
                 (make-assignment-stmt
                  (stmt-target-name cycle)
                  (rewrite-expr (stmt-expression cycle))
-                 :target-indices (stmt-target-indices cycle)))
+                 ))
                (raw-c-statement
                 (let ((expr (stmt-expression cycle)))
                   (if expr
@@ -1754,8 +1737,7 @@ has had EXPR-IR:NORMALIZE-SIGNS-EXPR applied."
 
 (defun block-complexity (block)
   "Complexity measure for a BLOCK-STATEMENT: sum of expression complexities
-in RHSs, indices, and conditions. Trivial alias assignments (RHS is a symbol
-equal to the target) are ignored."
+in RHSs, indices, and conditions. Trivial alias assignments (RHS is a symbol) are ignored."
   (labels
       ((comp-expr (expr)
          (expr-complexity expr))
@@ -1763,12 +1745,12 @@ equal to the target) are ignored."
          (etypecase cycle
            (assignment-statement
             (let* ((rhs (stmt-expression cycle))
-                   (target (stmt-target-name cycle))
-                   (idx (stmt-target-indices cycle))
-                   (trivial-alias (and (symbolp rhs)
-                                       (eq rhs target))))
-                  (+ (comp-expr rhs)
-                     (reduce #'+ (mapcar #'comp-expr idx) :initial-value 0))))
+                   (rhs-var (and (typep rhs 'expr-ir:variable-expression)
+                                 (expr-ir:variable-name rhs)))
+                   (trivial-alias (and rhs-var (symbolp rhs-var))))
+              (if trivial-alias
+                  0
+                  (comp-expr rhs))))
            (block-statement
             (reduce #'+ (mapcar #'comp-stmt (block-statements cycle)) :initial-value 0))
            (if-statement
@@ -1776,9 +1758,9 @@ equal to the target) are ignored."
                (if (if-then-block cycle)
                    (comp-stmt (if-then-block cycle))
                    0)
-           (if (if-else-block cycle)
-               (comp-stmt (if-else-block cycle))
-               0)))
+               (if (if-else-block cycle)
+                   (comp-stmt (if-else-block cycle))
+                   0)))
            (raw-c-statement
             (let ((expr (stmt-expression cycle)))
               (if expr
@@ -1814,12 +1796,12 @@ Only linear subexpressions are changed; non-linear ones are left as-is."
            (make-anchored-assignment-stmt
             (stmt-target-name st)
             (rewrite-expr (stmt-expression st))
-            (stmt-target-indices st)))
+            ))
           (assignment-statement
            (make-assignment-stmt
             (stmt-target-name st)
             (rewrite-expr (stmt-expression st))
-            :target-indices (stmt-target-indices st)))
+            ))
           (raw-c-statement
            (let ((expr (stmt-expression st)))
              (if expr
@@ -2131,7 +2113,7 @@ to the variable T.
                       (new-stmt  (make-anchored-assignment-stmt
                                   (stmt-target-name st)
                                   new-expr
-                                  (stmt-target-indices st))))
+                                  )))
                  ;; Keep the rewritten assignment
                  (push new-stmt new-stmts)
                  ;; Then possibly register a new alias based on its RHS
@@ -2143,7 +2125,7 @@ to the variable T.
                       (new-stmt  (make-assignment-stmt
                                   (stmt-target-name st)
                                   new-expr
-                                  :target-indices (stmt-target-indices st))))
+                                  )))
                  ;; Keep the rewritten assignment
                  (push new-stmt new-stmts)
                  ;; Then possibly register a new alias based on its RHS

@@ -189,7 +189,7 @@
   (format t "Wrote nonbond_dd_cutoff-gradient kernel ~s~%" (first kernels))
   )
 
-
+#+(or)
 (progn
   (warn "!!!!!!!!!!!!!!!! Not building any kernels !!!!!!!!!!!!!!!!!")
   (test-nonbond-dd))
@@ -204,7 +204,6 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-#+(or)
 (progn
 
 

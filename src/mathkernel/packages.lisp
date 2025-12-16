@@ -150,7 +150,6 @@
 
    ;; accessors
    #:stmt-target-name
-   #:stmt-target-indices
    #:stmt-expression
 
    #:raw-c-text

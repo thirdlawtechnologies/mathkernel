@@ -49,8 +49,7 @@
             (new-expr (cp-rewrite-expr (stmt-expression st) env))
             (new-st (if (eq new-expr (stmt-expression st))
                         st
-                        (make-anchored-assignment-stmt tgt new-expr
-                                                       (stmt-target-indices st)))))
+                        (make-anchored-assignment-stmt tgt new-expr))))
        (declare (ignore idx))
        (remhash tgt env)
        (values new-st ctx)))
@@ -79,7 +78,8 @@
            (remhash tgt env)
            (let ((new-st (if (eq new-expr (stmt-expression st))
                              st
-                             (make-assignment-stmt tgt new-expr :target-indices (stmt-target-indices st)))))
+                             (make-assignment-stmt tgt new-expr
+                                                   ))))
              (values new-st ctx))))))
      (raw-c-statement
       (let* ((idx (incf (cp-idx ctx)))

@@ -233,7 +233,7 @@
                                  (nexpr (expr-ir:sexpr->expr-ir rewrite)))
                             nexpr)))
             (new-st (if (eq new-expr expr) st (make-assignment-stmt tgt new-expr :preserve-anchor-of st
-                                                                    :target-indices (stmt-target-indices st)))))
+                                                                                 ))))
        (binding-env-add env tgt (make-env-entry idx new-expr))
        (when (not (eq new-st st))
          (setf (car (cse-fr-changed ctx)) t))

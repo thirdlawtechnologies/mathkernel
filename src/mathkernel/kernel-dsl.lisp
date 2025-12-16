@@ -843,8 +843,6 @@ Optional :MODES restricts when the statement is kept:
   `(make-annotated-stmt
     :stmt (stmt-ir:make-assignment-stmt
            ',(let ((vv (expr-ir:ev var)))
-               (when (eq vv 'expr-var::energy)
-                 (error "Use =! when assigning to ENERGY"))
                vv)
            (expr-ir:parse-expr ,expr-string))
     :modes (normalize-modes ',modes)))

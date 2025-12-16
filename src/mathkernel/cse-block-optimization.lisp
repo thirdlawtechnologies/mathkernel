@@ -162,7 +162,7 @@
             (rewritten (expr-ir:sexpr->expr-ir rewritten-sexpr))
             (new-st (if (eq rewritten (stmt-expression st)) st (make-assignment-stmt tgt rewritten
                                                                                      :preserve-anchor-of st
-                                                                                     :target-indices (stmt-target-indices st))))
+                                                                                     )))
             )
        (binding-env-add env tgt (make-env-entry idx rewritten))
        (when (not (eq new-st st)) (setf (car (cse-rw-changed ctx)) t))
