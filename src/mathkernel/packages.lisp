@@ -232,7 +232,13 @@
   #:block-label
   #:cse-factor-products-in-block
   #:check-block-integrity
-  #:rewrite-block))
+  #:rewrite-block
+  #:emit-block-cxx
+  #:block->cxx-string
+  #:write-c-code
+  #:c-function-template
+  #:c-function-coord-vars
+  #:c-function-return-expr))
 
 (defpackage :stmt-ir.tests
   (:use :cl :expr-ir :stmt-ir)
@@ -261,7 +267,7 @@
    #:numeric-force-and-hessian!
    #:define-multiple-kernels
    #:push-kernel
-   #:build-multiple-kernels
+   #:build-kernel-group
    #:with-kernels
    #:build-kernel
    #:emit-c-tests

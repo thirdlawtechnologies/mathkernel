@@ -1135,7 +1135,7 @@ calling KernelGradientAcc(i_base, offset, g_x1); otherwise return NIL."
 
 (defun make-hess-macro-call-from-target (target-sym layout)
   "If TARGET-SYM is a Hessian scalar like H_X1_X2, return a RAW-C-STATEMENT
-  calling KernelDiagHessAcc/KernelOffDiagHessAcc with that variable as v.
+  calling KernelHessDiagAcc/KernelHessOffDiagAcc with that variable as v.
   Otherwise return NIL."
   (multiple-value-bind (c1 c2)
       (hess-target-name->coords target-sym)
@@ -1143,18 +1143,17 @@ calling KernelGradientAcc(i_base, offset, g_x1); otherwise return NIL."
       (multiple-value-bind (ibase1 off1) (coord-name->ibase+offset c1 layout)
         (multiple-value-bind (ibase2 off2) (coord-name->ibase+offset c2 layout)
           (let* ((macro (if (string= c1 c2)
-                            "KernelDiagHessAcc"
-                            "KernelOffDiagHessAcc"))
+                            "KernelHessDiagAcc( PositionSize, hessian, dvec, hdvec, "
+                            "KernelHessOffDiagAcc( PositionSize, hessian, dvec, hdvec, "))
                  (ibase1-str (string-downcase (symbol-name ibase1)))
                  (ibase2-str (string-downcase (symbol-name ibase2)))
                  ;; use the scalar name as the C variable
                  (v-name (string-downcase (symbol-name target-sym)))
-                 (code (format nil "~A(~A, ~D, ~A, ~D, ~A);"
+                 (code (format nil "~A ~A, ~D, ~A, ~D, ~A);"
                                macro
                                ibase1-str off1
                                ibase2-str off2
                                v-name)))
-            (warn "make-hess-macro-call-from-target")
             (stmt-ir:make-raw-c-statement code)))))))
 
 
@@ -1819,12 +1818,50 @@ energy-only kernels where D! requests are unnecessary."
          (ordered transformed) ;;;(stmt-ir:reorder-block-def-before-use transformed))
          (locals (infer-kernel-locals ordered params coord-vars)))
     (stmt-ir:make-c-function
-     (kernel-name kernel)
+     (string-downcase (kernel-compute-mode kernel))
      ordered
+     :template (kernel-template kernel)
+     :coord-vars (kernel-coord-vars kernel)
      :return-type (kernel-return-type kernel)
      :parameters  params
      :locals      locals
      :return-expr (kernel-return-expr kernel))))
+
+(defun write-c-code (kernel-group pathname)
+  "Emit C for KERNEL to STREAM using the walker-based generator."
+  (declare (optimize (debug 3)))
+  (with-open-file (stream pathname :direction :output :if-exists :supersede)
+    (flet ((p (fmt &rest args)
+             (apply 'format stream fmt args)))
+      (let* ((one-kernel (first (kernel-group-kernels kernel-group)))
+             (one-fun (compile-kernel-to-c-function one-kernel)))
+        (when (stmt-ir:c-function-template one-fun)
+          (p "~a~%" (stmt-ir:c-function-template one-fun)))
+        (p "struct ~a {~%" (string-capitalize (kernel-group-name kernel-group)))
+        (p "  static constexpr size_t PositionSize = ~d;~%" (length (kernel-coord-vars one-kernel)))
+        (loop for kernel in (kernel-group-kernels kernel-group)
+              do (let* ((fun (compile-kernel-to-c-function kernel)))
+                   ;; function header
+                   (p "void ~a(" (string-downcase (stmt-ir:c-function-name fun)))
+                   (loop for p in (stmt-ir:c-function-parameters fun)
+                         for tt = (first p)
+                        for var = (second p)
+                         for i from 0 do
+                           (when (> i 0) (p ", "))
+                           (p "~a ~a" (string tt) (string-downcase var)))
+                   (p ") {~%")
+                   ;; emit body with new generator
+                   (stmt-ir:emit-block-cxx (stmt-ir:c-function-body fun)
+                                           :params (stmt-ir:c-function-parameters fun) ;; don’t redeclare inputs
+                                           :outputs nil ;; outputs ;; don’t redeclare anchored outputs
+                                           :stream stream)
+                   (p "}~%")
+                   (let ((fd-src (fd-wrapper-c-source kernel)))
+                     (when fd-src
+                       (write-line fd-src stream)))))
+        (p "};~%")
+        ))))
+
 
 ;; ------------------------------------------------------------
 ;; Finite-difference wrappers (energy/gradient/hessian)
@@ -1834,7 +1871,7 @@ energy-only kernels where D! requests are unnecessary."
   (string-downcase (symbol-name (second param))))
 
 (defun %fd-param-type (param)
-  (string-downcase (princ-to-string (first param))))
+  (princ-to-string (first param)))
 
 (defun %fd-param-list-string (params)
   (format nil "~{~a ~a~^, ~}"
@@ -1874,14 +1911,12 @@ energy-only kernels where D! requests are unnecessary."
     (let* ((params (kernel-params kernel))
            (param-list (%fd-param-list-string params))
            (coord-specs (%fd-coord-specs kernel))
-           (ret-type   (or (kernel-return-type kernel) "void"))
-           (ret-type-str (if (stringp ret-type) ret-type (princ-to-string ret-type)))
            (return-expr (kernel-return-expr kernel))
-           (energy-name (format nil "~a_energy" (string-downcase (kernel-group kernel))))
+           (energy-name (format nil "energy"))
            (group-name (string-downcase (kernel-group kernel)))
-           (energy-fd-name (format nil "~a_energy_fd" group-name))
-           (grad-name  (format nil "~a_gradient_fd" group-name))
-           (hess-name  (format nil "~a_hessian_fd" group-name))
+           (energy-fd-name (format nil "energy_fd"))
+           (grad-name  (format nil "gradient_fd"))
+           (hess-name  (format nil "hessian_fd"))
            (call-args-base (%fd-call-args params
                                           :energy-accum "&e0"
                                           :force "0" :hessian "0" :dvec "0" :hdvec "0"))
@@ -1890,29 +1925,23 @@ energy-only kernels where D! requests are unnecessary."
                              (%fd-call-args params
                                             :energy-accum (format nil "&~a" var)
                                             :force "0" :hessian "0" :dvec "0" :hdvec "0")))
-           (hval-denom "(h*h)")
-           (ret-void? (string= (string-downcase ret-type-str) "void")))
+           (hval-denom "(h*h)"))
       (cond
         ;; Energy TU: emit only energy_fd
         ((and (not (kernel-compute-grad-p kernel))
               (not (kernel-compute-hess-p kernel)))
          (with-output-to-string (s)
            (let ((call-args (format nil "~{~a~^, ~}" (%fd-call-args params))))
-             (format s "~a ~a(~a)~%{~%" ret-type-str energy-fd-name param-list)
-             (cond
-               (return-expr
-                (format s "  ~a(~a);~%~a~%" energy-name call-args return-expr))
-               (ret-void?
-                (format s "  ~a(~a);~%" energy-name call-args))
-               (t
-                (format s "  return ~a(~a);~%" energy-name call-args)))
-             (format s "}~%"))))
-        ;; Gradient TU: emit only gradient_fd
+             (format s "void ~a(~a)~%{~%" energy-fd-name param-list)
+             (format s "  ~a(~a);~%" energy-name call-args))
+           (format s "}~%")))
+      ;; Gradient TU: emit only gradient_fd
         ((and (kernel-compute-grad-p kernel)
               (not (kernel-compute-hess-p kernel)))
          (with-output-to-string (s)
-           (format s "extern ~a ~a(~a);~%~%" ret-type-str energy-name param-list)
-           (format s "~a ~a(~a)~%{~%" ret-type-str grad-name param-list)
+          (format s "void ~a(~a)~%{~%" grad-name param-list)
+
+           (format s "  constexpr size_t PositionSize = ~d;~%" (length (kernel-coord-vars kernel)))
            (format s "  const double h = 1.0e-5;~%  const double inv2h = 1.0/(2.0*h);~%  double e0 = 0.0;~%  ~a(~a);~%  if (energy_accumulate) { *energy_accumulate += e0; }~%"
                    energy-name call-args-base-str)
            (dolist (cs coord-specs)
@@ -1927,18 +1956,13 @@ energy-only kernels where D! requests are unnecessary."
                        energy-name (format nil "~{~a~^, ~}" (funcall call-args-plus "e_minus"))
                        idx
                        ibase off)))
-           (cond
-             (return-expr
-              (format s "~a~%}~%" return-expr))
-             (ret-void?
-              (format s "}~%"))
-             (t
-              (format s "  return 0;~%}~%")))))
-        ;; Hessian TU: emit only hessian_fd
+           (format s "}~%")
+           ))
+      ;; Hessian TU: emit only hessian_fd
         ((kernel-compute-hess-p kernel)
          (with-output-to-string (s)
-           (format s "extern ~a ~a(~a);~%~%" ret-type-str energy-name param-list)
-           (format s "~a ~a(~a)~%{~%" ret-type-str hess-name param-list)
+           (format s "void ~a(~a)~%{~%" hess-name param-list)
+           (format s "  constexpr size_t PositionSize = ~d;~%" (length (kernel-coord-vars kernel)))
            (format s "  const double h = 1.0e-5;~%  const double inv2h = 1.0/(2.0*h);~%  const double invh2 = 1.0/(~a);~%  double e0 = 0.0;~%  ~a(~a);~%  if (energy_accumulate) { *energy_accumulate += e0; }~%"
                    hval-denom energy-name call-args-base-str)
            (dolist (cs coord-specs)
@@ -1958,7 +1982,7 @@ energy-only kernels where D! requests are unnecessary."
                     (ibase (getf cs :ibase))
                     (off   (getf cs :offset)))
                (format s
-                       "  {~%    double saved = position[~a];~%    double e_plus = 0.0;~%    double e_minus = 0.0;~%    position[~a] = saved + h;~%    ~a(~a);~%    position[~a] = saved - h;~%    ~a(~a);~%    position[~a] = saved;~%    double hval = (e_plus + e_minus - (2.0*e0)) * invh2;~%    KernelDiagHessAcc(~a, ~d, ~a, ~d, hval);~%  }~%"
+                       "  {~%    double saved = position[~a];~%    double e_plus = 0.0;~%    double e_minus = 0.0;~%    position[~a] = saved + h;~%    ~a(~a);~%    position[~a] = saved - h;~%    ~a(~a);~%    position[~a] = saved;~%    double hval = (e_plus + e_minus - (2.0*e0)) * invh2;~%    KernelHessDiagAcc( PositionSize, hessian, dvec, hdvec, ~a, ~d, ~a, ~d, hval);~%  }~%"
                        idx idx
                        energy-name (format nil "~{~a~^, ~}" (funcall call-args-plus "e_plus"))
                        idx
@@ -1966,42 +1990,26 @@ energy-only kernels where D! requests are unnecessary."
                        idx
                        ibase off ibase off)))
            (loop for i from 0 below (length coord-specs) do
-                 (loop for j from 0 below i do
-                       (let* ((csi (nth i coord-specs))
-                              (csj (nth j coord-specs))
-                              (idx-i (format nil "~a + ~d" (getf csi :ibase) (getf csi :offset)))
-                              (idx-j (format nil "~a + ~d" (getf csj :ibase) (getf csj :offset)))
-                              (ibase-i (getf csi :ibase))
-                              (off-i   (getf csi :offset))
-                              (ibase-j (getf csj :ibase))
-                              (off-j   (getf csj :offset)))
-                         (format s
-                                 "  {~%    double saved_i = position[~a];~%    double saved_j = position[~a];~%    double e_pp = 0.0;~%    double e_pm = 0.0;~%    double e_mp = 0.0;~%    double e_mm = 0.0;~%    position[~a] = saved_i + h; position[~a] = saved_j + h;~%    ~a(~a);~%    position[~a] = saved_j - h;~%    ~a(~a);~%    position[~a] = saved_i - h; position[~a] = saved_j + h;~%    ~a(~a);~%    position[~a] = saved_j - h;~%    ~a(~a);~%    position[~a] = saved_i; position[~a] = saved_j;~%    double hval = (e_pp - e_pm - e_mp + e_mm) * (0.25*invh2);~%    KernelOffDiagHessAcc(~a, ~d, ~a, ~d, hval);~%  }~%"
-                                 idx-i idx-j
-                                 idx-i idx-j energy-name (format nil "~{~a~^, ~}" (funcall call-args-plus "e_pp"))
-                                 idx-j energy-name (format nil "~{~a~^, ~}" (funcall call-args-plus "e_pm"))
-                                 idx-i idx-j energy-name (format nil "~{~a~^, ~}" (funcall call-args-plus "e_mp"))
-                                 idx-j energy-name (format nil "~{~a~^, ~}" (funcall call-args-plus "e_mm"))
-                                 idx-i idx-j
-                                 ibase-i off-i ibase-j off-j))))
-           (cond
-             (return-expr
-              (format s "~a~%}~%" return-expr))
-             (ret-void?
-              (format s "}~%"))
-             (t
-              (format s "  return 0;~%}~%")))))))))
-
-(defun write-c-code (kernel pathname)
-  (ensure-directories-exist pathname)
-  (with-open-file (fout pathname :direction :output :if-exists :supersede)
-    (let* ((fun (compile-kernel-to-c-function kernel))
-           (core-src (stmt-ir:c-function->c-source-string fun))
-           (fd-src  (fd-wrapper-c-source kernel)))
-      (write-line core-src fout)
-      (when fd-src
-        (write-line fd-src fout)))))
-
+             (loop for j from 0 below i do
+               (let* ((csi (nth i coord-specs))
+                      (csj (nth j coord-specs))
+                      (idx-i (format nil "~a + ~d" (getf csi :ibase) (getf csi :offset)))
+                      (idx-j (format nil "~a + ~d" (getf csj :ibase) (getf csj :offset)))
+                      (ibase-i (getf csi :ibase))
+                      (off-i   (getf csi :offset))
+                      (ibase-j (getf csj :ibase))
+                      (off-j   (getf csj :offset)))
+                 (format s
+                         "  {~%    double saved_i = position[~a];~%    double saved_j = position[~a];~%    double e_pp = 0.0;~%    double e_pm = 0.0;~%    double e_mp = 0.0;~%    double e_mm = 0.0;~%    position[~a] = saved_i + h; position[~a] = saved_j + h;~%    ~a(~a);~%    position[~a] = saved_j - h;~%    ~a(~a);~%    position[~a] = saved_i - h; position[~a] = saved_j + h;~%    ~a(~a);~%    position[~a] = saved_j - h;~%    ~a(~a);~%    position[~a] = saved_i; position[~a] = saved_j;~%    double hval = (e_pp - e_pm - e_mp + e_mm) * (0.25*invh2);~%    KernelHessOffDiagAcc( PositionSize, hessian, dvec, hdvec, ~a, ~d, ~a, ~d, hval);~%  }~%"
+                         idx-i idx-j
+                         idx-i idx-j energy-name (format nil "~{~a~^, ~}" (funcall call-args-plus "e_pp"))
+                         idx-j energy-name (format nil "~{~a~^, ~}" (funcall call-args-plus "e_pm"))
+                         idx-i idx-j energy-name (format nil "~{~a~^, ~}" (funcall call-args-plus "e_mp"))
+                         idx-j energy-name (format nil "~{~a~^, ~}" (funcall call-args-plus "e_mm"))
+                         idx-i idx-j
+                         ibase-i off-i ibase-j off-j))))
+           (format s "}~%")
+           ))))))
 
 
 ;;; ------------------------------------------------------------
@@ -2010,11 +2018,13 @@ energy-only kernels where D! requests are unnecessary."
 
 
 (defclass kernel-ir ()
-  ((group :accessor kernel-group :initarg :group)
+  ((compute-mode :accessor kernel-compute-mode :initarg :compute-mode)
+   (group :accessor kernel-group :initarg :group)
    (name :accessor kernel-name :initarg :name)
    (layout :accessor kernel-layout :initarg :layout)
    (coord-vars :accessor kernel-coord-vars :initarg :coord-vars)
    (coord-load-stmts :accessor kernel-coord-load-stmts :initarg :coord-load-stmts)
+   (template :accessor kernel-template :initarg :template)
    (params :accessor kernel-params :initarg :params)
    ;; pre-E/G/H block with scalar energy/grad/hess assignments
    (core-block :accessor kernel-core-block :initarg :core-block)
@@ -2050,6 +2060,28 @@ energy-only kernels where D! requests are unnecessary."
   "Convenience constructor mirroring the old DEFSTRUCT MAKE-KERNEL-IR."
   (apply #'make-instance 'kernel-ir initargs))
 
+(defmethod print-object ((kernel kernel-ir) stream)
+  (print-unreadable-object (kernel stream :type t)
+    (format stream "~a-~a" (kernel-group kernel) (kernel-name kernel))))
+
+
+(defclass kernel-group ()
+  ((name :initarg :name
+         :reader kernel-group-name)
+   (kernels :initarg :kernels
+            :reader kernel-group-kernels
+            :documentation "A list of three kernels, one for energy, gradient and hdvec")))
+
+(defun make-kernel-group (kernels &key name)
+  (make-instance 'kernel-group
+                 :name name
+                 :kernels kernels))
+
+
+(defmethod print-object ((obj kernel-group) stream)
+  (print-unreadable-object (obj stream :type t)
+    (format stream ":name ~a" (kernel-group-name obj))))
+
 ;;; ------------------------------------------------------------
 ;;; Top-level make-kernel-from-block
 ;;;    Implements what DEFKERNEL does
@@ -2066,8 +2098,9 @@ energy-only kernels where D! requests are unnecessary."
     (append res coord-vars)))
 
 (defun make-kernel-from-block
-    (&key group name pipeline layout coord-vars coord-load-stmts base-block params
-       compute-mode compute-energy compute-grad compute-hess derivatives
+    (&key group name pipeline layout coord-vars coord-load-stmts
+       base-block template params compute-mode compute-energy
+       compute-grad compute-hess derivatives
        extra-equivalence-rules extra-optimization-rules
        post-eg-h-pipeline
        (return-type "void")
@@ -2173,11 +2206,13 @@ energy-only kernels where D! requests are unnecessary."
                          post-block)
                        eg-h-block)))
             (make-kernel-ir
+             :compute-mode compute-mode
              :group group
              :name name
              :layout layout
              :coord-vars coord-vars
              :coord-load-stmts coord-load-stmts
+             :template template
              :params params
              :core-block core-block
              :eg-h-block eg-h-block*
@@ -2201,10 +2236,11 @@ energy-only kernels where D! requests are unnecessary."
   (mapcar #'expr-ir:expr-var-symbol vars))
 
 
-(defmacro push-kernel (destination c-function-name compute-mode &body clauses)
+(defmacro build-one-kernel (destination c-function-name compute-mode &body clauses)
   (labels ((clause-value (key)
              (cadr (assoc key clauses))))
     (let* ((pipeline        (clause-value :pipeline))
+           (template        (clause-value :template))
            (params          (clause-value :params))
            (layout-cl       (assoc :layout clauses))
            (coord-vars      (mapcar #'expr-ir:ev (clause-value :coord-vars)))
@@ -2224,50 +2260,52 @@ energy-only kernels where D! requests are unnecessary."
            (return-type    (or (clause-value :return-type) "void"))
            (return-expr    (clause-value :return-expr))
            )
-      `(push
-         (let* ((layout (make-kernel-layout
-                         :atom->ibase ',atom->ibase
-                         :axis->offset ',axis->offset))
-                (coord-vars (vars ,@coord-names))
-                (coord-load-stmts ,coord-load)
-                (base-block ,body-form))
-           (make-kernel-from-block
-            :group ,c-function-name
-            :name ',(format nil "~a_~a" c-function-name (string-downcase compute-mode))
-            :pipeline ,pipeline
-            :layout layout
-            :coord-vars coord-vars
-            :coord-load-stmts coord-load-stmts
-            :base-block base-block
-            :params ',params
-            :compute-energy t
-            :compute-mode ',compute-mode
-            :compute-grad ,want-grad
-            :compute-hess ,want-hess
-            :derivatives ',deriv-spec
-            ;; NEW: per‑kernel rewrite rules (may be NIL)
-            :extra-equivalence-rules ,extra-eq-rules
-            :extra-optimization-rules ,extra-opt-rules))
-         ,destination))))
+      `(let* ((layout (make-kernel-layout
+                       :atom->ibase ',atom->ibase
+                       :axis->offset ',axis->offset))
+              (coord-vars (vars ,@coord-names))
+              (coord-load-stmts ,coord-load)
+              (base-block ,body-form))
+         (make-kernel-from-block
+          :group ,c-function-name
+          :name ',(format nil "~a_~a" c-function-name (string-downcase compute-mode))
+          :pipeline ,pipeline
+          :layout layout
+          :coord-vars coord-vars
+          :coord-load-stmts coord-load-stmts
+          :base-block base-block
+          :template ,template
+          :params ',params
+          :compute-energy t
+          :compute-mode ',compute-mode
+          :compute-grad ,want-grad
+          :compute-hess ,want-hess
+          :derivatives ',deriv-spec
+          ;; NEW: per‑kernel rewrite rules (may be NIL)
+          :extra-equivalence-rules ,extra-eq-rules
+          :extra-optimization-rules ,extra-opt-rules))
+      )))
 
-(defmacro build-multiple-kernels ((destination c-function-name compute-mode-list) &body clauses)
-  `(progn
-     ,@(loop for compute-mode in compute-mode-list
-             collect `(push-kernel ,destination ,c-function-name ,compute-mode
-                        ,@clauses))))
+(defmacro build-kernel-group ((destination c-function-name &optional (compute-mode-list '(:energy :gradient :hessian))) &body clauses)
+  `(push
+    (make-kernel-group
+     (list ,@(loop for compute-mode in compute-mode-list
+             collect `(build-one-kernel ,destination ,c-function-name ,compute-mode
+                        ,@clauses)))
+    :name ',c-function-name
+    )
+    ,destination))
 
-
-(defun write-all (kernels &key (pathname (or (uiop/os:getenv "KERNEL_PATH") "/tmp/kernels/")))
-  (loop for kernel in kernels
-        for name = (string-downcase (kernel-name kernel))
+(defun write-all (kernel-groups &key (pathname (or (uiop/os:getenv "KERNEL_PATH") "/tmp/kernels/")))
+  (loop for kernel-group in kernel-groups
+        for name = (string-downcase (kernel-group-name kernel-group))
         for pn = (merge-pathnames (make-pathname :name name :type "c") (pathname pathname))
         do (format t "writing = ~s~%" pn)
-        do (write-c-code kernel pn)))
+        do (write-c-code kernel-group pn)))
 
 (defmacro with-kernels ((destination) &body body)
   `(let ((,destination nil))
      ,@body))
-
 
 (defmacro with-trace-output (filename &body body)
   `(with-open-file (*trace-output* filename :direction :output :if-exists :supersede)

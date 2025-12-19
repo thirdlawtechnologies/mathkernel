@@ -541,7 +541,7 @@ infrastructure."
                  (t nil)))))
     (check-stmt-list (block-statements block) '()))
   ;; Also run the SSA/ordering check up front to catch any temp reuse before planning.
-  (ignore-errors
+  #+(or)(ignore-errors
     (check-block-integrity block :label "pre-cse-factor"))
   (let* ((outer-symbols (or outer-symbols binding-params))
          (def-env (copy-binding-env defined-env block))

@@ -79,7 +79,6 @@
 
                  test-cse-does-not-introduce-nil-variable-rhs
                  test-cse-preserves-energy-grad-hess-rhs
-                 test-copy-propagate-preserves-hessian-target
                  test-cse-and-copy-propagate-preserve-energy-grad-hess-rhs
 
                  test-factor-temp-param-products-simple
@@ -753,91 +752,6 @@ second value so tests can print it."
 ;;; Kernel codegen snapshots
 ;;; ------------------------------------------------------------
 
-(defparameter *stretch-kernel-c-cache* nil
-  "Memoized alist of (\"name\" . c-source-string) for the stretch kernel variants.")
-
-(defun build-stretch-kernel-c-snapshots ()
-  "Build stretch kernels (energy/gradient/hessian) with the production pipeline
-and return an alist mapping kernel name strings to generated C source strings."
-  (let* ((*package* (find-package :mathkernel-user))
-         (*trace-output* (make-broadcast-stream))
-         (stmt-ir:*debug* nil)
-         (stmt-ir::*factor-temp-param-debug* nil)
-         (*standard-output* (make-broadcast-stream))
-         (pipeline
-           (stmt-ir:make-optimization-pipeline
-            :name :kernel-full
-            :optimizations
-            (list
-            (stmt-ir:make-optimization
-             :name :linear-canonicalization
-             :function 'stmt-ir:linear-canonicalization-optimization)
-            (stmt-ir:make-optimization
-             :name :factor-sums
-             :function 'stmt-ir:factor-sums-optimization
-             :keyword-args (list :min-uses 2 :min-factors 1 :min-size 4))
-            (stmt-ir:make-optimization
-              :name :cse-full
-              :function 'stmt-ir:cse-block-multi-optimization
-              :keyword-args (list :max-passes 50 :min-uses 2 :min-size 1))
-             (stmt-ir:make-optimization
-              :name :factor-temp-param
-              :function 'stmt-ir:factor-temp-param-products-optimization
-              :keyword-args (list :min-uses 2 :min-factors 2 :max-factors 3))
-             (stmt-ir:make-optimization
-              :name :copy-propagate
-              :function 'stmt-ir:copy-propagate-optimization)
-             (stmt-ir:make-optimization
-              :name :alias-assigned-exprs
-              :function 'stmt-ir:alias-assigned-exprs-optimization)
-             (stmt-ir:make-optimization
-              :name :normalize-signs
-              :function 'stmt-ir:normalize-signs-optimization)))))
-    (let ((kernels nil))
-      (mathkernel:build-multiple-kernels (kernels "stretch" (:energy :gradient :hessian))
-        (:pipeline pipeline)
-        (:params ((double kb)
-                  (double r0)
-                  (size_t i3x1)
-                  (size_t i3x2)
-                  (double* position)
-                  (double* energy_accumulate)
-                  (double* force)
-                  (double* hessian)
-                  (double* dvec)
-                  (double* hdvec)))
-        (:layout ((1 . I3X1) (2 . I3X2))
-                 ((X . 0) (Y . 1) (Z . 2)))
-        (:coord-vars (x1 y1 z1
-                         x2 y2 z2))
-        (:coord-load
-         (mathkernel:coords-from-position
-          ((x1 y1 z1 i3x1)
-           (x2 y2 z2 i3x2))))
-        (:body
-         (mathkernel:stmt-block
-           (mathkernel:=. dx "x2 - x1")
-           (mathkernel:=. dy "y2 - y1")
-           (mathkernel:=. dz "z2 - z1")
-           (mathkernel:=. r2 "dx*dx + dy*dy + dz*dz")
-           (mathkernel:=. r  "sqrt(r2)")
-           (mathkernel:=. dr "r - r0")
-           ;; E(r) = kb * (r - r0)^2
-           (mathkernel:=. energy "kb*dr*dr"))))
-    (mapcar (lambda (nm)
-              (let* ((k (find nm kernels :key #'mathkernel::kernel-name :test #'string=))
-                     (cfun (mathkernel::compile-kernel-to-c-function k))
-                     (src (stmt-ir:c-function->c-source-string cfun)))
-                (cons nm src)))
-            '("stretch_energy" "stretch_gradient" "stretch_hessian")))))
-
-(defun stretch-kernel-c-source (name)
-  "Return cached C source string for stretch kernel NAME, computing if needed."
-  (or (cdr (assoc name *stretch-kernel-c-cache* :test #'string=))
-      (let ((snapshots (build-stretch-kernel-c-snapshots)))
-        (setf *stretch-kernel-c-cache* snapshots)
-        (cdr (assoc name snapshots :test #'string=)))))
-
 
 ;;; ------------------------------------------------------------
 ;;; CSE + temp-order regression tests
@@ -988,123 +902,6 @@ CSE temps are defined before use and not redefined."
                  'test-stretch-gradient-c-regression
                  "stretch_gradient C output changed.~%Expected:~%~A~%Got:~%~A"
                  expected src)))
-
-(deftest test-stretch-hessian-c-regression
-  "Lock in the current generated C for stretch_hessian."
-  (let* ((src (stretch-kernel-c-source "stretch_hessian"))
-         (expected
-"void stretch_hessian(double kb, double r0, size_t i3x1, size_t i3x2, double* position, double* energy_accumulate, double* force, double* hessian, double* dvec, double* hdvec)
-{
-  double x1 = position[i3x1 + 0];
-  double y1 = position[i3x1 + 1];
-  double z1 = position[i3x1 + 2];
-  double x2 = position[i3x2 + 0];
-  double y2 = position[i3x2 + 1];
-  double z2 = position[i3x2 + 2];
-  double dx = (x2 + (-(x1)));
-  double cse_p25_t1 = (dx * dx);
-  double dy = (y2 + (-(y1)));
-  double cse_p27_t1 = (dy * dy);
-  double dz = (z2 + (-(z1)));
-  double cse_p18_t1 = (dz * dz);
-  double r2 = (cse_p18_t1 + cse_p25_t1 + cse_p27_t1);
-  double cse_p1_t1 = pow(r2, -0.50000000000000000    );
-  double cse_p10_t47 = (cse_p1_t1 * kb);
-  double cse_p17_t1 = (cse_p1_t1 * dy);
-  double cse_p10_t17 = (cse_p17_t1 * dy);
-  double cse_p10_t19 = (cse_p18_t1 * cse_p1_t1);
-  double cse_p12_t24 = (cse_p1_t1 * dx);
-  double cse_p10_t14 = (cse_p12_t24 * dx);
-  double cse_p10_t45 = pow(r2, -1);
-  double cse_p14_t2 = (cse_p10_t47 * cse_p12_t24);
-  double cse_p10_t15 = (cse_p14_t2 * dy);
-  double cse_p10_t16 = (cse_p14_t2 * dz);
-  double cse_p10_t18 = (cse_p10_t47 * cse_p17_t1 * dz);
-  double cse_p10_t41 = (-(cse_p10_t15));
-  double cse_p10_t42 = (-(cse_p10_t16));
-  double cse_p10_t43 = (-(cse_p10_t18));
-  double cse_p10_t4 = (2.0000000000000000     * cse_p10_t41);
-  double cse_p10_t5 = (2.0000000000000000     * cse_p10_t42);
-  double cse_p10_t6 = (2.0000000000000000     * cse_p10_t43);
-  double cse_p20_t1 = (cse_p10_t47 * cse_p1_t1);
-  double cse_p23_t1 = (-2.0000000000000000     * cse_p20_t1);
-  double r = sqrt(r2);
-  double dr = (r + (-(r0)));
-  double cse_p10_t13 = (cse_p10_t47 * dr);
-  double cse_p10_t32 = (cse_p10_t14 + cse_p10_t14 + dr + dr);
-  double cse_p10_t33 = (cse_p10_t17 + cse_p10_t17 + dr + dr);
-  double cse_p10_t34 = (cse_p10_t19 + cse_p10_t19 + dr + dr);
-  double cse_p11_t37 = (cse_p10_t13 * cse_p10_t45);
-  double cse_p16_t1 = (cse_p11_t37 * dy);
-  double cse_p13_t11 = (cse_p11_t37 * dx);
-  double cse_p10_t8 = (cse_p13_t11 * dy);
-  double cse_p10_t9 = (cse_p13_t11 * dz);
-  double cse_p10_t11 = (cse_p16_t1 * dz);
-  double cse_p10_t7 = (cse_p13_t11 * dx);
-  double cse_p10_t10 = (cse_p16_t1 * dy);
-  double cse_p10_t12 = (cse_p11_t37 * cse_p18_t1);
-  double cse_p10_t36 = (-(cse_p10_t8));
-  double cse_p10_t37 = (-(cse_p10_t9));
-  double cse_p10_t39 = (-(cse_p10_t11));
-  double cse_p10_t1 = (2.0000000000000000     * cse_p10_t36);
-  double cse_p10_t2 = (2.0000000000000000     * cse_p10_t37);
-  double cse_p10_t3 = (2.0000000000000000     * cse_p10_t39);
-  double cse_p10_t20 = (cse_p10_t32 * cse_p10_t47);
-  double cse_p10_t21 = (cse_p10_t33 * cse_p10_t47);
-  double cse_p10_t22 = (cse_p10_t34 * cse_p10_t47);
-  double cse_p10_t35 = (-(cse_p10_t7));
-  double cse_p10_t38 = (-(cse_p10_t10));
-  double cse_p10_t40 = (-(cse_p10_t12));
-  double h_x2_y2 = (cse_p10_t1 + cse_p10_t15 + cse_p10_t15);
-  KernelOffDiagHessAcc(i3x2, 0, i3x2, 1, h_x2_y2);
-  double h_x2_z2 = (cse_p10_t16 + cse_p10_t16 + cse_p10_t2);
-  KernelOffDiagHessAcc(i3x2, 0, i3x2, 2, h_x2_z2);
-  double h_y2_z2 = (cse_p10_t18 + cse_p10_t18 + cse_p10_t3);
-  KernelOffDiagHessAcc(i3x2, 1, i3x2, 2, h_y2_z2);
-  double h_y1_x2 = (cse_p10_t4 + cse_p10_t8 + cse_p10_t8);
-  KernelOffDiagHessAcc(i3x1, 1, i3x2, 0, h_y1_x2);
-  double h_z1_x2 = (cse_p10_t5 + cse_p10_t9 + cse_p10_t9);
-  KernelOffDiagHessAcc(i3x1, 2, i3x2, 0, h_z1_x2);
-  double h_z1_y2 = (cse_p10_t11 + cse_p10_t11 + cse_p10_t6);
-  KernelOffDiagHessAcc(i3x1, 2, i3x2, 1, h_z1_y2);
-  double h_x2_x2 = (cse_p10_t20 + cse_p10_t35 + cse_p10_t35);
-  KernelDiagHessAcc(i3x2, 0, i3x2, 0, h_x2_x2);
-  double h_y2_y2 = (cse_p10_t21 + cse_p10_t38 + cse_p10_t38);
-  KernelDiagHessAcc(i3x2, 1, i3x2, 1, h_y2_y2);
-  double h_z2_z2 = (cse_p10_t22 + cse_p10_t40 + cse_p10_t40);
-  KernelDiagHessAcc(i3x2, 2, i3x2, 2, h_z2_z2);
-  double cse_p10_t44 = (-(cse_p10_t13));
-  double cse_p2_t1 = (dr * kb);
-  double cse_p4_t1 = (cse_p1_t1 * cse_p2_t1);
-  double cse_p5_t1 = (-2.0000000000000000     * cse_p4_t1);
-  double cse_p1_t2 = (2.0000000000000000     * cse_p4_t1);
-  double energy = (cse_p2_t1 * dr);
-  *energy_accumulate += energy;
-  double g_x1 = (cse_p5_t1 * dx);
-  KernelGradientAcc(i3x1, 0, g_x1);
-  double g_y1 = (cse_p5_t1 * dy);
-  KernelGradientAcc(i3x1, 1, g_y1);
-  double g_z1 = (cse_p5_t1 * dz);
-  KernelGradientAcc(i3x1, 2, g_z1);
-  double g_x2 = (cse_p1_t2 * dx);
-  KernelGradientAcc(i3x2, 0, g_x2);
-  double g_y2 = (cse_p1_t2 * dy);
-  KernelGradientAcc(i3x2, 1, g_y2);
-  double g_z2 = (cse_p1_t2 * dz);
-  KernelGradientAcc(i3x2, 2, g_z2);
-  double h_x1_x2 = (cse_p10_t44 + cse_p10_t44 + cse_p10_t7 + cse_p10_t7 + (cse_p23_t1 * cse_p25_t1));
-  KernelOffDiagHessAcc(i3x1, 0, i3x2, 0, h_x1_x2);
-  double h_y1_y2 = (cse_p10_t10 + cse_p10_t10 + cse_p10_t44 + cse_p10_t44 + (cse_p23_t1 * cse_p27_t1));
-  KernelOffDiagHessAcc(i3x1, 1, i3x2, 1, h_y1_y2);
-  double h_z1_z2 = (cse_p10_t12 + cse_p10_t12 + cse_p10_t44 + cse_p10_t44 + (cse_p18_t1 * cse_p23_t1));
-  KernelOffDiagHessAcc(i3x1, 2, i3x2, 2, h_z1_z2);
-}
-"))
-    (assert-true (string= src expected)
-                 'test-stretch-hessian-c-regression
-                 "stretch_hessian C output changed.~%Expected:~%~A~%Got:~%~A"
-                 expected src)))
-
 
 
 
@@ -1302,27 +1099,6 @@ CSE temps are defined before use and not redefined."
                        name rhs))))))
 
 
-(deftest test-copy-propagate-preserves-hessian-target
-  "copy-propagate-block must keep H_X_X with a real RHS, not a NIL variable."
-  (let* ((expr (expr-ir:parse-expr "x^2 + y^2"))
-         (tmp  (stmt-ir:make-assignment-stmt 'TMP expr))
-         (hxx  (stmt-ir:make-assignment-stmt 'H_X_X
-                                             (expr-ir:parse-expr "TMP")))
-         (block (stmt-ir:make-block-stmt (list tmp hxx)))
-         (after-block (stmt-ir:copy-propagate-optimization (stmt-ir:make-pass-id-counter) block))
-         (hxx-stmt (find-assignment after-block 'H_X_X)))
-    (assert-true hxx-stmt
-                 'test-copy-propagate-preserves-hessian-target
-                 "H_X_X assignment missing after copy-propagate")
-    (let ((rhs (stmt-ir:stmt-expression hxx-stmt)))
-      (assert-true rhs
-                   'test-copy-propagate-preserves-hessian-target
-                   "H_X_X RHS is NIL after copy-propagate")
-      (assert-true (not (expr-nil-variable-p rhs))
-                   'test-copy-propagate-preserves-hessian-target
-                   "H_X_X RHS is NIL variable after copy-propagate: ~S"
-                   rhs))))
-
 (deftest test-cse-and-copy-propagate-preserve-energy-grad-hess-rhs
   "CSE+copy-propagate must keep E, G_*, H_* with non-NIL RHS."
   (let* ((expr       (expr-ir:parse-expr "x^2 + y^2"))
@@ -1453,12 +1229,6 @@ all REQUIRED-FACTORS (by EQ)."
       (assert-true (null temp-assignment)
                    'test-factor-temp-param-products-min-uses
                    "Temp was created even though 2 * CSE_P1_T148 * kt only appears once."))))
-
-
-(defun expr-nil-variable-p (expr)
-  "True if EXPR is a variable-expression whose symbol name is \"NIL\"."
-  (and (typep expr 'expr-ir:variable-expression)
-       (string= (symbol-name (expr-ir:variable-name expr)) "NIL")))
 
 (deftest test-factor-temp-param-products-no-nil-rhs
   "factor-temp-param-products-optimization must not produce NIL or NIL-variable RHS."

@@ -54,140 +54,6 @@
 
 (defparameter kernels nil)
 
-(defun test-nonbond-dd ()
-  (build-multiple-kernels (kernels "nonbond_dd_cutoff" (:hessian)) ;; :gradient)) ;; :energy :hessian))
-    (:pipeline *pipeline*)
-
-    (:params ((double A)       ;; LJ A coefficient  (A / r^12)
-              (double B)       ;; LJ B coefficient  (B / r^6)
-              (double qq)      ;; Coulomb prefactor
-              (double invdd)   ;; 1.0/epsilon(r) = 1.0/dd*r
-              (double r_switch) ;; switching start
-              (double r_switch2) ;; switching start squared
-              (double r_cut)     ;; cutoff
-              (double r_cut2)    ;; cutoff^2
-              (double inv_range) ;; 1.0/(r_cut - r_switch)
-              (size_t i3x1)
-              (size_t i3x2)
-              (double* position)
-              (double* energy_accumulate)
-              (double* force)
-              (double* hessian)
-              (double* dvec)
-              (double* hdvec)))
-
-    (:layout ((1 . I3X1) (2 . I3X2))
-             ((X . 0) (Y . 1) (Z . 2)))
-
-    (:coord-vars (x1 y1 z1
-                     x2 y2 z2))
-
-    (:coord-load
-     (coords-from-position
-      ((x1 y1 z1 i3x1)
-       (x2 y2 z2 i3x2))))
-
-    (:body
-     (stmt-block :!base
-       (=. dx "x1 - x2")
-       (=. dy "y1 - y2")
-       (=. dz "z1 - z2")
-       (=. r2 "dx*dx + dy*dy + dz*dz")
-       (stmt-ir:make-if-stmt
-        (expr-ir:parse-expr "r2 < r_cut2")
-        (stmt-block :!in-cut
-          (=. invr  "r2^-0.5")          ; one pow/sqrt
-          (=. r     "r2*invr")          ; reuse, no extra sqrt
-          (=. invr2 "invr*invr")
-          (=. invr3 "invr*invr2")
-          (=. invr4 "invr2*invr2")
-          (=. invr6 "invr2*invr2*invr2")
-          (=. e_lj   "A*invr6*invr6 - B*invr6")
-          (=. e_coul "qq*invr2*invdd")
-          (=. e_base "e_lj + e_coul")
-          ;; base radial derivatives
-          (=. dE_base_dr   "(-12.0*A*invr6*invr6*invr) + (6.0*B*invr6*invr) + (-2.0*qq*invr3*invdd)"
-              :modes (:gradient :hessian))
-          (=. d2E_base_dr2 "(156.0*A*invr6*invr6*invr2) + (-42.0*B*invr6*invr2) + (6.0*qq*invr2*invr2*invdd)"
-              :modes (:hessian))
-          (stmt-ir:make-if-stmt
-           (expr-ir:parse-expr "r2 < r_switch2")
-           (stmt-block :!in-switch
-             (=! energy "e_base")
-             (=. dE_dr   "dE_base_dr" :modes (:gradient :hessian))
-             (=. d2E_dr2 "d2E_base_dr2" :modes (:hessian)))
-           (stmt-block :!in-skin
-             (=. drs "r - r_switch")
-             (=. t1 "drs*inv_range")
-             (=. t2 "t1*t1")
-             (=. t3 "t2*t1")
-             (=. t4 "t2*t2")
-             (=. t5 "t3*t2")
-             (=. s "1.0 - 10.0*t3 + 15.0*t4 - 6.0*t5")
-             (=. ds_dt1 "(-30.0*t2 + 60.0*t3 - 30.0*t4)" :modes (:gradient :hessian))
-             (=. d2s_dt2 "(-60.0*t1 + 180.0*t2 - 120.0*t3)" :modes (:hessian))
-             (=. ds_dr "ds_dt1*inv_range" :modes (:gradient :hessian))
-             (=. d2s_dr2 "d2s_dt2*inv_range*inv_range" :modes (:hessian))
-             (=! energy "s*e_base")
-             (=. dE_dr   "(s*dE_base_dr) + (ds_dr*e_base)" :modes (:gradient :hessian))
-             (=. d2E_dr2 "(s*d2E_base_dr2) + (2.0*ds_dr*dE_base_dr) + (d2s_dr2*e_base)" :modes (:hessian)))))))
-
-     )
-
-    (:derivatives
-     (:mode :manual
-      :intermediates (r)
-
-      ;; radial geometry
-      :intermediate->coord
-      ((r ((x1 "dx / r")
-           (y1 "dy / r")
-           (z1 "dz / r")
-           (x2 "-dx / r")
-           (y2 "-dy / r")
-           (z2 "-dz / r"))))
-
-      :intermediate->coord2
-      ((r (
-           ((x1 x1) "(r*r - dx*dx)/(r^3)")
-           ((x1 y1) "(-dx*dy)/(r^3)")
-           ((x1 z1) "(-dx*dz)/(r^3)")
-           ((x1 x2) "(dx*dx - r*r)/(r^3)")
-           ((x1 y2) "dx*dy/(r^3)")
-           ((x1 z2) "dx*dz/(r^3)")
-
-           ((y1 y1) "(r*r - dy*dy)/(r^3)")
-           ((y1 z1) "(-dy*dz)/(r^3)")
-           ((y1 x2) "dx*dy/(r^3)")
-           ((y1 y2) "(dy*dy - r*r)/(r^3)")
-           ((y1 z2) "dy*dz/(r^3)")
-
-           ((z1 z1) "(r*r - dz*dz)/(r^3)")
-           ((z1 x2) "dx*dz/(r^3)")
-           ((z1 y2) "dy*dz/(r^3)")
-           ((z1 z2) "(dz*dz - r*r)/(r^3)")
-
-           ((x2 x2) "(r*r - dx*dx)/(r^3)")
-           ((x2 y2) "(-dx*dy)/(r^3)")
-           ((x2 z2) "(-dx*dz)/(r^3)")
-
-           ((y2 y2) "(r*r - dy*dy)/(r^3)")
-           ((y2 z2) "(-dy*dz)/(r^3)")
-
-           ((z2 z2) "(r*r - dz*dz)/(r^3)"))))
-
-      ;; radial link energy ↔ r via branchwise dE_dr, d2E_dr2
-      :energy->intermediate
-      (:gradient ((r "dE_dr"))
-       :hessian  (((r r) "d2E_dr2")))
-
-      :hessian-modes ((r :full))
-      :geometry-check :warn)))
-
-  (write-all (list (first kernels)))
-  (defparameter kernel (first kernels))
-  (format t "Wrote nonbond_dd_cutoff-gradient kernel ~s~%" (first kernels))
-  )
 
 #+(or)
 (progn
@@ -204,24 +70,25 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
+;;#+(or)
 (progn
 
 
 ;;; Run all the tests
   #+(or)(stmt-ir.tests:run-all)
 
-  (build-multiple-kernels (kernels "stretch" (:hessian :gradient :energy))
+  (build-kernel-group (kernels "stretch" (:hessian :gradient :energy))
     (:pipeline *pipeline*)
-    (:params ((double kb)
-              (double r0)
-              (size_t i3x1)
-              (size_t i3x2)
-              (double* position)
-              (double* energy_accumulate)
-              (double* force)
-              (double* hessian)
-              (double* dvec)
-              (double* hdvec)))
+    (:params ((|double| kb)
+              (|double| r0)
+              (|size_t| i3x1)
+              (|size_t| i3x2)
+              (|double*| position)
+              (|double*| energy_accumulate)
+              (|double*| force)
+              (|double*| hessian)
+              (|double*| dvec)
+              (|double*| hdvec)))
 
     (:layout ((1 . I3X1) (2 . I3X2))
              ((X . 0) (Y . 1) (Z . 2)))
@@ -247,19 +114,19 @@
     )
 
 
-  (build-multiple-kernels (kernels "angle" (:energy :gradient :hessian))
+  (build-kernel-group (kernels "angle" (:energy :gradient :hessian))
     (:pipeline *pipeline*)
-    (:params ((double kt)
-              (double t0)
-              (size_t i3x1)
-              (size_t i3x2)
-              (size_t i3x3)
-              (double* position)
-              (double* energy_accumulate)
-              (double* force)
-              (double* hessian)
-              (double* dvec)
-              (double* hdvec)))
+    (:params ((|double| kt)
+              (|double| t0)
+              (|size_t| i3x1)
+              (|size_t| i3x2)
+              (|size_t| i3x3)
+              (|double*| position)
+              (|double*| energy_accumulate)
+              (|double*| force)
+              (|double*| hessian)
+              (|double*| dvec)
+              (|double*| hdvec)))
 
     (:layout ((1 . I3X1) (2 . I3X2) (3 . I3X3))
              ((X . 0) (Y . 1) (Z . 2)))
@@ -302,22 +169,22 @@
        (=! energy "kt*dtheta*dtheta")))
     )
 
-  (build-multiple-kernels (kernels "dihedral" (:energy :gradient :hessian))
+  (build-kernel-group (kernels "dihedral" (:energy :gradient :hessian))
     (:pipeline *pipeline*)
-    (:params ((double V)      ;; amplitude
-              (double n)      ;; multiplicity
-              (double sinPhase) ;; sin(phase offset δ)
-              (double cosPhase) ;; cos(phase offset δ)
-              (size_t i3x1)
-              (size_t i3x2)
-              (size_t i3x3)
-              (size_t i3x4)
-              (double* position)
-              (double* energy_accumulate)
-              (double* force)
-              (double* hessian)
-              (double* dvec)
-              (double* hdvec)))
+    (:params ((|double| V)      ;; amplitude
+              (|double| n)      ;; multiplicity
+              (|double| sinPhase) ;; sin(phase offset δ)
+              (|double| cosPhase) ;; cos(phase offset δ)
+              (|size_t| i3x1)
+              (|size_t| i3x2)
+              (|size_t| i3x3)
+              (|size_t| i3x4)
+              (|double*| position)
+              (|double*| energy_accumulate)
+              (|double*| force)
+              (|double*| hessian)
+              (|double*| dvec)
+              (|double*| hdvec)))
 
     (:layout ((1 . I3X1) (2 . I3X2) (3 . I3X3) (4 . I3X4))
              ((X . 0) (Y . 1) (Z . 2)))
@@ -397,25 +264,26 @@
       (:gradient ((phi "-V*n*sin_angle"))
        :hessian  (((phi phi) "-V*n*n*cos_angle")))
 
-      :hessian-modes ((phi :outer-product-only))
+      :hessian-modes ((phi :full)) ;; :outer-product-only))
       :geometry-check :warn)))
 
 
 
 
-  (build-multiple-kernels (kernels "nonbond" (:gradient :energy :hessian))
+  (build-kernel-group (kernels "nonbond" (:gradient :energy :hessian))
     (:pipeline *pipeline*)
-    (:params ((double A) ;; LJ A coefficient  (A / r^12)
-              (double B) ;; LJ B coefficient  (B / r^6)
-              (double qq) ;; Coulomb prefactor (qq / r)
-              (size_t i3x1)
-              (size_t i3x2)
-              (double* position)
-              (double* energy_accumulate)
-              (double* force)
-              (double* hessian)
-              (double* dvec)
-              (double* hdvec)))
+    (:template "template <typename HESSIAN>")
+    (:params ((|double| A) ;; LJ A coefficient  (A / r^12)
+              (|double| B) ;; LJ B coefficient  (B / r^6)
+              (|double| qq) ;; Coulomb prefactor (qq / r)
+              (|size_t| i3x1)
+              (|size_t| i3x2)
+              (|double*| position)
+              (|double*| energy_accumulate)
+              (|double*| force)
+              (HESSIAN hessian)
+              (|double*| dvec)
+              (|double*| hdvec)))
 
     (:layout ((1 . I3X1) (2 . I3X2))
              ((X . 0) (Y . 1) (Z . 2)))
@@ -496,26 +364,28 @@
       :hessian-modes ((r :full))
       :geometry-check :warn)))
 
-  (build-multiple-kernels (kernels "nonbond_dd_cutoff" (:gradient :energy :hessian))
+  (build-kernel-group (kernels "nonbond_dd_cutoff" (:gradient :energy :hessian))
     (:pipeline *pipeline*)
 
-    (:params ((double A)       ;; LJ A coefficient  (A / r^12)
-              (double B)       ;; LJ B coefficient  (B / r^6)
-              (double qq)      ;; Coulomb prefactor
-              (double invdd)   ;; 1.0/epsilon(r) = 1.0/dd*r
-              (double r_switch) ;; switching start
-              (double r_switch2) ;; switching start squared
-              (double r_cut)     ;; cutoff
-              (double r_cut2)    ;; cutoff^2
-              (double inv_range) ;; 1.0/(r_cut - r_switch)
-              (size_t i3x1)
-              (size_t i3x2)
-              (double* position)
-              (double* energy_accumulate)
-              (double* force)
-              (double* hessian)
-              (double* dvec)
-              (double* hdvec)))
+    (:template "template <typename HESSIAN>")
+
+    (:params ((|double| A)       ;; LJ A coefficient  (A / r^12)
+              (|double| B)       ;; LJ B coefficient  (B / r^6)
+              (|double| qq)      ;; Coulomb prefactor
+              (|double| invdd)   ;; 1.0/epsilon(r) = 1.0/dd*r
+              (|double| r_switch) ;; switching start
+              (|double| r_switch2) ;; switching start squared
+              (|double| r_cut)     ;; cutoff
+              (|double| r_cut2)    ;; cutoff^2
+              (|double| inv_range) ;; 1.0/(r_cut - r_switch)
+              (|size_t| i3x1)
+              (|size_t| i3x2)
+              (|double*| position)
+              (|double*| energy_accumulate)
+              (|double*| force)
+              (HESSIAN hessian)
+              (|double*| dvec)
+              (|double*| hdvec)))
 
     (:layout ((1 . I3X1) (2 . I3X2))
              ((X . 0) (Y . 1) (Z . 2)))
@@ -628,23 +498,25 @@
 
 
 
-  (build-multiple-kernels (kernels "chiral_restraint" (:energy :gradient :hessian))
+  (build-kernel-group (kernels "chiral_restraint" (:energy :gradient :hessian))
     ;; Optimization pipeline
     (:pipeline *pipeline*)
 
     ;; Parameters: (ctype name)
     ;;   K   – force constant
     ;;   CO  – target chiral value
-    (:params ((double K)
-              (double CO)
-              (size_t i3x1)
-              (size_t i3x2)
-              (double* position)
-              (double* energy_accumulate)
-              (double* force)
-              (double* hessian)
-              (double* dvec)
-              (double* hdvec)
+    (:params ((|double| K)
+              (|double| CO)
+              (|size_t| i3x1)
+              (|size_t| i3x2)
+              (|size_t| i3x3)
+              (|size_t| i3x4)
+              (|double*| position)
+              (|double*| energy_accumulate)
+              (|double*| force)
+              (|double*| hessian)
+              (|double*| dvec)
+              (|double*| hdvec)
               ))
 
     ;; Layout: 4 atoms with 3D coords
@@ -738,7 +610,7 @@
        )))
 
 
-  (build-multiple-kernels (kernels "anchor" (:energy :gradient :hessian))
+  (build-kernel-group (kernels "anchor" (:energy :gradient :hessian))
     (:pipeline *pipeline*)
     (:layout ((1 . I3X1))
              ((X . 0) (Y . 1) (Z . 2)))
@@ -754,14 +626,18 @@
        (=. r2 "dx*dx + dy*dy + dz*dz")
        (=! energy "ka * r2")
        ))
-    (:params ((double ka)
-              (double xa)
-              (double ya)
-              (double za)
-              (double* position)
-              (double* energy_accumulate)
-              (double* force_accumulate)
-              (double* hess_accumulate)))
+    (:params ((|double| ka)
+              (|double| xa)
+              (|double| ya)
+              (|double| za)
+              (|size_t| i3x1)
+              (|double*| position)
+              (|double*| energy_accumulate)
+              (|double*| force)
+              (|double*| hessian)
+              (|double*| dvec)
+              (|double*| hdvec)
+              ))
     (:derivatives
      (:mode :manual
       :intermediates (dx dy dz r2)
@@ -793,14 +669,25 @@
 
 
 
-  (build-multiple-kernels (kernels "dihedral_restraint" (:energy :gradient :hessian))
+  (build-kernel-group (kernels "dihedral_restraint" (:energy :gradient :hessian))
     (:pipeline *pipeline*)
 
     ;; Parameters:
     ;;   kdh  – force constant
     ;;   phi0 – target dihedral angle (radians)
-    (:params ((double kdh)
-              (double phi0)))
+    (:params ((|double| kdh)
+              (|double| phi0)
+              (|size_t| i3x1)
+              (|size_t| i3x2)
+              (|size_t| i3x3)
+              (|size_t| i3x4)
+              (|double*| position)
+              (|double*| energy_accumulate)
+              (|double*| force)
+              (|double*| hessian)
+              (|double*| dvec)
+              (|double*| hdvec)
+              ))
 
     ;; 4-atom dihedral 1–2–3–4
     (:layout ((1 . I3X1) (2 . I3X2) (3 . I3X3) (4 . I3X4))
@@ -885,7 +772,7 @@
        (=. n1   "sqrt(n1_2)")
        (=. n2   "sqrt(n2_2)")
 
-       ;; Cos(phi) = (n1 · n2) / (|n1||n2|)
+       ;; Cos(phi) = (n1 · n2) / (|n1|n2|)
        (=. dot_n1n2 "n1x*n2x + n1y*n2y + n1z*n2z")
        (=. inv_n1n2 "1/(n1*n2)")
        (=. cosphi "dot_n1n2 * inv_n1n2")
@@ -906,6 +793,7 @@
 
   (write-all kernels)
 
+  #+(or)
   (mathkernel:emit-c-tests (loop for kernel in kernels
                                  when (member (mathkernel::kernel-group kernel) '("stretch" "angle" "dihedral") :test 'string=)
                                    collect kernel)

@@ -303,7 +303,6 @@ Supported forms (initial version):
 
 ENV is reserved for future use (e.g. to distinguish some function names)."
   (declare (ignore env))
-  (declare (optimize (debug 3)))
   (cond
     ;; Already an expression node
     ((typep form 'expression)

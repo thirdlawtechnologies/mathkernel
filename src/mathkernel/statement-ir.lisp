@@ -460,6 +460,11 @@ Example:
     :accessor c-function-name
     :documentation
     "Symbol or string naming the C function.")
+   (template
+    :initarg :template
+    :initform nil
+    :reader c-function-template
+    :documentation "Store a string that represents the template prefix or NIL if none.")
    (return-type
     :initarg :return-type
     :initform "void"
@@ -475,6 +480,12 @@ Example:
      For now, each element is a cons (CTYPE . NAME), where:
        CTYPE is a string (e.g. \"double *\"),
        NAME  is a symbol or string (e.g. 'x, \"grad\").")
+   (coord-vars
+    :initarg :coord-vars
+    :initform nil
+    :reader c-function-coord-vars
+    :documentation
+    "Store this to figure out the number of coordinate vars for KernelHess... template functions")
    (locals
     :initarg :locals
     :initform nil
@@ -500,17 +511,26 @@ just before the closing brace."))
   (:documentation
    "Represents a complete C function ready for emission."))
 
+(defmethod print-object ((statement c-function) stream)
+  (let ((*print-pretty* nil))
+    (print-unreadable-object (statement stream :type t)
+      (format stream "~a" (c-function-name statement)))))
+
 (defun make-c-function (name body
                         &key
+                          (template (error "Provide the template"))
                           (return-type "void")
                           (parameters nil)
+                          (coord-vars (error "Provide coord-vars"))
                           (locals nil)
                           (return-expr nil))
   "Convenience constructor for c-function."
   (make-instance 'c-function
                  :name name
+                 :template template
                  :return-type return-type
                  :parameters parameters
+                 :coord-vars coord-vars
                  :locals locals
                  :body body
                  :return-expr return-expr))
@@ -559,6 +579,7 @@ passed through EXPR-IR:SIMPLIFY-EXPR."
      (let ((body (c-function-body stmt)))
        (make-c-function (c-function-name stmt)
                         (simplify-block body)
+                        :template (c-function-template stmt)
                         :return-type (c-function-return-type stmt)
                         :parameters  (c-function-parameters stmt)
                         :locals      (c-function-locals stmt))))

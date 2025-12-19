@@ -23,6 +23,7 @@
                                            (:file "expression-diff")
                                            (:file "statement-diff")
                                            (:file "energy-blocks")
+                                           (:file "cxx-generator")
                                            (:file "kernel-dsl")
                                            (:file "statement-tests")
                                            (:file "kernel-compare")

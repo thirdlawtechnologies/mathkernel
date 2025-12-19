@@ -1,43 +1,280 @@
-• We’re on branch throwaway/walker-grad-hess with several refactors:
-
-- Walker-based gradient/Hessian injection integrated into make-kernel-from-block (inject-*-after-energy now return proper blocks).
-- CSE factorization (cse-factor-products-in-block) now uses a class-based walker context/accumulator and is refactored into helpers:
-- collect-products-in-block (walker collection),
-- choose-best-factor (candidate scoring),
-- rewrite-with-factor is currently broken - it needs to be updated to use new binder-env blocks and the walker (temp insertion/rewrite),
-- main loop re-collects after each rewrite.
-- Helper classes added: cse-factor-accumulator, cse-factor-context.
 
 
-- Walker scaffold added: src/mathkernel/walker.lisp defines a generic block walker.
-- Base class: walk-context (empty; extend as needed).
-- Generics (args: operation, context):
-- clone-context: clone per branch. Default returns ctx.
-- on-statement: per-stmt hook; returns (values new-stmt new-ctx). Default passes through.
-- rewrite-block: block-level hook; returns (values new-statements new-ctx). Default folds on-statement, threading ctx; accepts
-list or single statement returns, drops on nil.
-- walk-block-with-context (operation ctx block): pre-order call to rewrite-block, then descends into child blocks/ifs; contexts are
-cloned per branch via clone-context; no merging. Returns (new-block, final-ctx).
-- Exported in packages.lisp; mathkernel.asd includes walker. No existing code uses it yet.
-- Two-pass plan guidance:
-- With branching-only (no joins), use a shared accumulator in the context to make analysis reusable for rewrite.
-- In clone-context, deep-copy branch-local slots but keep the shared table pointer so branches write into the same accumulator.
-- Key accumulated data by block/statement/path. Pass 1 (:analyze) records data; Pass 2 (:rewrite) reads it to transform.
-- If you need post-order analysis, either specialize rewrite-block to recurse into children before aggregating, or run a separate
-traversal. Default walker is pre-order.
-- Optimization/debug context (from earlier work):
-- *verbose-optimization* exists and is used as default for verbose keyword args.
-- Complexity metric ignores trivial alias assignments; run-optimization was adjusted to rerun :cse-full with verbose=2 when Δ<0 and
-dump before/after.
-- Factor loops and copy-propagate after factoring were temporarily disabled with #+(or) for debugging; cse-factor-products can be
-iterated.
-- A copy-deriv-env helper was added (exported).
-- build-deriv-env-for-block-propagate now threads/clones derivative env through ifs (still hash-table; merges are simple).
-- Open themes:
-- Branch-only structure means no env joins; a walker with a shared accumulator suits future passes (grad/hessian insertion, CSE
-analysis).
-- Future passes should decide pre- vs post-order or two-pass depending on whether child info is needed.
+› Look at the current code.  I want to optimize the code so that  pow(x,-0.5) is converted to rsqrt(x) and
+pow(x,0.5) is sqrt(x) and all other pow(x,y) are coallesced into temporary variables and there are as few
+reciprocal operations as possible.  What else do we need for this?
 
 
 
+• Explored
+└ List ls
+Read AGENTS.md
+Search \bpow\b in src
+Read expression-ir.lisp
+Search cse|common sub|temporary|temp|invr|rsqrt in mathkernel
+Read expression-parse.lisp, expression-rewrite.lisp
+Search rsqrt in src
+Search c-expr|emit.*c in statement-ir.lisp
+Search cse in statement-ir.lisp
+Search cse-block in mathkernel
+Read cse-block-optimization.lisp
+Search expt|power-expression|power in expression-ir.lisp
+Read expression-ir.lisp, statement-tests.lisp
+Search sexpr-size|expr-size|size in cse-block-optimization.lisp
+Read cse-block-optimization.lisp
+Search defun sexpr-size in mathkernel
+Read statement-ir.lisp
+Search reciprocal|invr|inv in mathkernel
+Read expression-parse.lisp
+Search cse-block-multi|cse-block-multi-optimization|optimization in kernel-dsl.lisp
+Read kernel-dsl.lisp
+Search pipeline in kernel-dsl.lisp
+Search make-optimization-pipeline in mathkernel
+Search :pipeline in src
+Read energy-kernels.lisp, statement-ir.lisp, session-summary-nov28-2025.md
 
+• I’m mapping out what’s needed to implement coalescing pow calls into intermediate variables, focusing on
+updating expression printing, rewrite rules, CSE passes, and tests. There are questions about how to handle
+rsqrt support, negative exponents, and whether all pow calls—even single-use—should be hoisted. I’m considering
+what code paths touch pow—including expr->c string, rewrites, and CSE—and noting places tests will need
+updating while preparing clarifying questions about target semantics and function vs. macro for rsqrt.
+
+• Explored
+└ Read expression-ir.lisp, expression-tests.lisp
+
+• I reviewed how pow with fractional and negative exponents is currently emitted and optimized. The existing code
+emits sqrt for exponent 0.5 but falls back to pow for negative halves like -0.5, and there’s no existing rsqrt
+support. Coalescing repeated pow calls happens only for uses of two or more, so single-use pow expressions
+aren’t hoisted. To improve this, it looks like adding rsqrt emission, rewriting rules for reciprocal
+minimization, new optimization passes for hoisting pow, and test updates would be needed. I’m curious about how
+the user wants to define and integrate rsqrt—whether as an intrinsic, macro, or fallback—and how aggressive
+they want to be about hoisting pow and minimizing reciprocals. Here’s a concise overview:
+
+- Current state includes emission logic in src/mathkernel/expression-ir.lisp with expr->c-expr-string mapping
+exponent 1/2 to sqrt, but no handling of -0.5 to rsqrt.
+- Division is lowered to pow with exponent -1 in src/mathkernel/expression-parse.lisp, and the rewrite
+rule :combine-expt^-1 in src/mathkernel/expression-rewrite.lisp merges reciprocal operations but only for
+exponent -1.
+- The CSE pipeline in src/cando-kernels/energy-kernels.lisp uses a minimum use threshold of 2 for coalescing
+pow, so only repeated pow calls are hoisted.
+- Tests in src/mathkernel/statement-tests.lisp include pow expressions with -0.5, meaning updates would be
+required to reflect rsqrt if introduced.
+
+Needed work includes: defining how to emit or implement rsqrt in C code and templates, canonicalizing numeric
+constants for better CSE consistency, designing a pow hoisting pass or adjusting CSE thresholds to handle
+single-use pow calls, enhancing rewrite rules to cover fractional negative exponents like -1/2, and adding
+appropriate tests and regression updates.
+
+Some questions remain: Should rsqrt be emitted as a real function or a macro? For which platforms and
+precision? Does the user want to hoist every pow call or only repeats? And for reducing reciprocals, should we
+unify division and pow(-1) explicitly or preserve both forms? These clarifications would help tailor the
+implementation approach.
+
+Preparing final explanation and questions
+
+─ Worked for 5m 17s ─────────────────────────────────────────────────────────────────────────────────────────────
+
+• Checked the current pow handling and the optimization pipeline. pow(x,0.5) already emits sqrt, but pow(x,-0.5)
+still emits pow, and pow calls are only coalesced when repeated. To reach your goal, we need a couple of
+decisions plus a small new pass.
+
+- src/mathkernel/expression-ir.lisp emits sqrt only for exponent 1/2; negative half falls through to pow. This
+is the direct hook for rsqrt.
+- src/mathkernel/expression-parse.lisp lowers division to pow(x,-1), so any reciprocal-minimization strategy
+must account for that.
+- src/mathkernel/expression-rewrite.lisp has :combine-expt^-1 (only for exponent -1). There is no rule for -1/2
+or other negative exponents.
+- src/cando-kernels/energy-kernels.lisp runs CSE with min-uses 2, so pow is coalesced only when duplicated;
+there is no pass that hoists single-use pow calls into temps.
+- src/mathkernel/statement-tests.lisp includes regression output with pow(r2, -0.5) that would need updating
+for rsqrt.
+
+What else we need to decide or add:
+
+- Define where rsqrt comes from (macro, inline helper, or platform intrinsic). There is no rsqrt symbol in the
+tree today, so generated C would need a definition or include.
+- Decide on numeric canonicalization for exponents (0.5 vs 1/2), otherwise CSE and pow matching may miss
+coalescing.
+- Decide whether “coalesce all other pow” means only duplicate pow or every pow (even single-use). The latter
+needs a dedicated “hoist pow” pass or a pow-specific CSE rule.
+- Choose the reciprocal minimization policy: extend rewrite rules beyond exponent -1, or add a dataflow pass to
+reuse precomputed inverses (as hinted in the session summary).
+
+Questions to pin this down:
+
+1. Should rsqrt be a real C function/macro you provide, or do you want a fallback like 1.0/sqrt(x)?
+2. Do you want to hoist every pow into a temp, or only when the same pow appears multiple times?
+3. For “few reciprocal ops”, do you want to rewrite negative exponents into a shared inverse (invr/invr2/etc.),
+or keep them as pow with negative exponent?
+
+
+› 1. I will define an rsqrt inline template function. 2. I want to hoist pow that appear multiple times. 3. I
+want to rewrite negative exponents as shared invers invr/invr2 etc.
+
+
+• Detailing negative exponent rewrite strategy
+
+I’m outlining a new optimization pass that will scan for negative integer exponents per base, create shared
+inverse temps (like invr, invr2), and rewrite expressions to use them. This pass fits best after CSE to ensure
+maximal reuse and minimal reciprocals. I’ll also propose updating the C expression emitter to special-case
+exponent -1 (emit 1.0/base) and -0.5 (emit rsqrt) for efficient code generation. Additionally, tests and
+pipeline integration need updates. There are open questions about handling non-integer negative exponents
+beyond -0.5 and whether to always create inverse temps even for single uses. Once confirmed, I can provide a
+precise implementation plan.
+
+Proposing emission and optimization choices for inverses
+
+I’m considering whether exponent -1 should emit as 1.0/(x) versus pow(x,-1) to minimize reciprocal calls, plus
+how to leverage rsqrt for both -0.5 and -1 powers. There’s a trade-off in deriving invr from rsqrt to reduce
+reciprocals. I’ll include these design questions alongside required changes: new rsqrt emitter, optimization
+pass to create shared inverse temps, pipeline integration, and tests updates. I’ll ask for confirmation before
+proceeding.
+
+• Explored
+└ Search rewrite in expression-rewrite.lisp
+Read expression-rewrite.lisp
+Search rewrite-expr-ir-with-rules in mathkernel
+
+• I’m organizing what’s missing to implement the new optimization pass, including emission updates, pipeline
+integration, and test changes, plus open questions about exponent handling and code generation choices to
+clarify before proceeding.
+
+─ Worked for 3m 21s ─────────────────────────────────────────────────────────────────────────────────────────────
+
+• With your choices, pow coalescing is already handled by the existing :cse-full pass (min-size 1) in src/cando-
+kernels/energy-kernels.lisp, so the remaining work is mostly around negative exponents and C emission.
+
+Needed
+
+- Add a -1/2 special-case in expr->c-expr-string’s power-expression branch so pow(x,-0.5) emits rsqrt(x)
+alongside the current sqrt handling in src/mathkernel/expression-ir.lisp.
+- Add a stmt‑IR optimization pass that finds negative integer exponents, introduces shared inverse temps (inv1,
+inv2, … via multiplications), and rewrites uses; wire it into the pipeline in src/cando-kernels/energy-
+kernels.lisp (likely just after :cse-full so temps are inserted once and reused).
+- Make the inverse temp a single reciprocal (e.g., 1.0/(base) in the temp RHS) so the pass reduces reciprocal
+ops; the rest are multiplies.
+- Update regression C output expectations in src/mathkernel/statement-tests.lisp for the new rsqrt and inverse
+temps.
+
+Clarifications
+
+- For x^-1, do you want the temp RHS emitted as 1.0/(x) (explicit reciprocal) or keep pow(x,-1) and just rely
+on sharing?
+- For negative non‑integer exponents other than -1/2, should we leave them as pow (just CSE‑hoisted if
+repeated), or also decompose them?
+- If both x^-0.5 and x^-1 appear for the same base, should we derive x^-1 from rsqrt(x) (square) instead of a
+reciprocal?
+
+rocal operations but only for
+exponent -1.
+- The CSE pipeline in src/cando-kernels/energy-kernels.lisp uses a minimum use threshold of 2 for coalescing
+pow, so only repeated pow calls are hoisted.
+- Tests in src/mathkernel/statement-tests.lisp include pow expressions with -0.5, meaning updates would be
+required to reflect rsqrt if introduced.
+
+Needed work includes: defining how to emit or implement rsqrt in C code and templates, canonicalizing numeric
+constants for better CSE consistency, designing a pow hoisting pass or adjusting CSE thresholds to handle
+single-use pow calls, enhancing rewrite rules to cover fractional negative exponents like -1/2, and adding
+appropriate tests and regression updates.
+
+Some questions remain: Should rsqrt be emitted as a real function or a macro? For which platforms and
+precision? Does the user want to hoist every pow call or only repeats? And for reducing reciprocals, should we
+unify division and pow(-1) explicitly or preserve both forms? These clarifications would help tailor the
+implementation approach.
+
+Preparing final explanation and questions
+
+─ Worked for 5m 17s ─────────────────────────────────────────────────────────────────────────────────────────────
+
+• Checked the current pow handling and the optimization pipeline. pow(x,0.5) already emits sqrt, but pow(x,-0.5)
+still emits pow, and pow calls are only coalesced when repeated. To reach your goal, we need a couple of
+decisions plus a small new pass.
+
+- src/mathkernel/expression-ir.lisp emits sqrt only for exponent 1/2; negative half falls through to pow. This
+is the direct hook for rsqrt.
+- src/mathkernel/expression-parse.lisp lowers division to pow(x,-1), so any reciprocal-minimization strategy
+must account for that.
+- src/mathkernel/expression-rewrite.lisp has :combine-expt^-1 (only for exponent -1). There is no rule for -1/2
+or other negative exponents.
+- src/cando-kernels/energy-kernels.lisp runs CSE with min-uses 2, so pow is coalesced only when duplicated;
+there is no pass that hoists single-use pow calls into temps.
+- src/mathkernel/statement-tests.lisp includes regression output with pow(r2, -0.5) that would need updating
+for rsqrt.
+
+What else we need to decide or add:
+
+- Define where rsqrt comes from (macro, inline helper, or platform intrinsic). There is no rsqrt symbol in the
+tree today, so generated C would need a definition or include.
+- Decide on numeric canonicalization for exponents (0.5 vs 1/2), otherwise CSE and pow matching may miss
+coalescing.
+- Decide whether “coalesce all other pow” means only duplicate pow or every pow (even single-use). The latter
+needs a dedicated “hoist pow” pass or a pow-specific CSE rule.
+- Choose the reciprocal minimization policy: extend rewrite rules beyond exponent -1, or add a dataflow pass to
+reuse precomputed inverses (as hinted in the session summary).
+
+Questions to pin this down:
+
+1. Should rsqrt be a real C function/macro you provide, or do you want a fallback like 1.0/sqrt(x)?
+2. Do you want to hoist every pow into a temp, or only when the same pow appears multiple times?
+3. For “few reciprocal ops”, do you want to rewrite negative exponents into a shared inverse (invr/invr2/etc.),
+or keep them as pow with negative exponent?
+
+
+› 1. I will define an rsqrt inline template function. 2. I want to hoist pow that appear multiple times. 3. I
+want to rewrite negative exponents as shared invers invr/invr2 etc.
+
+
+• Detailing negative exponent rewrite strategy
+
+I’m outlining a new optimization pass that will scan for negative integer exponents per base, create shared
+inverse temps (like invr, invr2), and rewrite expressions to use them. This pass fits best after CSE to ensure
+maximal reuse and minimal reciprocals. I’ll also propose updating the C expression emitter to special-case
+exponent -1 (emit 1.0/base) and -0.5 (emit rsqrt) for efficient code generation. Additionally, tests and
+pipeline integration need updates. There are open questions about handling non-integer negative exponents
+beyond -0.5 and whether to always create inverse temps even for single uses. Once confirmed, I can provide a
+precise implementation plan.
+
+Proposing emission and optimization choices for inverses
+
+I’m considering whether exponent -1 should emit as 1.0/(x) versus pow(x,-1) to minimize reciprocal calls, plus
+how to leverage rsqrt for both -0.5 and -1 powers. There’s a trade-off in deriving invr from rsqrt to reduce
+reciprocals. I’ll include these design questions alongside required changes: new rsqrt emitter, optimization
+pass to create shared inverse temps, pipeline integration, and tests updates. I’ll ask for confirmation before
+proceeding.
+
+• Explored
+└ Search rewrite in expression-rewrite.lisp
+Read expression-rewrite.lisp
+Search rewrite-expr-ir-with-rules in mathkernel
+
+• I’m organizing what’s missing to implement the new optimization pass, including emission updates, pipeline
+integration, and test changes, plus open questions about exponent handling and code generation choices to
+clarify before proceeding.
+
+─ Worked for 3m 21s ─────────────────────────────────────────────────────────────────────────────────────────────
+
+• With your choices, pow coalescing is already handled by the existing :cse-full pass (min-size 1) in src/cando-
+kernels/energy-kernels.lisp, so the remaining work is mostly around negative exponents and C emission.
+
+Needed
+
+- Add a -1/2 special-case in expr->c-expr-string’s power-expression branch so pow(x,-0.5) emits rsqrt(x)
+alongside the current sqrt handling in src/mathkernel/expression-ir.lisp.
+- Add a stmt‑IR optimization pass that finds negative integer exponents, introduces shared inverse temps (inv1,
+inv2, … via multiplications), and rewrites uses; wire it into the pipeline in src/cando-kernels/energy-
+kernels.lisp (likely just after :cse-full so temps are inserted once and reused).
+- Make the inverse temp a single reciprocal (e.g., 1.0/(base) in the temp RHS) so the pass reduces reciprocal
+ops; the rest are multiplies.
+- Update regression C output expectations in src/mathkernel/statement-tests.lisp for the new rsqrt and inverse
+temps.
+
+Clarifications
+
+- For x^-1, do you want the temp RHS emitted as 1.0/(x) (explicit reciprocal) or keep pow(x,-1) and just rely
+on sharing?
+- For negative non‑integer exponents other than -1/2, should we leave them as pow (just CSE‑hoisted if
+repeated), or also decompose them?
+- If both x^-0.5 and x^-1 appear for the same base, should we derive x^-1 from rsqrt(x) (square) instead of a
+reciprocal?
+
+If you want me to implement, tell me your preferences on those three points and I’ll proceed.
