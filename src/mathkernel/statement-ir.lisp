@@ -701,13 +701,13 @@ SUFFIX can be T (auto-gensym), a symbol, string, or any printable object."
   (let* ((suffix-str (cond
                        ((null suffix) nil)
                        ((eq suffix t) (symbol-name (gensym "G")))
-                       ((symbolp suffix) (symbol-name suffix))
-                       ((stringp suffix) suffix)
-                       (t (princ-to-string suffix))))
+                       ((symbolp suffix) (gensym (symbol-name suffix)))
+                       ((stringp suffix) (gensym suffix))
+                       (t (gensym (princ-to-string suffix)))))
          (name (if suffix-str
                    (format nil "CSE_P~D_T~D_~A" pass-id index suffix-str)
                    (format nil "CSE_P~D_T~D" pass-id index))))
-    #+(or)(when (string= "CSE_P1_T61_G285" name)
+    (when (string= "CSE_P51_T2_INVSQRT" name)
       (break "Caught problem symbol ~s" name))
     (intern name :expr-var)))
 

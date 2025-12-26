@@ -238,7 +238,8 @@
   #:write-c-code
   #:c-function-template
   #:c-function-coord-vars
-  #:c-function-return-expr))
+  #:c-function-return-expr
+  #:inverse-expt-optimization))
 
 (defpackage :stmt-ir.tests
   (:use :cl :expr-ir :stmt-ir)

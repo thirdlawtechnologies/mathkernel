@@ -30,6 +30,13 @@
      :keyword-args (list :max-passes 50
                          :min-uses 2
                          :min-size 1))
+
+    ;; inverse exponent optimization
+    (stmt-ir:make-optimization
+     :name :inverse-expt
+     :function 'stmt-ir:inverse-expt-optimization
+     :keyword-args (list :min-uses 2))
+
     ;; temp+param factoring
     (stmt-ir:make-optimization
      :name :factor-temp-param
@@ -79,6 +86,7 @@
 
   (build-kernel-group (kernels "stretch" (:hessian :gradient :energy))
     (:pipeline *pipeline*)
+    (:template "template <typename HESSIAN>")
     (:params ((|double| kb)
               (|double| r0)
               (|size_t| i3x1)
@@ -86,7 +94,7 @@
               (|double*| position)
               (|double*| energy_accumulate)
               (|double*| force)
-              (|double*| hessian)
+              (HESSIAN hessian)
               (|double*| dvec)
               (|double*| hdvec)))
 
@@ -116,6 +124,7 @@
 
   (build-kernel-group (kernels "angle" (:energy :gradient :hessian))
     (:pipeline *pipeline*)
+    (:template "template <typename HESSIAN>")
     (:params ((|double| kt)
               (|double| t0)
               (|size_t| i3x1)
@@ -124,7 +133,7 @@
               (|double*| position)
               (|double*| energy_accumulate)
               (|double*| force)
-              (|double*| hessian)
+              (HESSIAN hessian)
               (|double*| dvec)
               (|double*| hdvec)))
 
@@ -169,8 +178,40 @@
        (=! energy "kt*dtheta*dtheta")))
     )
 
-  (build-kernel-group (kernels "dihedral" (:energy :gradient :hessian))
-    (:pipeline *pipeline*)
+
+  (defparameter *dihedral-pipeline*
+    (stmt-ir:make-optimization-pipeline
+     :name :dihedral-opt
+     :optimizations
+     (list
+      (stmt-ir:make-optimization
+       :name :linear-canonicalization
+       :function 'stmt-ir:linear-canonicalization-optimization)
+      (stmt-ir:make-optimization
+       :name :inverse-expt
+       :function 'stmt-ir:inverse-expt-optimization
+       :keyword-args (list :min-uses 3))
+      (stmt-ir:make-optimization
+       :name :factor-sums
+       :function 'stmt-ir:factor-sums-optimization
+       :keyword-args (list :min-uses 3 :min-factors 1 :min-size 6))
+      (stmt-ir:make-optimization
+       :name :cse-full
+       :function 'stmt-ir:cse-block-multi-optimization
+       :keyword-args (list :max-passes 8 :min-uses 3 :min-size 4))
+      (stmt-ir:make-optimization
+       :name :copy-propagate
+       :function 'stmt-ir:copy-propagate-optimization)
+      (stmt-ir:make-optimization
+       :name :alias-assigned-exprs
+       :function 'stmt-ir:alias-assigned-exprs-optimization)
+      (stmt-ir:make-optimization
+       :name :normalize-signs
+              :function 'stmt-ir:normalize-signs-optimization))))
+
+  (build-kernel-group (kernels "dihedral_fast" (:energy :gradient :hessian))
+    (:pipeline *dihedral-pipeline*)
+    (:template "template <typename HESSIAN>")
     (:params ((|double| V)      ;; amplitude
               (|double| n)      ;; multiplicity
               (|double| sinPhase) ;; sin(phase offset δ)
@@ -182,7 +223,7 @@
               (|double*| position)
               (|double*| energy_accumulate)
               (|double*| force)
-              (|double*| hessian)
+              (HESSIAN hessian)
               (|double*| dvec)
               (|double*| hdvec)))
 
@@ -226,13 +267,8 @@
        (=. c2z "v2x*v3y - v2y*v3x")
 
        ;; norms and dot products
-       (=. c1_sq "c1x*c1x + c1y*c1y + c1z*c1z")
-       (=. c2_sq "c2x*c2x + c2y*c2y + c2z*c2z")
        (=. v2_sq "v2x*v2x + v2y*v2y + v2z*v2z")
        (=. v2_len "sqrt(v2_sq)")
-
-       (=. dot12 "v1x*v2x + v1y*v2y + v1z*v2z")
-       (=. dot23 "v2x*v3x + v2y*v3y + v2z*v3z")
 
        ;; torsion via atan2
        (=. t1 "v2_len*(v1x*c2x + v1y*c2y + v1z*c2z)")
@@ -502,6 +538,8 @@
     ;; Optimization pipeline
     (:pipeline *pipeline*)
 
+    (:template "template <typename HESSIAN>")
+
     ;; Parameters: (ctype name)
     ;;   K   – force constant
     ;;   CO  – target chiral value
@@ -514,7 +552,7 @@
               (|double*| position)
               (|double*| energy_accumulate)
               (|double*| force)
-              (|double*| hessian)
+              (HESSIAN hessian)
               (|double*| dvec)
               (|double*| hdvec)
               ))
@@ -626,6 +664,7 @@
        (=. r2 "dx*dx + dy*dy + dz*dz")
        (=! energy "ka * r2")
        ))
+    (:template "template <typename HESSIAN>")
     (:params ((|double| ka)
               (|double| xa)
               (|double| ya)
@@ -634,7 +673,7 @@
               (|double*| position)
               (|double*| energy_accumulate)
               (|double*| force)
-              (|double*| hessian)
+              (HESSIAN hessian)
               (|double*| dvec)
               (|double*| hdvec)
               ))
@@ -669,12 +708,14 @@
 
 
 
-  (build-kernel-group (kernels "dihedral_restraint" (:energy :gradient :hessian))
-    (:pipeline *pipeline*)
+  (build-kernel-group (kernels "dihedral_restraint_fast" (:energy :gradient :hessian))
+    (:pipeline *dihedral-pipeline*)
 
     ;; Parameters:
     ;;   kdh  – force constant
     ;;   phi0 – target dihedral angle (radians)
+
+    (:template "template <typename HESSIAN>")
     (:params ((|double| kdh)
               (|double| phi0)
               (|size_t| i3x1)
@@ -684,7 +725,7 @@
               (|double*| position)
               (|double*| energy_accumulate)
               (|double*| force)
-              (|double*| hessian)
+              (HESSIAN hessian)
               (|double*| dvec)
               (|double*| hdvec)
               ))
@@ -748,15 +789,6 @@
        (=. dy34 "y4 - y3")
        (=. dz34 "z4 - z3")
 
-       ;; Norms
-       (=. r12_2 "dx12*dx12 + dy12*dy12 + dz12*dz12")
-       (=. r23_2 "dx23*dx23 + dy23*dy23 + dz23*dz23")
-       (=. r34_2 "dx34*dx34 + dy34*dy34 + dz34*dz34")
-
-       (=. r12 "sqrt(r12_2)")
-       (=. r23 "sqrt(r23_2)")
-       (=. r34 "sqrt(r34_2)")
-
        ;; Planes normals: n1 = (r12 × r23), n2 = (r23 × r34)
        (=. n1x "dy12*dz23 - dz12*dy23")
        (=. n1y "dz12*dx23 - dx12*dz23")
@@ -769,12 +801,11 @@
        ;; Norms of normals
        (=. n1_2 "n1x*n1x + n1y*n1y + n1z*n1z")
        (=. n2_2 "n2x*n2x + n2y*n2y + n2z*n2z")
-       (=. n1   "sqrt(n1_2)")
-       (=. n2   "sqrt(n2_2)")
 
        ;; Cos(phi) = (n1 · n2) / (|n1|n2|)
+
+       (=. inv_n1n2 "(n1_2*n2_2)^-0.5")
        (=. dot_n1n2 "n1x*n2x + n1y*n2y + n1z*n2z")
-       (=. inv_n1n2 "1/(n1*n2)")
        (=. cosphi "dot_n1n2 * inv_n1n2")
 
        ;; phi in [0,pi]

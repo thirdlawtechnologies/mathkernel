@@ -19,6 +19,7 @@
                                            (:file "statement-ir")
                                            (:file "copy-propagate-optimization")
                                            (:file "cse-block-optimization")
+                                           (:file "inverse-expt-optimization")
                                            (:file "cse-factor-products-optimization")
                                            (:file "expression-diff")
                                            (:file "statement-diff")

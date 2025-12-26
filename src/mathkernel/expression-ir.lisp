@@ -392,7 +392,9 @@ in argument positions are counted."
   (make-instance 'variable-expression :name symbol-name))
 
 
-(in-package :expr-ir)
+(defun ~= (xx yy &optional (tol 0.00000001))
+  (let ((dd (abs (- xx yy))))
+    (< dd tol)))
 
 (defun expr->c-expr-string (expr)
   "Render EXPR as a C expression string.
@@ -429,34 +431,40 @@ Variable and function names are lower-cased."
               (format nil "(~{~A~^ * ~})" parts)))
 
            (power-expression
-            (let* ((b-str (emit (power-base-expression e)))
-                   (p-expr (power-exponent-expression e)))
+            (let* ((base-str (emit (power-base-expression e)))
+                   (exp-expr (power-exponent-expression e)))
               (cond
                 ;; integer exponents
-                ((and (typep p-expr 'constant-expression)
-                      (integerp (expression-value p-expr)))
-                 (let ((n (expression-value p-expr)))
+                ((and (typep exp-expr 'constant-expression)
+                      (integerp (expression-value exp-expr)))
+                 (let ((pow-value (expression-value exp-expr)))
                    (cond
-                     ((= n 2)
-                      (format nil "((~A) * (~A))" b-str b-str))
-                     ((and (> n 2) (<= n 5))
-                      ;; unroll small integer powers
+                     ((~= pow-value 2)
+                      (format nil "((~A) * (~A))" base-str base-str))
+                     ((~= pow-value -1)
+                      (format nil "(1.0 / (~A))" base-str))
+                     ((and (> pow-value 2) (<= pow-value 5))
                       (format nil "(~{~A~^ * ~})"
-                              (make-list n :initial-element b-str)))
+                              (make-list pow-value :initial-element base-str)))
                      (t
-                      ;; general integer power
-                      (format nil "pow(~A, ~D)" b-str n)))))
-                ;; exponent = 1/2 → sqrt
-                ((and (typep p-expr 'constant-expression)
-                      (let ((v (expression-value p-expr)))
-                        (or (eql v 1/2)
-                            (eql v 0.5d0)
-                            (eql v 0.5))))
-                 (format nil "sqrt(~A)" b-str))
-                ;; everything else → pow(base, exponent)
+                      (format nil "pow(~A, ~D)" base-str pow-value)))))
+                ;; exponent = -1/2 -> 1.0/sqrt
+                ((and (typep exp-expr 'constant-expression)
+                      (let ((value (expression-value exp-expr)))
+                        (or (eql value -1/2)
+                            (~= value -0.5d0)
+                            (~= value -0.5))))
+                 (format nil "(1.0 / sqrt(~A))" base-str))
+                ;; exponent = 1/2 -> sqrt
+                ((and (typep exp-expr 'constant-expression)
+                      (let ((value (expression-value exp-expr)))
+                        (or (eql value 1/2)
+                            (compare-double value 0.5d0))))
+                 (format nil "sqrt(~A)" base-str))
+                ;; everything else -> pow
                 (t
-                 (let ((p-str (emit p-expr)))
-                   (format nil "pow(~A, ~A)" b-str p-str))))))
+                 (let ((exp-str (emit exp-expr)))
+                   (format nil "pow(~A, ~A)" base-str exp-str))))))
 
            (negate-expression
             (let ((arg (emit (negate-argument-expression e))))

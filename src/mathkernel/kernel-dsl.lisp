@@ -1839,6 +1839,8 @@ energy-only kernels where D! requests are unnecessary."
           (p "~a~%" (stmt-ir:c-function-template one-fun)))
         (p "struct ~a {~%" (string-capitalize (kernel-group-name kernel-group)))
         (p "  static constexpr size_t PositionSize = ~d;~%" (length (kernel-coord-vars one-kernel)))
+        (p "  static std::string description() { return \"mathkernel-~a\"; };~%"
+           (kernel-group-name kernel-group))
         (loop for kernel in (kernel-group-kernels kernel-group)
               do (let* ((fun (compile-kernel-to-c-function kernel)))
                    ;; function header
@@ -2097,6 +2099,25 @@ energy-only kernels where D! requests are unnecessary."
                    collect var)))
     (append res coord-vars)))
 
+
+(defparameter *pre-hess-pipeline*
+  (stmt-ir:make-optimization-pipeline
+   :name :pre-hess
+   :optimizations
+   (list
+    (stmt-ir:make-optimization
+     :name :linear-canonicalization
+     :function 'stmt-ir:linear-canonicalization-optimization)
+    (stmt-ir:make-optimization
+     :name :inverse-expt
+     :function 'stmt-ir:inverse-expt-optimization
+     :keyword-args (list :min-uses 3))
+    (stmt-ir:make-optimization
+     :name :factor-sums
+     :function 'stmt-ir:factor-sums-optimization
+     :keyword-args (list :min-uses 3 :min-factors 1 :min-size 6)))))
+
+
 (defun make-kernel-from-block
     (&key group name pipeline layout coord-vars coord-load-stmts
        base-block template params compute-mode compute-energy
@@ -2146,85 +2167,87 @@ energy-only kernels where D! requests are unnecessary."
                   (inject-gradients-after-energy
                    current-block coord-vars energy-var #'general-grad-name))
             (setf current-stmts (copy-list (stmt-ir:block-statements current-block))))
-          (when pipeline
+          (let ((energy-block (stmt-ir:make-block-stmt current-stmts :label current-label)))
             (let ((grad-block (stmt-ir:make-block-stmt current-stmts :label current-label)))
               (stmt-ir:check-block-integrity grad-block)
               (multiple-value-bind (grad-opt results total-before total-after)
                   (stmt-ir:run-optimization-pipeline
-                   pass-counter pipeline grad-block binding-params
+                   pass-counter *pre-hess-pipeline* grad-block binding-params
                    :name (the-name "e-grad")
                    :log-stream *trace-output*)
                 (declare (ignore results total-before total-after))
                 (setf current-stmts
                       (copy-list (stmt-ir:block-statements grad-opt)))
                 (setf current-label (stmt-ir:block-label grad-opt))
-                (setf current-block grad-opt))))
-          (when compute-hess
-            (let* ((local-hess-block (stmt-ir:make-block-stmt current-stmts :label current-label))
-                   f (with-h (inject-hessians-after-energy
-                            local-hess-block coord-vars energy-var #'general-hess-name
-                            manual-deriv-spec)))
-              (stmt-ir:check-block-integrity with-h)
-              (setf current-stmts (copy-list (stmt-ir:block-statements with-h)))
-              (setf current-label (stmt-ir:block-label with-h))
-              (setf hess-block with-h)))
-          (when pipeline
-            (let ((local-hess-block (stmt-ir:make-block-stmt current-stmts :label current-label)))
-              (stmt-ir:check-block-integrity local-hess-block)
-              (multiple-value-bind (hess-opt results total-before total-after)
-                  (stmt-ir:run-optimization-pipeline
-                   pass-counter pipeline local-hess-block binding-params
-                   :name (the-name "e-g-hess")
-                   :log-stream *trace-output*)
-                (declare (ignore results total-before total-after))
-                (setf current-stmts
-                      (copy-list (stmt-ir:block-statements hess-opt)))
-                (setf current-label (stmt-ir:block-label hess-opt))
-                (setf hess-block hess-opt))))
-          (let* ((core-block
-                   (let ((blk (stmt-ir:make-block-stmt current-stmts :label current-label)))
-                     (stmt-ir:check-def-before-use-in-block blk :errorp t)
-                     blk))
-                 (block-with-coords
-                   (if coord-load-stmts
-                       (stmt-ir:make-block-stmt
-                        (append coord-load-stmts (list core-block))
-                        :label (stmt-ir:block-label core-block))
-                       core-block))
-                 (eg-h-block
-                   (transform-eg-h-block
-                    block-with-coords layout coord-vars
-                    #'general-grad-name #'general-hess-name))
-                 (eg-h-block*
-                   (if post-eg-h-pipeline*
-                       (multiple-value-bind (post-block results total-before total-after)
-                           (stmt-ir:run-optimization-pipeline
-                            pass-counter post-eg-h-pipeline* eg-h-block binding-params
-                            :name (the-name "post-eg-h")
-                            :log-stream *trace-output*)
-                         (declare (ignore results total-before total-after))
-                         post-block)
-                       eg-h-block)))
-            (make-kernel-ir
-             :compute-mode compute-mode
-             :group group
-             :name name
-             :layout layout
-             :coord-vars coord-vars
-             :coord-load-stmts coord-load-stmts
-             :template template
-             :params params
-             :core-block core-block
-             :eg-h-block eg-h-block*
-             :compute-energy-p compute-energy
-             :compute-grad-p   compute-grad
-             :compute-hess-p   compute-hess
-             :manual-deriv-spec manual-deriv-spec
-             :pipeline pipeline
-             :extra-equivalence-rules extra-equivalence-rules
-             :extra-optimization-rules extra-optimization-rules
-             :return-type return-type
-             :return-expr return-expr)))))))
+                (setf current-block grad-opt)))
+            (let ((optimized-gradient-block current-block))
+              (when compute-hess
+                (let* ((local-hess-block (stmt-ir:make-block-stmt current-stmts :label current-label))
+                       f (with-h (inject-hessians-after-energy
+                                  local-hess-block coord-vars energy-var #'general-hess-name
+                                  manual-deriv-spec)))
+                  (stmt-ir:check-block-integrity with-h)
+                  (setf current-stmts (copy-list (stmt-ir:block-statements with-h)))
+                  (setf current-label (stmt-ir:block-label with-h))
+                  (setf hess-block with-h)))
+              (when pipeline
+                (let ((local-hess-block (stmt-ir:make-block-stmt current-stmts :label current-label)))
+                  (stmt-ir:check-block-integrity local-hess-block)
+                  (multiple-value-bind (hess-opt results total-before total-after)
+                      (stmt-ir:run-optimization-pipeline
+                       pass-counter pipeline local-hess-block binding-params
+                       :name (the-name "e-g-hess")
+                       :log-stream *trace-output*)
+                    (declare (ignore results total-before total-after))
+                    (setf current-stmts
+                          (copy-list (stmt-ir:block-statements hess-opt)))
+                    (setf current-label (stmt-ir:block-label hess-opt))
+                    (setf hess-block hess-opt))))
+              (let ((optimized-hessian-block current-block))
+                (let* ((core-block
+                         (let ((blk (stmt-ir:make-block-stmt current-stmts :label current-label)))
+                           (stmt-ir:check-def-before-use-in-block blk :errorp t)
+                           blk))
+                       (block-with-coords
+                         (if coord-load-stmts
+                             (stmt-ir:make-block-stmt
+                              (append coord-load-stmts (list core-block))
+                              :label (stmt-ir:block-label core-block))
+                             core-block))
+                       (eg-h-block
+                         (transform-eg-h-block
+                          block-with-coords layout coord-vars
+                          #'general-grad-name #'general-hess-name))
+                       (eg-h-block*
+                         (if post-eg-h-pipeline*
+                             (multiple-value-bind (post-block results total-before total-after)
+                                 (stmt-ir:run-optimization-pipeline
+                                  pass-counter post-eg-h-pipeline* eg-h-block binding-params
+                                  :name (the-name "post-eg-h")
+                                  :log-stream *trace-output*)
+                               (declare (ignore results total-before total-after))
+                               post-block)
+                             eg-h-block)))
+                  (make-kernel-ir
+                   :compute-mode compute-mode
+                   :group group
+                   :name name
+                   :layout layout
+                   :coord-vars coord-vars
+                   :coord-load-stmts coord-load-stmts
+                   :template template
+                   :params params
+                   :core-block core-block
+                   :eg-h-block eg-h-block*
+                   :compute-energy-p compute-energy
+                   :compute-grad-p   compute-grad
+                   :compute-hess-p   compute-hess
+                   :manual-deriv-spec manual-deriv-spec
+                   :pipeline pipeline
+                   :extra-equivalence-rules extra-equivalence-rules
+                   :extra-optimization-rules extra-optimization-rules
+                   :return-type return-type
+                   :return-expr return-expr))))))))))
 
 
 ;;; ------------------------------------------------------------

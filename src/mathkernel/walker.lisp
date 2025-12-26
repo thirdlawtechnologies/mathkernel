@@ -94,6 +94,24 @@ Returns T if clean and NIL if not."
                (%temp-inserts-table obj)))))
 
 
+
+(defun check-temp-insert-order (temp-list env &key label)
+  (let* ((remaining (mapcar #'stmt-target-name temp-list))
+         (seen (make-hash-table :test #'eq)))
+    (dolist (temp-stmt temp-list)
+      (let* ((target (stmt-target-name temp-stmt))
+             (used (expr-ir:expr-free-vars (stmt-expression temp-stmt))))
+        (dolist (sym used)
+          (when (and (member sym remaining :test #'eq)
+                     (not (gethash sym seen)))
+            (multiple-value-bind (entry env-found) (binding-env-lookup env sym)
+              (declare (ignore entry))
+              (unless env-found
+                (error "inverse-rewrite temp order~@[ (~A)~]: ~S uses ~S before it is defined"
+                       label target sym))))))
+      (setf (gethash (stmt-target-name temp-stmt) seen) t)
+      (pop remaining))))
+
 ;;; ------------------------------------------------------------
 ;;; Generic hooks
 ;;; ------------------------------------------------------------
